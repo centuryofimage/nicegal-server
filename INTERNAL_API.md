@@ -145,12 +145,18 @@ CREATE TABLE catalog_meta(
 );
 ```
 
-`media_kind` is currently `image` or `video`. Image dimensions, GIF frame count, and duration are
+As of 2026-09-13, scans and catalog upserts accept images only (PNG, JPEG, GIF, WebP, BMP).
+This supersedes the earlier video-path cataloging behavior: video thumbnailing is unsupported,
+so videos are excluded rather than presented as broken tiles. Existing `video` rows remain on
+disk for compatibility but are omitted from catalog lookups, lists, timelines, and counts.
+No source files or catalog databases are deleted/rebuilt. `media_kind` returned by the catalog
+API is therefore `image`; the legacy database value `video` is still understood internally.
+Image dimensions, GIF frame count, and duration are
 best-effort. `exif_taken_ns` is Unix nanoseconds parsed from `DateTimeOriginal`, including
 `SubSecTimeOriginal` and `OffsetTimeOriginal` when present; an absent EXIF offset deterministically
-means UTC. Probe failure leaves optional columns null and does not remove the asset. Video paths
-and basic format classification are cataloged; video probing and poster generation are not supported. GIF posters are static PNGs produced from the first decoded/composited frame; original
-animated GIF or video bytes never belong in the thumbnail database.
+means UTC. Probe failure leaves optional columns null and does not remove the image. GIF posters
+are static PNGs produced from the first decoded/composited frame; original animated GIF bytes
+never belong in the thumbnail database.
 
 These columns are Rust implementation details. Gallery listing uses these indexed orders
 (descending timestamp and descending asset ID for the desktop):
@@ -389,12 +395,14 @@ Version 1 routes:
   strings; unavailable timestamps/dimensions/frame count/duration are null.
 - `GET /v1/catalog/count?root=<absolute-root>` returns a JSON integer without materializing rows.
   `GET /v1/catalog/revision` returns a decimal-string revision.
-- `GET /v1/catalog/metadata?assetId=<positive-id>` returns `{asset, file, ocrState, textState,
-  imageIndexed, decodeFailed}`. `asset` has the gallery shape above. `file` contains `sourceState`
+- `GET /v1/catalog/metadata?assetId=<positive-id>` returns `{asset, file, ocrState, ocrText,
+  textState, imageIndexed, decodeFailed}`. `asset` has the gallery shape above. `file` contains `sourceState`
   (`current`, `changed`, `missing`, `unavailable`), Windows `attributes`, selected EXIF fields as
   `{label,value}` pairs, and a nullable diagnostic `error`. Detailed file probing happens on demand;
   changed sources omit EXIF instead of mixing live camera data with saved catalog dimensions.
   Unsupported/no EXIF is an empty list, not a failure. Field text is bounded to 4096 characters.
+  `ocrText` is the complete OCR result for the current source fingerprint, or null when OCR has
+  not indexed the current file; a successful image with no recognized text returns an empty string.
   `ocrState` is `indexed|stale|notIndexed`; `textState` is `embedded|pending|noText|notIndexed` and
   matches the persisted OCR fingerprint/embedding state, excluding marked-for-deletion OCR rows.
   `imageIndexed` means a CLIP vector matches the catalog fingerprint in the active model's store.

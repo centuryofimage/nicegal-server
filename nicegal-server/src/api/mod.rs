@@ -314,20 +314,21 @@ mod tests {
         let image_embedder = Arc::new(ImageModel::deferred(
             nicegal_core::embedding::ImageEmbedderOptions::default(),
         ));
-        let image_query_embedder =
-            Arc::new(
-                ImageQueryEmbedder::deferred(
-                    nicegal_core::embedding::ImageQueryEmbedderOptions::default(),
-                )
-                .without_cached_loading(),
-            );
+        let image_query_embedder = Arc::new(
+            ImageQueryEmbedder::deferred(
+                nicegal_core::embedding::ImageQueryEmbedderOptions::default(),
+            )
+            .without_cached_loading(),
+        );
         if prepare_models {
             embedder.prepare().unwrap();
             image_embedder.prepare().unwrap();
             image_query_embedder.prepare().unwrap();
         }
         drop(ImageIndexDb::new(&databases.images, image_query_embedder.dimensions()).unwrap());
-        let ocr_models = Arc::new(ModelStore::new(nicegal_core::runtime::ExecutionProvider::Cpu));
+        let ocr_models = Arc::new(ModelStore::new(
+            nicegal_core::runtime::ExecutionProvider::Cpu,
+        ));
         let thumbnails = Arc::new(ThumbnailService::new(&databases.thumbnails).unwrap());
         let runtime = Arc::new(
             RuntimeSettings::load(
@@ -1128,6 +1129,17 @@ mod tests {
             .upsert(&source, &std::fs::metadata(&source).unwrap())
             .unwrap();
         catalog.record_decode_failure(&asset).unwrap();
+        let mut ocr = DB::new(&root.join("ocr.db")).unwrap();
+        ocr.save_results(vec![OcrResult {
+            asset_id: asset.asset_id,
+            path: source.clone(),
+            fingerprint: asset.fingerprint,
+            exif_taken_ns: asset.exif_taken_ns,
+            width: 1,
+            height: 1,
+            contents: "Total: $23.50".to_owned(),
+        }])
+        .unwrap();
         std::fs::remove_file(&source).unwrap();
         let uri = format!(
             "/v1/catalog?root={}&timeline=capture",
@@ -1161,8 +1173,9 @@ mod tests {
         assert_eq!(info["file"]["sourceState"], "missing");
         assert_eq!(info["decodeFailed"], true);
         assert_eq!(info["imageIndexed"], false);
-        assert_eq!(info["ocrState"], "stale");
-        assert_eq!(info["textState"], "notIndexed");
+        assert_eq!(info["ocrState"], "indexed");
+        assert_eq!(info["ocrText"], "Total: $23.50");
+        assert_eq!(info["textState"], "pending");
         let (status, _) = send(&router, Method::GET, "/v1/catalog/metadata?assetId=999").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         for uri in [

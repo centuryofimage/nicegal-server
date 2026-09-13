@@ -5,7 +5,9 @@ use camino::Utf8PathBuf as PathBuf;
 use nicegal_core::assets::AssetCatalog;
 use nicegal_core::db::DB;
 use nicegal_core::image_index::ImageIndexDb;
-use nicegal_core::index::{IndexEvent, IndexObserver, IndexOptions, IndexPhase, IndexProgressDelta};
+use nicegal_core::index::{
+    IndexEvent, IndexObserver, IndexOptions, IndexPhase, IndexProgressDelta,
+};
 use nicegal_core::thumbs::ThumbnailService;
 use serde::Deserialize;
 

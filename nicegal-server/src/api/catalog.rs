@@ -149,6 +149,7 @@ struct MetadataResponse {
     asset: GalleryAssetResponse,
     file: FileMetadataResponse,
     ocr_state: IndexStateResponse,
+    ocr_text: Option<String>,
     image_indexed: bool,
     text_state: &'static str,
     decode_failed: bool,
@@ -214,6 +215,7 @@ async fn metadata(
                 .get(&asset.asset_id)
                 .copied()
                 .into();
+            let ocr_text = ocr.current_asset_text(asset.asset_id, asset.fingerprint)?;
             let decode_failed = catalog
                 .current_decode_failure_asset_ids(&fingerprints)?
                 .contains(&asset.asset_id);
@@ -234,6 +236,7 @@ async fn metadata(
                 asset: asset.into(),
                 file,
                 ocr_state,
+                ocr_text,
                 image_indexed,
                 text_state,
                 decode_failed,

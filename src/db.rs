@@ -402,6 +402,28 @@ impl DB {
             .optional()?)
     }
 
+    /// Return recognized text only when it belongs to the catalog's current source fingerprint.
+    /// A stale OCR row is useful for search-state reporting, but must not be shown as text from
+    /// the current file.
+    pub fn current_asset_text(
+        &self,
+        asset_id: i64,
+        fingerprint: SourceFingerprint,
+    ) -> Result<Option<String>> {
+        let source_size = i64::try_from(fingerprint.size)
+            .context("source byte size exceeds SQLite's integer range")?;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT content FROM ocr_results
+                 WHERE asset_id = ?1 AND source_modified_ns = ?2 AND source_size = ?3
+                   AND mark_delete = FALSE",
+                (asset_id, fingerprint.modified_ns, source_size),
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     pub fn is_indexed(&self, asset_id: i64, fingerprint: SourceFingerprint) -> Result<bool> {
         let source_size = i64::try_from(fingerprint.size)
             .context("source byte size exceeds SQLite's integer range")?;
@@ -1880,7 +1902,12 @@ mod tests {
             db.asset_text_embedding_status(1, fingerprint)?,
             Some((true, true))
         );
+        assert_eq!(
+            db.current_asset_text(1, fingerprint)?,
+            Some("due north".to_owned())
+        );
         assert_eq!(db.asset_text_embedding_status(999, fingerprint)?, None);
+        assert_eq!(db.current_asset_text(999, fingerprint)?, None);
 
         // Both parts of the source fingerprint matter, even before a rescan runs.
         let changed = SourceFingerprint {
@@ -1892,6 +1919,7 @@ mod tests {
             ..fingerprint
         };
         assert_eq!(db.asset_text_embedding_status(1, changed)?, None);
+        assert_eq!(db.current_asset_text(1, changed)?, None);
         assert_eq!(db.asset_text_embedding_status(1, resized)?, None);
 
         let mut rescanned = result(&temp, 1, "due north, rescanned")?;

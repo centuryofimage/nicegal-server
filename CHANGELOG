@@ -1,1 +1,3 @@
-Updated CI release, attestation, and README verification references to the centuryofimage/nicegal-server repository.
+- Fixed compose search behavior
+- Revamped "all" search
+- Added auto updater

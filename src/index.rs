@@ -234,7 +234,7 @@ impl IndexPipeline<'_> {
             return Ok(None);
         }
         // Preserve the catalog-first barrier introduced in e19f372. OCR is a derived index; it
-        // must not delay otherwise usable image/video paths from becoming visible to the gallery.
+        // must not delay otherwise usable image paths from becoming visible to the gallery.
         let (catalog, catalog_complete) = CatalogPipeline {
             assets: &*self.assets,
             options: &self.options,
