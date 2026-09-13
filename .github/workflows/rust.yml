@@ -56,6 +56,18 @@ jobs:
           if (-not $clangDirectory) { throw 'The runner has no libclang.dll for Rust bindgen.' }
           "LIBCLANG_PATH=$clangDirectory" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
+      - name: Locate Visual C++ runtime
+        shell: pwsh
+        run: |
+          $runtimeDirectory = Get-ChildItem -LiteralPath (Join-Path $env:VCToolsRedistDir 'x64') -Directory |
+            Where-Object {
+              $_.Name -like 'Microsoft.VC*.CRT' -and
+              (Test-Path -LiteralPath (Join-Path $_.FullName 'vcruntime140.dll')) -and
+              (Test-Path -LiteralPath (Join-Path $_.FullName 'msvcp140.dll'))
+            } | Sort-Object Name -Descending | Select-Object -First 1
+          if (-not $runtimeDirectory) { throw 'The runner has no x64 Visual C++ redistributable directory.' }
+          "NICEGAL_CRT_LIB_PATH=$($runtimeDirectory.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Setup Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
@@ -111,14 +123,6 @@ jobs:
           BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
         shell: pwsh
         run: Copy-Item -LiteralPath $env:BUNDLE_PATH -Destination dist/provenance.intoto.jsonl
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: nicegal-server-windows-${{ steps.version.outputs.version }}
-          path: |
-            dist/*.zip
-            dist/*.intoto.jsonl
 
       - name: Tag and publish the release
         if: github.repository == 'nicegal/nicegal-server' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
