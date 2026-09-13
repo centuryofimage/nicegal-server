@@ -1,1 +1,1 @@
-Job progress throughput now resets by phase and excludes skipped assets from resumed OCR rate calculations, with the behavior documented in the internal API.
+Updated Cargo metadata and README build instructions to reference the centuryofimage/nicegal-server repository.

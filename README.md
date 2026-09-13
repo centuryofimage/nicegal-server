@@ -159,7 +159,7 @@ On Windows x64, install Rust 1.98.0 (MSVC), Visual Studio C++ build tools, and u
 Clone this repository and build the server with its runtime libraries:
 
 ```text
-git clone https://github.com/nicegal/nicegal-server.git
+git clone https://github.com/centuryofimage/nicegal-server.git
 cd nicegal-server
 build-server.cmd
 dev.cmd build --workspace --release --locked

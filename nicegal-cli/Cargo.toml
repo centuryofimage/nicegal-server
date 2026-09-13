@@ -5,7 +5,7 @@ authors = ["bep"]
 license = "PolyForm-Internal-Use-1.0.0"
 edition = "2024"
 description = "Command-line interface for nicegal-server"
-repository = "https://github.com/nicegal/nicegal-server"
+repository = "https://github.com/centuryofimage/nicegal-server"
 keywords = ["ocr", "image", "paddleocr"]
 categories = ["command-line-utilities", "multimedia::images"]
 

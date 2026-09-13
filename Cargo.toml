@@ -6,7 +6,7 @@ authors = ["bep"]
 license = "PolyForm-Internal-Use-1.0.0"
 edition = "2024"
 description = "Library for indexing and searching images with OCR (optical character recognition)"
-repository = "https://github.com/nicegal/nicegal-server"
+repository = "https://github.com/centuryofimage/nicegal-server"
 keywords = ["ocr", "image", "paddleocr"]
 categories = ["multimedia::images"]
 
