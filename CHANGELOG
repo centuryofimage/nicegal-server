@@ -1,1 +1,1 @@
-Added Linux x64 OpenVINO bundling and runtime loading, platform-specific provider defaults, portable dev.sh execution, and a Linux runtime smoke test.
+Made build-server.sh and dev.sh executable for Unix-based development and server builds.
