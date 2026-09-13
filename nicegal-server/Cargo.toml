@@ -1,0 +1,37 @@
+[package]
+name = "nicegal-server"
+version = "0.3.0"
+authors = ["bep"]
+license = "PolyForm-Internal-Use-1.0.0"
+edition = "2024"
+description = "Local HTTP server for nicegal-server"
+repository = "https://github.com/nicegal/nicegal-server"
+
+[features]
+default = ["regex", "ort-openvino", "ort-directml"]
+regex = ["nicegal-core/regex"]
+ort-openvino = ["nicegal-core/ort-openvino"]
+ort-directml = ["nicegal-core/ort-directml"]
+[dependencies]
+anyhow = "1.0.104"
+base64 = "0.22.1"
+imagesize = "0.15.0"
+sha2 = "0.10.9"
+axum = "0.8.9"
+camino = { version = "1.2.5", features = ["serde1"] }
+clap = { version = "4.6.6", features = ["derive", "env"] }
+dirs = "6.0.0"
+glob = "0.3.4"
+hf-hub = { version = "0.4.3", default-features = false, features = ["native-tls", "tokio"] }
+nicegal-core = { path = "..", default-features = false, features = ["logging"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["io-std", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = { version = "0.1.19", default-features = false, features = ["sync"] }
+tower-http = { version = "0.7.0", default-features = false, features = ["trace"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+serde_urlencoded = "0.7.1"
+tempfile = "3.27.0"
+tower = { version = "0.5.2", features = ["util"] }

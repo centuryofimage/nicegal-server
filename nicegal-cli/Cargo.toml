@@ -1,0 +1,27 @@
+[package]
+name = "nicegal-cli"
+version = "0.3.0"
+authors = ["bep"]
+license = "PolyForm-Internal-Use-1.0.0"
+edition = "2024"
+description = "Command-line interface for nicegal-server"
+repository = "https://github.com/nicegal/nicegal-server"
+keywords = ["ocr", "image", "paddleocr"]
+categories = ["command-line-utilities", "multimedia::images"]
+
+[[bin]]
+name = "nicegal-cli"
+path = "src/main.rs"
+
+[features]
+default = ["regex"]
+regex = ["nicegal-core/regex"]
+
+[dependencies]
+anyhow = "1.0.104"
+camino = "1.2.5"
+clap = { version = "4.6.6", features = ["cargo", "wrap_help", "env"] }
+dirs = "6.0.0"
+nicegal-core = { path = "..", default-features = false }
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { version = "0.7.0", features = ["unprefixed_malloc_on_supported_platforms"] }
