@@ -1,1 +1,1 @@
-Made build-server.sh and dev.sh executable for Unix-based development and server builds.
+Job progress throughput now resets by phase and excludes skipped assets from resumed OCR rate calculations, with the behavior documented in the internal API.

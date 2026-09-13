@@ -182,8 +182,8 @@ struct JobProgress {
     downloaded_bytes: usize,
     download_total_bytes: usize,
     models_loaded: usize,
-    /// The rate of `phaseCompleted` work since the current phase began. It deliberately does not
-    /// combine unlike units from different phases.
+    /// The rate of completed work since the current phase began. OCR excludes skipped assets
+    /// so resuming an index does not count previously indexed images as new OCR work.
     items_per_second: Option<f64>,
 }
 
@@ -196,6 +196,7 @@ struct JobData {
     errors: Vec<JobItemError>,
     active_asset_paths: BTreeSet<PathBuf>,
     phase_started_at: Option<Instant>,
+    phase_started_skipped: usize,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -248,6 +249,7 @@ impl Job {
             errors: Vec::new(),
             active_asset_paths: BTreeSet::new(),
             phase_started_at: None,
+            phase_started_skipped: 0,
         };
         let (updates, _) = watch::channel(Self::response_from_data(id, kind, &data));
         Self {
@@ -463,14 +465,26 @@ fn set_phase(data: &mut JobData, next: JobPhase) {
         data.progress.phase_completed = 0;
         data.progress.items_per_second = None;
         data.phase_started_at = Some(Instant::now());
+        data.phase_started_skipped = data.progress.skipped;
         data.active_asset_paths.clear();
     }
 }
 
 fn refresh_phase_throughput(data: &mut JobData) {
-    if matches!(data.phase, JobPhase::Queued | JobPhase::Finished)
-        || data.progress.phase_completed == 0
-    {
+    if matches!(data.phase, JobPhase::Queued | JobPhase::Finished) {
+        return;
+    }
+    let completed = if data.phase == JobPhase::Ocr {
+        data.progress.phase_completed.saturating_sub(
+            data.progress
+                .skipped
+                .saturating_sub(data.phase_started_skipped) as u64,
+        )
+    } else {
+        data.progress.phase_completed
+    };
+    if completed == 0 {
+        data.progress.items_per_second = None;
         return;
     }
     let Some(started_at) = data.phase_started_at else {
@@ -478,7 +492,7 @@ fn refresh_phase_throughput(data: &mut JobData) {
     };
     let elapsed = started_at.elapsed().as_secs_f64();
     if elapsed > 0.0 {
-        data.progress.items_per_second = Some(data.progress.phase_completed as f64 / elapsed);
+        data.progress.items_per_second = Some(completed as f64 / elapsed);
     }
 }
 
@@ -984,6 +998,79 @@ mod tests {
         assert_eq!(response.progress.total, Some(5));
         assert_eq!(response.progress.phase_completed, 2);
         assert_eq!(response.progress.cataloged, 2);
+    }
+
+    #[test]
+    fn throughput_resets_when_indexing_phase_changes() {
+        let job = Job::new(8, JobKind::OcrIndex);
+        assert!(job.begin());
+
+        for phase in [
+            IndexPhase::Cataloging,
+            IndexPhase::Thumbnails,
+            IndexPhase::Ocr,
+            IndexPhase::Cleanup,
+            IndexPhase::ImageEmbedding,
+            IndexPhase::TextEmbedding,
+        ] {
+            job.on_event(IndexEvent::PhaseChanged(phase));
+            let response = job.response();
+            assert_eq!(response.progress.items_per_second, None);
+            assert_eq!(response.progress.phase_completed, 0);
+            assert!(job.data().phase_started_at.unwrap().elapsed() < Duration::from_secs(1));
+
+            // A controlled elapsed time makes each phase's expected rate independent of
+            // machine speed and proves that earlier phases' work is not counted again.
+            job.data().phase_started_at = Some(Instant::now() - Duration::from_secs(10));
+            job.on_event(IndexEvent::Progress(IndexProgressDelta {
+                phase_completed: 20,
+                ..IndexProgressDelta::default()
+            }));
+            let rate = job.response().progress.items_per_second.unwrap();
+            assert!((1.9..=2.0).contains(&rate), "unexpected rate: {rate}");
+        }
+    }
+
+    #[test]
+    fn resumed_ocr_throughput_excludes_skips_but_preserves_progress() {
+        let job = Job::new(10, JobKind::OcrIndex);
+        assert!(job.begin());
+        job.on_event(IndexEvent::PhaseChanged(IndexPhase::Cataloging));
+        job.on_event(IndexEvent::Progress(IndexProgressDelta {
+            phase_completed: 100,
+            skipped: 100,
+            ..IndexProgressDelta::default()
+        }));
+        job.on_event(IndexEvent::PhaseChanged(IndexPhase::Ocr));
+        job.on_event(IndexEvent::DiscoveryComplete { total: 10_020 });
+        job.on_event(IndexEvent::Progress(IndexProgressDelta {
+            phase_completed: 10_000,
+            processed: 10_000,
+            skipped: 10_000,
+            ..IndexProgressDelta::default()
+        }));
+        assert_eq!(job.response().progress.items_per_second, None);
+
+        job.data().phase_started_at = Some(Instant::now() - Duration::from_secs(10));
+        job.on_event(IndexEvent::Progress(IndexProgressDelta {
+            phase_completed: 20,
+            processed: 20,
+            ..IndexProgressDelta::default()
+        }));
+        let progress = job.response().progress;
+        assert_eq!(progress.phase_completed, 10_020);
+        assert_eq!(progress.total, Some(10_020));
+        assert_eq!(progress.skipped, 10_100);
+        assert!((1.9..=2.0).contains(&progress.items_per_second.unwrap()));
+
+        // Saving the completed OCR batch must not count the same work twice.
+        job.on_event(IndexEvent::Progress(IndexProgressDelta {
+            indexed: 20,
+            ..IndexProgressDelta::default()
+        }));
+        assert!((1.9..=2.0).contains(&job.response().progress.items_per_second.unwrap()));
+        job.on_event(IndexEvent::PhaseChanged(IndexPhase::ImageEmbedding));
+        assert_eq!(job.response().progress.items_per_second, None);
     }
 
     #[test]

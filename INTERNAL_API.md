@@ -1000,6 +1000,11 @@ it. Those lifetime counters never reset and remain useful for labels and final s
 `indexed`, `skipped`, `failed`, and `deleted` are lifetime counters for the job. `errors` retains up
 to 100 item failures. A failed job also contains an `error` string.
 
+`itemsPerSecond` measures completed work per second since the current phase began and resets
+on phase changes. During OCR it excludes that phase's skipped assets, so a resumed job's
+previously indexed images advance progress without inflating OCR speed. It is `null` until
+non-skipped OCR work completes. The progress bar still includes skipped assets.
+
 | Job type | Phase | Fields that move in the phase | `total` in the phase | Honest within-phase UI |
 | --- | --- | --- | --- | --- |
 | Any | `queued` | None | `null` | Queued state, not a progress bar. |
