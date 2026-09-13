@@ -21,7 +21,7 @@ env:
 
 jobs:
   build:
-    if: github.repository == 'nicegal/nicegal-server'
+    if: github.repository == 'centuryofimage/nicegal-server'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -112,21 +112,21 @@ jobs:
           Compress-Archive -Path "$packageDirectory/*" -DestinationPath $archive
 
       - name: Attest Windows download
-        if: github.repository == 'nicegal/nicegal-server' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        if: github.repository == 'centuryofimage/nicegal-server' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         id: attest
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
           subject-path: dist/*.zip
 
       - name: Preserve the attestation bundle
-        if: github.repository == 'nicegal/nicegal-server' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        if: github.repository == 'centuryofimage/nicegal-server' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         env:
           BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
         shell: pwsh
         run: Copy-Item -LiteralPath $env:BUNDLE_PATH -Destination dist/provenance.intoto.jsonl
 
       - name: Tag and publish the release
-        if: github.repository == 'nicegal/nicegal-server' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        if: github.repository == 'centuryofimage/nicegal-server' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_VERSION: ${{ steps.version.outputs.version }}

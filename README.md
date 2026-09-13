@@ -191,7 +191,7 @@ not included in this repository.
 Verify a downloaded server ZIP with GitHub CLI:
 
 ```powershell
-gh attestation verify PATH_TO_DOWNLOADED_ZIP --repo nicegal/nicegal-server
+gh attestation verify PATH_TO_DOWNLOADED_ZIP --repo centuryofimage/nicegal-server
 ```
 
 The build-provenance attestation identifies the repository, source commit, and
