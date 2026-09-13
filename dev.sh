@@ -7,4 +7,7 @@ if (($# == 0)); then
 fi
 
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-exec "$repo_root/dev.cmd" "$@"
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) exec "$repo_root/dev.cmd" "$@" ;;
+    *) exec cargo "$@" ;;
+esac

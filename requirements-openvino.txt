@@ -1,2 +1,3 @@
 onnxruntime-openvino==1.24.1
-openvino==2025.4.1
+# Linux wheels already contain the matching OpenVINO native libraries.
+openvino==2025.4.1; sys_platform == "win32"

@@ -1,1 +1,1 @@
-Updated the Rust CI build to run on the latest Windows GitHub Actions runner.
+Added Linux x64 OpenVINO bundling and runtime loading, platform-specific provider defaults, portable dev.sh execution, and a Linux runtime smoke test.

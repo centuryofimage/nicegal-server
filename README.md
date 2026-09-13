@@ -27,6 +27,7 @@ and two separate `onnxruntime` distributions:
 
 ```text
 build-server.cmd   # Windows: DirectML and OpenVINO distributions
+./build-server.sh  # Linux x64: OpenVINO distribution, including CPU
 ```
 
 `onnxruntime-directml` and `onnxruntime-openvino` each need their own `onnxruntime.dll`, since one
@@ -63,6 +64,23 @@ distribution selected for it, its build metadata, and the persisted selection fo
 `restartRequired` is true until the server restarts with it. The command-line
 `--execution-provider` / `NICEGAL_EXECUTION_PROVIDER` override still applies to that launch
 only.
+
+On Linux x64, `build-server.sh` provisions `.venv-openvino` with uv and Python 3.13.
+The Linux wheel includes OpenVINO's native libraries, so a separate OpenVINO Python
+package is unnecessary. The script stages the shared libraries under
+`target/{debug,release}/onnxruntime/openvino/` (and each profile's `deps/` for tests).
+Distribute `nicegal-server` with that `onnxruntime/openvino/` directory intact;
+Python is not needed at runtime. Linux defaults to OpenVINO and can fall back to CPU.
+
+Ubuntu 24.04 build prerequisites are Rust 1.98.0, uv, `build-essential`,
+`pkg-config`, `libssl-dev`, `libclang-dev`, `cmake`, and `nasm`. After running
+`./build-server.sh`, verify both providers with a small local ONNX model:
+
+```bash
+./dev.sh test -p nicegal-core --features ort-openvino --test linux_runtime -- --ignored
+```
+
+This test disables fallback to prove both OpenVINO and CPU can execute inference.
 
 `RuntimeOptions` selects the provider and thread count. Production callers may allow a failed
 accelerator registration or model compilation to rebuild both OCR sessions on CPU. Callers that

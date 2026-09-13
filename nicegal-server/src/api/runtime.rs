@@ -97,6 +97,9 @@ pub(super) struct RuntimeStatusResponse {
 /// CPU models can execute against either accelerated distribution. The Windows server uses the
 /// DirectML distribution for CPU selection because it is the default general-purpose bundle.
 fn runtime_distribution(execution_provider: ExecutionProvider) -> &'static str {
+    if cfg!(target_os = "linux") {
+        return "openvino";
+    }
     match execution_provider {
         ExecutionProvider::OpenVino => "openvino",
         ExecutionProvider::Cpu | ExecutionProvider::Directml => "directml",
@@ -150,10 +153,15 @@ async fn update(
 fn read_provider(path: &PathBuf) -> Result<ExecutionProvider> {
     let contents = match fs::read(path) {
         Ok(contents) => contents,
-        // No saved choice yet — DirectML is the deliberate out-of-the-box default on Windows; see
-        // `runtime::fallback_chain` for what a launch does when it turns out to be unavailable.
+        // Prefer each platform's bundled accelerator, with CPU fallback when unavailable.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ExecutionProvider::Directml);
+            return Ok(if cfg!(windows) {
+                ExecutionProvider::Directml
+            } else if cfg!(target_os = "linux") {
+                ExecutionProvider::OpenVino
+            } else {
+                ExecutionProvider::Cpu
+            });
         }
         Err(error) => {
             return Err(error).with_context(|| format!("reading runtime settings: {path}"));
@@ -194,19 +202,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn missing_settings_default_to_directml_and_persist_updates() {
+    fn missing_settings_use_platform_default_and_persist_updates() {
         let temp = TempDir::new().unwrap();
         let path = PathBuf::try_from(temp.path().join("runtime.json")).unwrap();
         let settings = RuntimeSettings::load(path.clone(), None).unwrap();
         settings.set_onnx_runtime_build_info("test build".to_owned());
-        assert_eq!(settings.status().active_execution_provider, "directml");
-        assert_eq!(settings.status().configured_execution_provider, "directml");
+        let expected = if cfg!(windows) {
+            "directml"
+        } else if cfg!(target_os = "linux") {
+            "openvino"
+        } else {
+            "cpu"
+        };
+        assert_eq!(settings.status().active_execution_provider, expected);
+        assert_eq!(settings.status().configured_execution_provider, expected);
+        if cfg!(target_os = "linux") {
+            assert_eq!(settings.status().active_runtime_distribution, "openvino");
+        }
         assert!(!settings.status().restart_required);
 
-        let status = settings.set(ExecutionProvider::OpenVino).unwrap();
-        assert_eq!(status.active_execution_provider, "directml");
-        assert_eq!(status.configured_execution_provider, "openvino");
-        assert!(status.restart_required);
+        let status = settings.set(ExecutionProvider::Cpu).unwrap();
+        assert_eq!(status.active_execution_provider, expected);
+        assert_eq!(status.configured_execution_provider, "cpu");
+        assert_eq!(status.restart_required, expected != "cpu");
 
         let status = settings.set(ExecutionProvider::Directml).unwrap();
         assert_eq!(status.configured_execution_provider, "directml");

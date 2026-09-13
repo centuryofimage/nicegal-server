@@ -5,4 +5,4 @@ vcpkg/
 .vscode
 onnxruntime_openvino-1.24.1-cp313-cp313-win_amd64/
 .venv-ort-openvino/
-
+.venv-openvino/

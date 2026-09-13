@@ -207,7 +207,16 @@ pub fn initialize_bundled_runtime(execution_provider: ExecutionProvider) -> Resu
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+pub fn initialize_bundled_runtime(_execution_provider: ExecutionProvider) -> Result<()> {
+    let executable = std::env::current_exe().context("resolving the executable path")?;
+    let directory = executable
+        .parent()
+        .context("executable path has no parent directory")?;
+    initialize_from_dylib(&directory.join("onnxruntime/openvino/libonnxruntime.so"))
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn initialize_bundled_runtime(_execution_provider: ExecutionProvider) -> Result<()> {
     Ok(())
 }
