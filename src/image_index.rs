@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use camino::{Utf8Path as Path, Utf8PathBuf as PathBuf};
-use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded, select};
+use crossbeam_channel::{Receiver, Sender, bounded};
 use image::RgbImage;
 use rusqlite::types::Value;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
@@ -24,7 +24,9 @@ use crate::db::{
     register_glob, register_vector_extension, vector_to_blob,
 };
 use crate::embedding::ImageEmbedder;
-use crate::index::{IndexEvent, IndexObserver, IndexPhase, IndexProgressDelta};
+use crate::index::{
+    IndexEvent, IndexObserver, IndexPhase, IndexProgressDelta, aborted, send_unless_aborted,
+};
 use crate::schema::{check_schema_read_only, open_schema};
 
 const SCHEMA_VERSION: i32 = 1;
@@ -876,17 +878,6 @@ fn report_failure(observer: &dyn IndexObserver, path: PathBuf, message: String) 
         failed: 1,
         ..IndexProgressDelta::default()
     }));
-}
-
-fn send_unless_aborted<T>(sender: &Sender<T>, item: T, abort: &Receiver<()>) -> bool {
-    select! {
-        send(sender, item) -> sent => sent.is_ok(),
-        recv(abort) -> _ => false,
-    }
-}
-
-fn aborted(abort: &Receiver<()>) -> bool {
-    matches!(abort.try_recv(), Err(TryRecvError::Disconnected))
 }
 
 fn guard_decode_worker(

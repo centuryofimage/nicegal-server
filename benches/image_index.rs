@@ -68,11 +68,21 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let parsed = parse_arguments()?;
-    init_tracing(parsed.trace_jsonl.as_deref())?;
+    let _tracing = init_tracing(parsed.trace_jsonl.as_deref())?;
     run(parsed)
 }
 
-fn init_tracing(path: Option<&Path>) -> Result<()> {
+struct BenchmarkTracing(Box<dyn Fn()>);
+
+impl Drop for BenchmarkTracing {
+    fn drop(&mut self) {
+        // ORT logs from its process-exit destructor after the formatter's TLS is gone.
+        // All benchmark sessions and spans have finished before this guard is dropped.
+        (self.0)();
+    }
+}
+
+fn init_tracing(path: Option<&Path>) -> Result<BenchmarkTracing> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::new(
             "warn,nicegal_core::image_index=debug,nicegal_core::embedding::image=debug,nom_exif=off",
@@ -81,23 +91,34 @@ fn init_tracing(path: Option<&Path>) -> Result<()> {
     if let Some(path) = path {
         let file = File::create(path)
             .with_context(|| format!("creating JSONL trace output: {}", path.display()))?;
-        tracing_subscriber::fmt()
+        let subscriber = tracing_subscriber::fmt()
             .json()
             .with_env_filter(filter)
             .with_span_events(FmtSpan::CLOSE)
             .with_writer(file)
+            .with_filter_reloading();
+        let filter = subscriber.reload_handle();
+        subscriber
             .try_init()
             .map_err(|error| anyhow!("installing benchmark JSONL tracing subscriber: {error}"))?;
+        Ok(BenchmarkTracing(Box::new(move || {
+            let _ = filter.reload(EnvFilter::new("off"));
+        })))
     } else {
-        tracing_subscriber::fmt()
+        let subscriber = tracing_subscriber::fmt()
             .json()
             .with_env_filter(filter)
             .with_span_events(FmtSpan::CLOSE)
             .with_writer(std::io::stderr)
+            .with_filter_reloading();
+        let filter = subscriber.reload_handle();
+        subscriber
             .try_init()
             .map_err(|error| anyhow!("installing benchmark JSONL tracing subscriber: {error}"))?;
+        Ok(BenchmarkTracing(Box::new(move || {
+            let _ = filter.reload(EnvFilter::new("off"));
+        })))
     }
-    Ok(())
 }
 
 fn run(arguments: Arguments) -> Result<()> {

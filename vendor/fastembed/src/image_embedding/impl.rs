@@ -8,6 +8,27 @@ use ort::{session::Session, value::Value};
 use std::path::PathBuf;
 use std::{io::Cursor, path::Path};
 
+/// Opt-in diagnostics for the first three image batches, including warmup.
+/// Keeping the newer API behind a feature preserves compatibility with older runtimes.
+#[cfg(feature = "ort-profiling")]
+fn image_profile_options() -> Result<Option<ort::session::RunOptions>> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static RUN: AtomicUsize = AtomicUsize::new(0);
+    let Some(directory) = std::env::var_os("NICEGAL_ORT_PROFILE_DIR") else {
+        return Ok(None);
+    };
+    let run = RUN.fetch_add(1, Ordering::Relaxed);
+    if run >= 3 {
+        return Ok(None);
+    }
+    std::fs::create_dir_all(&directory)?;
+    let mut options = ort::session::RunOptions::new()?;
+    options.enable_profiling(
+        Path::new(&directory).join(format!("image-{}-{run}", std::process::id())),
+    )?;
+    Ok(Some(options))
+}
+
 use crate::{
     common::{init_session_builder, normalize, Error, Result},
     models::image_embedding::models_list,
@@ -288,10 +309,15 @@ impl ImageEmbedding {
                 .map_err(|e| Error::OrtSession(e.to_string()))?,
         ];
 
-        let outputs = self
-            .session
-            .run(session_inputs)
-            .map_err(|e| Error::OrtSession(e.to_string()))?;
+        #[cfg(feature = "ort-profiling")]
+        let profile_options = image_profile_options()?;
+        #[cfg(not(feature = "ort-profiling"))]
+        let profile_options: Option<ort::session::RunOptions> = None;
+        let outputs = match profile_options.as_ref() {
+            Some(options) => self.session.run_with_options(session_inputs, options),
+            None => self.session.run(session_inputs),
+        }
+        .map_err(|e| Error::OrtSession(e.to_string()))?;
 
         // Try to get the only output key
         // If multiple, then default to few known keys `image_embeds` and `last_hidden_state`

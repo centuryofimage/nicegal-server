@@ -21,12 +21,17 @@ pub(crate) struct Request {
     #[serde(default)]
     scan: ScanOptions,
     embed: Option<bool>,
+    #[serde(default = "default_true")]
+    ocr: bool,
+    image: Option<bool>,
 }
 
 pub(crate) struct Spec {
     root: PathBuf,
     options: IndexOptions,
-    embed: bool,
+    text: bool,
+    ocr: bool,
+    image: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -102,11 +107,19 @@ struct MaxDimensions {
 }
 
 pub(crate) fn prepare(request: Request) -> Result<Spec, ApiError> {
+    let image = request.image.unwrap_or(request.embed.unwrap_or(true));
+    if !request.ocr && !image {
+        return Err(ApiError::bad_request(
+            "select text recognition or image search",
+        ));
+    }
     roots::resolve_root("index", &request.root)?;
     Ok(Spec {
         root: request.root,
         options: index_options(request.scan)?,
-        embed: request.embed.unwrap_or(true),
+        text: request.ocr && request.embed.unwrap_or(true),
+        ocr: request.ocr,
+        image,
     })
 }
 
@@ -124,19 +137,33 @@ pub(crate) fn run(
     spec: Spec,
     asset_database: &PathBuf,
     ocr_database: &PathBuf,
-    models: &Arc<Mutex<PaddleOcrPool>>,
+    models: Option<&Arc<Mutex<PaddleOcrPool>>>,
     observer: &dyn IndexObserver,
+    catalog_step: impl FnOnce() -> anyhow::Result<bool>,
 ) -> anyhow::Result<index::IndexSummary> {
     let mut assets = AssetCatalog::new(asset_database)?;
+    if !spec.ocr {
+        let summary = index::catalog_dir_observed(&assets, &spec.root, spec.options, observer)?;
+        return Ok(index::IndexSummary {
+            indexed: 0,
+            deleted: 0,
+            cancelled: summary.cancelled || catalog_step()?,
+            scan_complete: summary.scan_complete,
+        });
+    }
+    let models = models.ok_or_else(|| {
+        anyhow::anyhow!("PaddleOCR models were unloaded after the index job was accepted")
+    })?;
     let mut ocr = DB::new(ocr_database)?;
     let mut models = models.lock().unwrap_or_else(|error| error.into_inner());
-    let summary = index::index_dir_observed(
+    let summary = index::index_dir_with_catalog_step(
         &mut assets,
         &mut ocr,
         &mut models,
         &spec.root,
         spec.options,
         observer,
+        catalog_step,
     )?;
     Ok(summary)
 }
@@ -165,8 +192,16 @@ impl Spec {
         &self.root
     }
 
-    pub(crate) fn embeds(&self) -> bool {
-        self.embed
+    pub(crate) fn recognizes_text(&self) -> bool {
+        self.ocr
+    }
+
+    pub(crate) fn embeds_text(&self) -> bool {
+        self.text
+    }
+
+    pub(crate) fn embeds_images(&self) -> bool {
+        self.image
     }
 
     pub(crate) fn retry_failed(&self) -> bool {
@@ -243,6 +278,40 @@ fn default_excludes() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_only_scan_does_not_open_ocr_database_or_require_models() {
+        crate::api::tests::initialize_test_runtime();
+        let temp = tempfile::TempDir::new().unwrap();
+        let directory = PathBuf::try_from(temp.path().to_path_buf()).unwrap();
+        let root = directory.join("pictures");
+        std::fs::create_dir(&root).unwrap();
+        let request: Request = serde_json::from_value(serde_json::json!({
+            "root": root, "ocr": false, "image": true
+        }))
+        .unwrap();
+        struct Observer;
+        impl IndexObserver for Observer {}
+        let mut called = false;
+        let summary = run(
+            prepare(request).unwrap(),
+            &directory.join("assets.db"),
+            &directory.join("ocr.db"),
+            None,
+            &Observer,
+            || {
+                called = true;
+                assert!(directory.join("assets.db").exists());
+                assert!(!directory.join("ocr.db").exists());
+                Ok(true)
+            },
+        )
+        .unwrap();
+        assert!(summary.scan_complete);
+        assert!(called);
+        assert!(summary.cancelled);
+        assert!(!directory.join("ocr.db").exists());
+    }
 
     #[test]
     fn index_request_uses_stable_scan_defaults() {

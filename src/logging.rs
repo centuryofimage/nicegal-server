@@ -32,8 +32,16 @@ const KEPT_GENERATIONS: u32 = 3;
 /// Keeps the non-blocking writers' background flush threads alive.
 #[must_use]
 pub struct LoggingGuards {
+    shutdown: Box<dyn Fn() + Send + Sync>,
     _console: WorkerGuard,
     _file: WorkerGuard,
+}
+
+impl Drop for LoggingGuards {
+    fn drop(&mut self) {
+        // Stop events before formatter TLS is destroyed; then WorkerGuard flushes queued lines.
+        (self.shutdown)();
+    }
 }
 
 pub fn init(log_directory: &Path, override_directives: Option<&str>) -> Result<LoggingGuards> {
@@ -71,13 +79,19 @@ pub fn init(log_directory: &Path, override_directives: Option<&str>) -> Result<L
         .with_ansi(true)
         .with_filter(EnvFilter::new(DEFAULT_DIRECTIVES));
 
+    let (shutdown_filter, shutdown_handle) =
+        tracing_subscriber::reload::Layer::new(tracing_subscriber::filter::LevelFilter::TRACE);
     tracing_subscriber::registry()
         .with(file_layer)
         .with(console_layer)
+        .with(shutdown_filter)
         .try_init()
         .map_err(|error| anyhow::anyhow!("installing the log writer: {error}"))?;
 
     Ok(LoggingGuards {
+        shutdown: Box::new(move || {
+            let _ = shutdown_handle.reload(tracing_subscriber::filter::LevelFilter::OFF);
+        }),
         _console: console_guard,
         _file: file_guard,
     })

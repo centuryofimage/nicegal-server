@@ -1,2 +1,4 @@
-- Fixed auto updater 😱
-- Added download progress bar
+- Added WebGPU based acceleration on linux
+- Accelerated CLIP by 10x
+- Redesigned all view, again
+- Reduced priority of OCR features

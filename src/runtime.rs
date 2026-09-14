@@ -43,6 +43,7 @@ pub enum ExecutionProvider {
     Cpu,
     OpenVino,
     Directml,
+    Webgpu,
 }
 
 fn unsupported_execution_provider(provider: &str) -> ParseExecutionProviderError {
@@ -174,6 +175,9 @@ pub fn initialize_bundled_runtime(execution_provider: ExecutionProvider) -> Resu
     let runtime_distribution = match execution_provider {
         ExecutionProvider::OpenVino => "openvino",
         ExecutionProvider::Cpu | ExecutionProvider::Directml => "directml",
+        ExecutionProvider::Webgpu => {
+            bail!("{execution_provider} is only supported on Linux")
+        }
     };
     let executable = std::env::current_exe().context("resolving the executable path")?;
     let executable_directory = executable
@@ -208,12 +212,39 @@ pub fn initialize_bundled_runtime(execution_provider: ExecutionProvider) -> Resu
 }
 
 #[cfg(target_os = "linux")]
-pub fn initialize_bundled_runtime(_execution_provider: ExecutionProvider) -> Result<()> {
+pub fn initialize_bundled_runtime(execution_provider: ExecutionProvider) -> Result<()> {
+    let distribution = match execution_provider {
+        ExecutionProvider::Cpu if cfg!(feature = "ort-webgpu") => "webgpu",
+        ExecutionProvider::Cpu | ExecutionProvider::OpenVino => "openvino",
+        ExecutionProvider::Webgpu => "webgpu",
+        ExecutionProvider::Directml => bail!("directml is only supported on Windows"),
+    };
     let executable = std::env::current_exe().context("resolving the executable path")?;
     let directory = executable
         .parent()
         .context("executable path has no parent directory")?;
-    initialize_from_dylib(&directory.join("onnxruntime/openvino/libonnxruntime.so"))
+    let dylib = directory
+        .join("onnxruntime")
+        .join(distribution)
+        .join("libonnxruntime.so");
+    if !dylib.is_file() {
+        bail!(
+            "the {distribution} ONNX Runtime distribution is missing: expected {}",
+            dylib.display()
+        );
+    }
+    initialize_from_dylib(&dylib)?;
+    #[cfg(feature = "ort-webgpu")]
+    if execution_provider == ExecutionProvider::Webgpu {
+        ort::environment::Environment::current()?
+            .register_ep_library(
+                "webgpu",
+                directory.join("onnxruntime/webgpu/libonnxruntime_providers_webgpu.so"),
+            )
+            .context("registering native WebGPU plugin")?;
+    }
+    tracing::info!(%execution_provider, distribution, path = %dylib.display(), "initialized ONNX Runtime");
+    Ok(())
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
@@ -262,7 +293,9 @@ pub(crate) fn fallback_chain(
 ) -> &'static [ExecutionProvider] {
     match execution_provider {
         ExecutionProvider::Directml => &[ExecutionProvider::OpenVino, ExecutionProvider::Cpu],
-        ExecutionProvider::OpenVino | ExecutionProvider::Cpu => &[ExecutionProvider::Cpu],
+        ExecutionProvider::OpenVino | ExecutionProvider::Webgpu | ExecutionProvider::Cpu => {
+            &[ExecutionProvider::Cpu]
+        }
     }
 }
 
@@ -316,6 +349,14 @@ pub(crate) fn configure_provider(
         ExecutionProvider::Directml => directml_provider(intra_threads),
         #[cfg(not(feature = "ort-directml"))]
         ExecutionProvider::Directml => provider_unavailable(execution_provider, "ort-directml"),
+
+        #[cfg(feature = "ort-webgpu")]
+        ExecutionProvider::Webgpu => Ok(ConfiguredProvider {
+            dispatch: ort::ep::WebGPU::default().build().error_on_failure(),
+            intra_threads,
+        }),
+        #[cfg(not(feature = "ort-webgpu"))]
+        ExecutionProvider::Webgpu => provider_unavailable(execution_provider, "ort-webgpu"),
     }
 }
 
@@ -331,15 +372,37 @@ fn compile_session(
 ) -> Result<Session> {
     let provider = configure_provider(execution_provider, intra_threads)?;
 
-    let mut builder = Session::builder()?
+    let builder = Session::builder()?
         .with_intra_threads(provider.intra_threads.get())
         .map_err(builder_error)?
         .with_parallel_execution(false)
         .map_err(builder_error)?
-        .with_execution_providers([provider.dispatch])
-        .map_err(builder_error)?
-        .with_optimization_level(GraphOptimizationLevel::Level3)
+        // WebGPU plugin 0.3.0 cannot initialize ORT 1.30's fused OCR activations.
+        // Basic optimization keeps the supported Conv and activation kernels separate.
+        .with_optimization_level(if execution_provider == ExecutionProvider::Webgpu {
+            GraphOptimizationLevel::Level1
+        } else {
+            GraphOptimizationLevel::Level3
+        })
         .map_err(builder_error)?;
+    let mut builder = if execution_provider == ExecutionProvider::Webgpu {
+        let environment = ort::environment::Environment::current()?;
+        let device = environment
+            .devices()
+            .find(|device| {
+                device
+                    .ep()
+                    .is_ok_and(|name| name == "WebGpuExecutionProvider")
+            })
+            .context("No native WebGPU device is available")?;
+        builder
+            .with_devices([device], None)
+            .map_err(builder_error)?
+    } else {
+        builder
+            .with_execution_providers([provider.dispatch])
+            .map_err(builder_error)?
+    };
     if provider.intra_threads.get() == 1 {
         // A one-thread ORT pool means the provider below owns the compute; spinning would only
         // take cores from the pool doing the work.
@@ -394,7 +457,7 @@ fn directml_provider(intra_threads: NonZeroUsize) -> Result<ConfiguredProvider> 
 
 /// Refuse a provider whose `ort` feature was not compiled into this build.
 #[cfg_attr(
-    any(feature = "ort-openvino", feature = "ort-directml"),
+    any(feature = "ort-openvino", feature = "ort-directml",),
     allow(dead_code)
 )]
 fn provider_unavailable(
@@ -409,7 +472,7 @@ fn provider_unavailable(
 /// An `ort` provider feature only compiles in the Rust side of registration; whether the provider
 /// exists belongs to the library loaded at runtime. Unchecked, such a session commits silently on
 /// CPU and everything measured from it is mislabelled.
-#[cfg(any(feature = "ort-openvino", feature = "ort-directml"))]
+#[cfg(any(feature = "ort-openvino", feature = "ort-directml",))]
 fn ensure_available(
     provider: &impl ort::ep::ExecutionProvider,
     name: ExecutionProvider,
@@ -453,6 +516,7 @@ mod tests {
             ("cpu", ExecutionProvider::Cpu),
             ("openvino", ExecutionProvider::OpenVino),
             ("directml", ExecutionProvider::Directml),
+            ("webgpu", ExecutionProvider::Webgpu),
         ] {
             assert_eq!(ExecutionProvider::from_str(value).unwrap(), expected);
             assert_eq!(expected.to_string(), value);

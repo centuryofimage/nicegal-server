@@ -17,6 +17,8 @@ regex = ["dep:regex", "rusqlite/functions"]
 # binary that wants output turns it on and calls `logging::init` once.
 logging = ["dep:tracing-subscriber", "dep:tracing-appender"]
 ort-openvino = ["ort/openvino"]
+ort-webgpu = ["ort/webgpu", "fastembed/webgpu"]
+ort-profiling = ["ort/api-25", "fastembed/ort-profiling"]
 # FastEmbed's own `directml` feature isn't about registering the provider (our `ort/directml`
 # already does that for every session in the process) — it turns on FastEmbed's DirectML-specific
 # session builder tweaks (disabled memory pattern and parallel execution) once it sees a DirectML

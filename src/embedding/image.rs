@@ -499,7 +499,13 @@ impl ImageEmbedder {
         let Some(backend) = backend else {
             return Ok(None);
         };
-        let preprocessor = backend.preprocessor();
+        let preprocessor = backend
+            .preprocessor()
+            .with_resize(|image, width, height, filter| {
+                crate::imaging::resize_rgb(image.into_rgb8(), width, height, filter)
+                    .map(DynamicImage::ImageRgb8)
+                    .map_err(|error| fastembed::Error::ImageTransform(format!("{error:#}")))
+            });
         let embedder = Self {
             backend: Mutex::new(backend),
             preprocessor,

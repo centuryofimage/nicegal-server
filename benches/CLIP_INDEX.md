@@ -74,12 +74,12 @@ and normalization. Operator/kernel profiling is needed to separate those costs a
 GPU transfers; ordinary `RUST_LOG` spans cannot provide that breakdown.
 
 Aggregate inputs are in the frontend repository under
-`temp/clip-models/state/benchmarks/pictures-20260913-194325/` (`results.json`,
+`../model-exports/state/benchmarks/pictures-20260913-194325/` (`results.json`,
 `stage-summary.csv`, `stage-timings.csv`, and `compute-node-placement.csv`).
 Recompute the trace aggregates from the frontend directory with:
 
 ```powershell
-uvx --with=pandas python temp/clip-models/analyze_benchmark_traces.py temp/clip-models/state/benchmarks/pictures-20260913-194325
+uvx --with=pandas python ../model-exports/analyze_benchmark_traces.py ../model-exports/state/benchmarks/pictures-20260913-194325
 ```
 
 The analyzer reads private traces locally and exports only model identifiers,

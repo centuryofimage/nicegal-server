@@ -31,6 +31,12 @@ impl RuntimeSettings {
         path: PathBuf,
         command_line_provider: Option<ExecutionProvider>,
     ) -> Result<Self> {
+        if let Some(provider) = command_line_provider {
+            anyhow::ensure!(
+                provider_available(provider),
+                "the {provider} execution provider is not compiled for this platform"
+            );
+        }
         let configured_execution_provider = read_provider(&path)?;
         Ok(Self {
             path,
@@ -69,6 +75,7 @@ impl RuntimeSettings {
             configured_execution_provider: configured_execution_provider.to_string(),
             restart_required: self.active_execution_provider != configured_execution_provider,
             image_model: None,
+            available_execution_providers: available_execution_providers(),
         }
     }
 
@@ -76,6 +83,10 @@ impl RuntimeSettings {
         &self,
         execution_provider: ExecutionProvider,
     ) -> Result<RuntimeStatusResponse> {
+        anyhow::ensure!(
+            provider_available(execution_provider),
+            "the {execution_provider} execution provider is not compiled for this platform"
+        );
         write_provider(&self.path, execution_provider)?;
         *self
             .configured_execution_provider
@@ -95,18 +106,59 @@ pub(super) struct RuntimeStatusResponse {
     restart_required: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     image_model: Option<super::image_model::ModelStatus>,
+    available_execution_providers: &'static [&'static str],
 }
 
 /// CPU models can execute against either accelerated distribution. The Windows server uses the
 /// DirectML distribution for CPU selection because it is the default general-purpose bundle.
 fn runtime_distribution(execution_provider: ExecutionProvider) -> &'static str {
-    if cfg!(target_os = "linux") {
-        return "openvino";
-    }
     match execution_provider {
         ExecutionProvider::OpenVino => "openvino",
-        ExecutionProvider::Cpu | ExecutionProvider::Directml => "directml",
+        ExecutionProvider::Webgpu => "webgpu",
+        ExecutionProvider::Cpu | ExecutionProvider::Directml => {
+            if cfg!(target_os = "linux") {
+                if cfg!(feature = "ort-webgpu") {
+                    "webgpu"
+                } else {
+                    "openvino"
+                }
+            } else {
+                "directml"
+            }
+        }
     }
+}
+
+fn available_execution_providers() -> &'static [&'static str] {
+    if cfg!(target_os = "linux") {
+        &[
+            #[cfg(feature = "ort-webgpu")]
+            "webgpu",
+            #[cfg(feature = "ort-openvino")]
+            "openvino",
+            "cpu",
+        ]
+    } else if cfg!(windows) {
+        &[
+            #[cfg(feature = "ort-directml")]
+            "directml",
+            #[cfg(feature = "ort-openvino")]
+            "openvino",
+            "cpu",
+        ]
+    } else {
+        &["cpu"]
+    }
+}
+
+fn provider_available(provider: ExecutionProvider) -> bool {
+    available_execution_providers().contains(&provider.to_string().as_str())
+}
+
+fn default_provider() -> ExecutionProvider {
+    available_execution_providers()[0]
+        .parse()
+        .expect("compiled provider name is valid")
 }
 
 #[derive(Debug, Deserialize)]
@@ -159,12 +211,22 @@ async fn update(
         .map(ExecutionProvider::from_str)
         .transpose()
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    if let Some(provider) = execution_provider
+        && !provider_available(provider)
+    {
+        return Err(ApiError::bad_request(format!(
+            "The {provider} execution provider is not available on this platform"
+        )));
+    }
     let model = request
         .image_model
         .as_deref()
         .map(str::parse::<nicegal_core::embedding::ImageEmbeddingModel>)
         .transpose()
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    if state.jobs.has_active_job() {
+        return Err(ApiError::job_busy());
+    }
     if let Some(model) = model {
         if !nicegal_core::embedding::ImageEmbeddingModel::SELECTABLE.contains(&model) {
             return Err(ApiError::bad_request(
@@ -173,9 +235,6 @@ async fn update(
         }
         if !model.available() {
             return Err(ApiError::bad_request("Image model is unavailable"));
-        }
-        if state.jobs.has_active_job() {
-            return Err(ApiError::job_busy());
         }
     }
     let runtime = Arc::clone(&state.runtime);
@@ -200,13 +259,7 @@ fn read_provider(path: &PathBuf) -> Result<ExecutionProvider> {
         Ok(contents) => contents,
         // Prefer each platform's bundled accelerator, with CPU fallback when unavailable.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(if cfg!(windows) {
-                ExecutionProvider::Directml
-            } else if cfg!(target_os = "linux") {
-                ExecutionProvider::OpenVino
-            } else {
-                ExecutionProvider::Cpu
-            });
+            return Ok(default_provider());
         }
         Err(error) => {
             return Err(error).with_context(|| format!("reading runtime settings: {path}"));
@@ -214,8 +267,22 @@ fn read_provider(path: &PathBuf) -> Result<ExecutionProvider> {
     };
     let settings: RuntimeSettingsFile = serde_json::from_slice(&contents)
         .with_context(|| format!("parsing runtime settings: {path}"))?;
-    ExecutionProvider::from_str(&settings.execution_provider)
-        .map_err(|error| anyhow!("invalid execution provider in runtime settings {path}: {error}"))
+    let saved = match ExecutionProvider::from_str(&settings.execution_provider) {
+        Ok(provider) => Some(provider),
+        Err(_) if matches!(settings.execution_provider.as_str(), "cuda" | "migraphx") => None,
+        Err(error) => {
+            return Err(anyhow!(
+                "invalid execution provider in runtime settings {path}: {error}"
+            ));
+        }
+    };
+    if let Some(provider) = saved.filter(|provider| provider_available(*provider)) {
+        return Ok(provider);
+    }
+    let provider = default_provider();
+    write_provider(path, provider)?;
+    tracing::warn!(previous = settings.execution_provider, %provider, "saved execution provider is absent from this build; selected bundled default");
+    Ok(provider)
 }
 
 fn write_provider(path: &PathBuf, execution_provider: ExecutionProvider) -> Result<()> {
@@ -252,17 +319,14 @@ mod tests {
         let path = PathBuf::try_from(temp.path().join("runtime.json")).unwrap();
         let settings = RuntimeSettings::load(path.clone(), None).unwrap();
         settings.set_onnx_runtime_build_info("test build".to_owned());
-        let expected = if cfg!(windows) {
-            "directml"
-        } else if cfg!(target_os = "linux") {
-            "openvino"
-        } else {
-            "cpu"
-        };
+        let expected = available_execution_providers()[0];
         assert_eq!(settings.status().active_execution_provider, expected);
         assert_eq!(settings.status().configured_execution_provider, expected);
         if cfg!(target_os = "linux") {
-            assert_eq!(settings.status().active_runtime_distribution, "openvino");
+            assert_eq!(
+                settings.status().active_runtime_distribution,
+                runtime_distribution(default_provider())
+            );
         }
         assert!(!settings.status().restart_required);
 
@@ -271,11 +335,11 @@ mod tests {
         assert_eq!(status.configured_execution_provider, "cpu");
         assert_eq!(status.restart_required, expected != "cpu");
 
-        let status = settings.set(ExecutionProvider::Directml).unwrap();
-        assert_eq!(status.configured_execution_provider, "directml");
+        let status = settings.set(default_provider()).unwrap();
+        assert_eq!(status.configured_execution_provider, expected);
 
         let restarted = RuntimeSettings::load(path, None).unwrap();
-        assert_eq!(restarted.status().active_execution_provider, "directml");
+        assert_eq!(restarted.status().active_execution_provider, expected);
         assert!(!restarted.status().restart_required);
     }
 
@@ -283,12 +347,39 @@ mod tests {
     fn command_line_provider_overrides_saved_setting_for_this_launch() {
         let temp = TempDir::new().unwrap();
         let path = PathBuf::try_from(temp.path().join("runtime.json")).unwrap();
-        write_provider(&path, ExecutionProvider::OpenVino).unwrap();
+        write_provider(&path, default_provider()).unwrap();
 
-        let settings = RuntimeSettings::load(path, Some(ExecutionProvider::Directml)).unwrap();
+        let settings = RuntimeSettings::load(path, Some(ExecutionProvider::Cpu)).unwrap();
         let status = settings.status();
-        assert_eq!(status.active_execution_provider, "directml");
-        assert_eq!(status.configured_execution_provider, "openvino");
-        assert!(status.restart_required);
+        assert_eq!(status.active_execution_provider, "cpu");
+        assert_eq!(
+            status.configured_execution_provider,
+            default_provider().to_string()
+        );
+        assert_eq!(
+            status.restart_required,
+            default_provider() != ExecutionProvider::Cpu
+        );
+    }
+
+    #[test]
+    fn saved_unavailable_providers_migrate_but_explicit_overrides_fail() {
+        let temp = TempDir::new().unwrap();
+        let path = PathBuf::try_from(temp.path().join("runtime.json")).unwrap();
+        for saved in ["cuda", "migraphx", "webgpu", "openvino", "directml"] {
+            if available_execution_providers().contains(&saved) {
+                continue;
+            }
+            fs::write(&path, format!(r#"{{"executionProvider":"{saved}"}}"#)).unwrap();
+            let settings = RuntimeSettings::load(path.clone(), None).unwrap();
+            assert_eq!(settings.active_execution_provider(), default_provider());
+            let persisted: RuntimeSettingsFile =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(persisted.execution_provider, default_provider().to_string());
+            if let Ok(provider) = saved.parse() {
+                assert!(RuntimeSettings::load(path.clone(), Some(provider)).is_err());
+                assert!(settings.set(provider).is_err());
+            }
+        }
     }
 }

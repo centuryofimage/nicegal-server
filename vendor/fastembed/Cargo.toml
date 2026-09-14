@@ -75,6 +75,8 @@ default = [
     "image-models",
 ]
 directml = ["ort/directml"]
+webgpu = ["ort/webgpu"]
+ort-profiling = ["ort/api-25"]
 hf-hub = [
     "dep:hf-hub",
     "hf-hub?/ureq",

@@ -82,12 +82,17 @@ def runtime_packages() -> list[dict]:
     """Pinned runtime metadata; DirectML's version is not pinned independently."""
     requirements = "\n".join(
         (ROOT / filename).read_text(encoding="utf-8")
-        for filename in ("requirements-directml.txt", "requirements-openvino.txt")
+        for filename in (
+            "requirements-directml.txt", "requirements-openvino.txt",
+            "requirements-webgpu.txt",
+        )
     )
     packages = []
     for name, license_name, url in (
         ("onnxruntime-directml", "MIT", "https://github.com/microsoft/onnxruntime"),
         ("onnxruntime-openvino", "MIT", "https://github.com/microsoft/onnxruntime"),
+        ("onnxruntime", "MIT", "https://github.com/microsoft/onnxruntime"),
+        ("onnxruntime-ep-webgpu", "MIT", "https://github.com/microsoft/onnxruntime"),
         ("openvino", "Apache-2.0", "https://github.com/openvinotoolkit/openvino"),
     ):
         match = re.search(rf"^{re.escape(name)}==([^;\s]+)", requirements, re.MULTILINE)
@@ -144,7 +149,8 @@ def main() -> None:
             "Separately provisioned runtime components. ONNX Runtime and OpenVINO "
             "versions come from requirements files; the separately installed OpenVINO "
             "pin applies to Windows. Linux uses libraries bundled in its ONNX Runtime "
-            "wheel. DirectML 1.15.4 license terms were verified against the Windows "
+            "wheel. Linux defaults to the native WebGPU runtime and plugin. DirectML 1.15.4 license "
+            "terms were verified against the Windows "
             "runtime DLL; its version is controlled by the ONNX Runtime wheel. "
             "These entries do not enumerate every component bundled in native runtimes."
         ),

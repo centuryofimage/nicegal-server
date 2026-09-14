@@ -10,11 +10,21 @@ Nicegal uses FastEmbed for BGE text embeddings and CLIP image/text embeddings
 through ONNX Runtime. The application initializes the runtime and supplies
 execution-provider settings before constructing embedding sessions.
 
+The optional `webgpu` feature recognizes WebGPU dispatches and registers the
+native plugin's discovered device. The optional `ort-profiling` feature enables
+bounded image-inference diagnostics through `NICEGAL_ORT_PROFILE_DIR` and requires
+ONNX Runtime API 25. Both are disabled unless selected by the parent build.
+
 The local integration exposes a cloneable `ImagePreprocessor` through
 `ImageEmbedding::preprocessor()`. Decode workers preprocess images into owned
 `ndarray::Array3<f32>` tensors; `ImageEmbedding::embed_preprocessed` runs batches
 of those tensors through the model. Cached model-loading paths allow query
 encoders to reload without a network request.
+
+`ImagePreprocessor::with_resize` lets the host supply its shared SIMD resizer.
+Nicegal uses float intermediates to limit changes to model inputs. The fork still
+owns each model's dimensions, crop offsets, Pillow pass order, and normalization;
+the callback is shared without locking the parallel preprocessing workers.
 
 Build this package through the parent Nicegal workspace. See the backend
 [README](../../README.md) and [CLIP benchmark](../../benches/CLIP_INDEX.md).

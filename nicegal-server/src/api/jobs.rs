@@ -112,7 +112,7 @@ impl JobSpec {
     }
 
     fn requires_loaded_ocr_models(&self) -> bool {
-        matches!(self, Self::OcrIndex(_))
+        matches!(self, Self::OcrIndex(spec) if spec.recognizes_text())
     }
 }
 
@@ -219,8 +219,16 @@ impl DownloadObserver for Job {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq)]
+struct IndexStages {
+    ocr: bool,
+    image: bool,
+    text: bool,
+}
+
 #[derive(Debug, Clone)]
 struct JobData {
+    index_stages: Option<IndexStages>,
     status: JobStatus,
     phase: JobPhase,
     progress: JobProgress,
@@ -242,6 +250,8 @@ struct JobItemError {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct JobResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    index_stages: Option<IndexStages>,
     job_id: String,
     #[serde(rename = "type")]
     kind: JobKind,
@@ -274,6 +284,7 @@ pub(super) struct Job {
 impl Job {
     fn new(id: u64, kind: JobKind) -> Self {
         let data = JobData {
+            index_stages: None,
             status: JobStatus::Queued,
             phase: JobPhase::Queued,
             progress: JobProgress::default(),
@@ -303,6 +314,7 @@ impl Job {
 
     fn response_from_data(id: u64, kind: JobKind, data: &JobData) -> JobResponse {
         JobResponse {
+            index_stages: data.index_stages,
             job_id: id.to_string(),
             kind,
             status: data.status,
@@ -612,6 +624,15 @@ impl JobManager {
             evict_retained_jobs(&mut registry);
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
             let job = Arc::new(Job::new(id, spec.kind()));
+            if let JobSpec::OcrIndex(spec) = &spec {
+                let mut data = job.data();
+                data.index_stages = Some(IndexStages {
+                    ocr: spec.recognizes_text(),
+                    image: spec.embeds_images(),
+                    text: spec.embeds_text(),
+                });
+                job.publish(&mut data);
+            }
             registry.active = Some(id);
             registry.jobs.insert(id, Arc::clone(&job));
             job
@@ -649,16 +670,17 @@ impl JobManager {
         let embedder = Arc::clone(&self.embedder);
         let image_embedder = Arc::clone(&self.image_embedder);
         let image_query_embedder = Arc::clone(&self.image_query_embedder);
-        let ocr_models = matches!(&spec, JobSpec::OcrIndex(_))
+        let ocr_models = spec
+            .requires_loaded_ocr_models()
             .then(|| self.ocr_models.snapshot())
             .flatten();
         let span = Span::current();
         tokio::task::spawn_blocking(move || {
             let _entered = span.enter();
             let needs_text = matches!(&spec, JobSpec::TextEmbed(_) | JobSpec::ModelPrepare)
-                || matches!(&spec, JobSpec::OcrIndex(spec) if spec.embeds());
+                || matches!(&spec, JobSpec::OcrIndex(spec) if spec.embeds_text());
             let needs_image = matches!(&spec, JobSpec::ImageEmbed(_) | JobSpec::ModelPrepare)
-                || matches!(&spec, JobSpec::OcrIndex(spec) if spec.embeds());
+                || matches!(&spec, JobSpec::OcrIndex(spec) if spec.embeds_images());
             if needs_text || needs_image {
                 let needs_image_text =
                     needs_image && image_embedder.model().supports_text_queries();
@@ -690,12 +712,8 @@ impl JobManager {
             match spec {
                 JobSpec::ModelPrepare => Ok(false),
                 JobSpec::OcrIndex(spec) => {
-                    let models = ocr_models.ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "PaddleOCR models were unloaded after the index job was accepted"
-                        )
-                    })?;
-                    let embed = spec.embeds();
+                    let embed_text = spec.embeds_text();
+                    let embed_image = spec.embeds_images();
                     let root = spec.root().clone();
                     let retry_failed = spec.retry_failed();
                     let debug_limit = spec.debug_limit();
@@ -704,8 +722,22 @@ impl JobManager {
                         spec,
                         &databases.assets,
                         &databases.ocr,
-                        &models,
+                        ocr_models.as_ref(),
                         job.as_ref(),
+                        || {
+                            Ok(embed_image
+                                && image_embeddings::run(
+                                    image_embeddings::Spec::pending_for(
+                                        root.clone(),
+                                        retry_failed,
+                                        debug_limit,
+                                    ),
+                                    &databases.assets,
+                                    &databases.images,
+                                    image_embedder.prepare()?.as_ref(),
+                                    job.as_ref(),
+                                )?)
+                        },
                     )?;
                     let cancelled = summary.cancelled
                         || (summary.scan_complete
@@ -716,22 +748,11 @@ impl JobManager {
                                 &thumbnails,
                                 job.as_ref(),
                             )?);
-                    if cancelled || !embed {
+                    if cancelled {
                         return Ok(cancelled);
                     }
-                    let cancelled = image_embeddings::run(
-                        image_embeddings::Spec::pending_for(
-                            root.clone(),
-                            retry_failed,
-                            debug_limit,
-                        ),
-                        &databases.assets,
-                        &databases.images,
-                        image_embedder.prepare()?.as_ref(),
-                        job.as_ref(),
-                    )?;
-                    if cancelled {
-                        return Ok(true);
+                    if !embed_text {
+                        return Ok(false);
                     }
                     text_embeddings::job::run(
                         text_embeddings::job::Spec::pending_for(root, debug_limit),
@@ -1236,6 +1257,39 @@ mod tests {
             "unexpected": true
         });
         assert!(serde_json::from_value::<JobRequest>(unknown).is_err());
+    }
+
+    #[test]
+    fn selective_indexing_only_requires_selected_models() {
+        let root = std::env::current_dir().unwrap();
+        for (ocr, image) in [(true, true), (true, false), (false, true)] {
+            let request: JobRequest = serde_json::from_value(serde_json::json!({
+                "type": "ocrIndex", "params": { "root": root, "ocr": ocr, "image": image }
+            }))
+            .unwrap();
+            let spec = request.prepare().unwrap();
+            assert_eq!(spec.requires_loaded_ocr_models(), ocr);
+            let JobSpec::OcrIndex(spec) = spec else {
+                panic!("wrong job type")
+            };
+            assert_eq!(spec.embeds_text(), ocr);
+            assert_eq!(spec.embeds_images(), image);
+        }
+        let request: JobRequest = serde_json::from_value(serde_json::json!({
+            "type": "ocrIndex", "params": { "root": root, "ocr": false, "image": false }
+        }))
+        .unwrap();
+        assert!(request.prepare().is_err());
+        let request: JobRequest = serde_json::from_value(serde_json::json!({
+            "type": "ocrIndex", "params": { "root": root, "embed": false }
+        }))
+        .unwrap();
+        let JobSpec::OcrIndex(spec) = request.prepare().unwrap() else {
+            panic!("wrong job type")
+        };
+        assert!(spec.recognizes_text());
+        assert!(!spec.embeds_text());
+        assert!(!spec.embeds_images());
     }
 
     #[test]

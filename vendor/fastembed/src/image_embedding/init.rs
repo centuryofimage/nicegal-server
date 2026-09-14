@@ -82,18 +82,37 @@ impl UserDefinedImageEmbeddingModel {
 #[derive(Clone)]
 pub struct ImagePreprocessor {
     inner: Arc<Compose>,
+    resize: Option<Arc<super::utils::ResizeFn>>,
 }
 
 impl ImagePreprocessor {
     pub(crate) fn new(inner: Compose) -> Self {
         Self {
             inner: Arc::new(inner),
+            resize: None,
         }
     }
 
     /// Resize, crop, rescale, and normalize an image according to this model's configuration.
     pub fn preprocess(&self, image: DynamicImage) -> crate::Result<Array3<f32>> {
-        self.inner.preprocess_image(image)
+        match &self.resize {
+            Some(resize) => self
+                .inner
+                .preprocess_image_with_resize(image, resize.as_ref()),
+            None => self.inner.preprocess_image(image),
+        }
+    }
+
+    /// Use the host's resizer while retaining model-specific geometry and normalization.
+    pub fn with_resize<F>(mut self, resize: F) -> Self
+    where
+        F: Fn(DynamicImage, u32, u32, image::imageops::FilterType) -> crate::Result<DynamicImage>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.resize = Some(Arc::new(resize));
+        self
     }
 }
 
@@ -109,6 +128,32 @@ mod tests {
     use image::{DynamicImage, RgbImage};
 
     use super::*;
+
+    #[test]
+    fn host_resize_keeps_crop_and_normalization() {
+        let config = br#"{"do_resize":true,"size":{"height":4,"width":4},
+            "do_center_crop":true,"crop_size":{"height":2,"width":2},
+            "do_rescale":true,"rescale_factor":0.5,
+            "do_normalize":true,"image_mean":[1,1,1],"image_std":[2,2,2]}"#;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let preprocessor = ImagePreprocessor::new(Compose::from_bytes(config).unwrap())
+            .with_resize(move |_, width, height, filter| {
+                assert_eq!((width, height), (4, 4));
+                assert_eq!(filter, image::imageops::FilterType::CatmullRom);
+                observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(RgbImage::from_pixel(width, height, image::Rgb([5, 7, 9])).into())
+            });
+        let pixels = preprocessor
+            .clone()
+            .preprocess(RgbImage::new(10, 20).into())
+            .unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(pixels.shape(), &[3, 2, 2]);
+        assert_eq!(pixels[[0, 0, 0]], 0.75);
+        assert_eq!(pixels[[1, 1, 1]], 1.25);
+        assert_eq!(pixels[[2, 0, 1]], 1.75);
+    }
 
     #[test]
     fn preprocessor_is_cloneable_and_normalizes_images() {

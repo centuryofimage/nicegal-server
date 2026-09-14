@@ -15,6 +15,19 @@
 
 ## Runtime setup
 
+- Default Linux `ort-webgpu` uses ONNX Runtime 1.30.0 and native WebGPU plugin
+  0.3.0, pinned in `requirements-webgpu.txt`. Build with
+  `NICEGAL_LINUX_PROVIDERS=webgpu ./build-server.sh`. Only the native shared
+  libraries are packaged; Python is a build tool. Startup registers the plugin
+  before sessions are created. Both the core and vendored FastEmbed register its
+  discovered device through `SessionBuilder::with_devices`; the older built-in
+  WebGPU registration API does not select plugin devices. CPU fallback uses the
+  same ORT distribution. These runtime versions do not affect Windows providers.
+  PaddleOCR sessions use BASIC graph optimization: ORT 1.30's fused convolution
+  activations fail to initialize with plugin 0.3.0, while separate kernels pass
+  the native parity tests. FastEmbed's embedding sessions retain their existing
+  optimization level.
+
 - `build-server.cmd` creates the `.venv-directml` and `.venv-openvino` environments from their
   corresponding requirements files, skipping each once installed.
 - `build.rs` copies both distributions to `onnxruntime/directml/` and `onnxruntime/openvino/` next
@@ -32,6 +45,12 @@
   replace the loaded DLL or live sessions.
 
 ## Important gotchas
+
+- Opt-in `ort-profiling` requires ORT API 25 or newer. With this feature,
+  `NICEGAL_ORT_PROFILE_DIR` records ONNX profiles for the first three image batches
+  (including warmup), using `RunOptions::enable_profiling`. Leave both unset for
+  throughput measurements. This feature is not enabled in the standard Windows
+  build, whose older runtimes retain the existing API 24 requirement.
 
 - With `load-dynamic`, `ort-sys/disable-linking` means upstream `copy-dylibs` does not run.
   `build.rs` copies the two distributions itself, and startup selects an absolute DLL path.
@@ -71,5 +90,10 @@
 
 ## Platform support
 
-The packaged accelerated runtimes target Windows x64. Linux and macOS runtime
-packaging is not supported.
+Windows packages include DirectML and OpenVINO. Linux x64 defaults to WebGPU
+with CPU fallback and requires a working Vulkan driver/loader. An OpenVINO build
+can be selected with `NICEGAL_LINUX_PROVIDERS=openvino`. The later September 14
+user direction removes the untested CUDA/MIGraphX paths, superseding their
+earlier inclusion during the Linux branch merge. Saved unavailable provider
+selections migrate to the current build's default. Explicit unavailable CLI/API
+choices are rejected. macOS runtime packaging is not supported.

@@ -180,6 +180,20 @@ pub fn index_dir_observed(
     options: IndexOptions,
     observer: &dyn IndexObserver,
 ) -> Result<IndexSummary> {
+    index_dir_with_catalog_step(assets, db, models, path, options, observer, || Ok(false))
+}
+
+/// Run an additional derived-index step after cataloging and before OCR.
+/// Returning true cancels the remaining work while retaining committed results.
+pub fn index_dir_with_catalog_step(
+    assets: &mut AssetCatalog,
+    db: &mut DB,
+    models: &mut PaddleOcrPool,
+    path: &Path,
+    options: IndexOptions,
+    observer: &dyn IndexObserver,
+    catalog_step: impl FnOnce() -> Result<bool>,
+) -> Result<IndexSummary> {
     if options.commit_chunk_size == 0 {
         bail!("OCR commit chunk size must be greater than zero");
     }
@@ -191,7 +205,7 @@ pub fn index_dir_observed(
         options,
         observer,
     }
-    .run(path)
+    .run(path, catalog_step)
 }
 
 struct IndexPipeline<'a> {
@@ -208,11 +222,18 @@ impl IndexPipeline<'_> {
         skip_all,
         fields(root = %path, indexed = field::Empty, deleted = field::Empty, cancelled = field::Empty)
     )]
-    fn run(&mut self, path: &Path) -> Result<IndexSummary> {
+    fn run(
+        &mut self,
+        path: &Path,
+        catalog_step: impl FnOnce() -> Result<bool>,
+    ) -> Result<IndexSummary> {
         let root = canonicalize_path(path).context("canonicalizing index path")?;
         let Some((sources, scan_complete)) = self.prepare_sources(&root)? else {
             return Ok(record_summary(cancelled_summary(0)));
         };
+        if catalog_step()? || self.cancelled() {
+            return Ok(record_summary(cancelled_summary(0)));
+        }
         let indexed = self.run_ocr(sources)?;
         if self.cancelled() {
             return Ok(record_summary(cancelled_summary(indexed)));
@@ -916,7 +937,7 @@ fn guard_worker(
 /// A plain blocking send on a full channel is only released by every receiver dropping, which
 /// would leave this worker parked while `thread::scope` waits to join it. Racing the abort channel
 /// makes every blocking send cancellable instead.
-fn send_unless_aborted<T>(sender: &Sender<T>, item: T, abort: &Receiver<()>) -> bool {
+pub(crate) fn send_unless_aborted<T>(sender: &Sender<T>, item: T, abort: &Receiver<()>) -> bool {
     select! {
         send(sender, item) -> sent => sent.is_ok(),
         recv(abort) -> _ => false,
@@ -924,7 +945,7 @@ fn send_unless_aborted<T>(sender: &Sender<T>, item: T, abort: &Receiver<()>) -> 
 }
 
 /// Whether the coordinator has dropped its abort sender.
-fn aborted(abort: &Receiver<()>) -> bool {
+pub(crate) fn aborted(abort: &Receiver<()>) -> bool {
     matches!(abort.try_recv(), Err(TryRecvError::Disconnected))
 }
 

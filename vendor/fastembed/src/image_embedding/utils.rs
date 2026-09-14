@@ -27,14 +27,33 @@ impl TransformData {
     }
 }
 
+pub(crate) type ResizeFn =
+    dyn Fn(DynamicImage, u32, u32, FilterType) -> Result<DynamicImage> + Send + Sync;
+
+fn default_resize(
+    image: DynamicImage,
+    width: u32,
+    height: u32,
+    filter: FilterType,
+) -> Result<DynamicImage> {
+    Ok(image.resize_exact(width, height, filter))
+}
+
 pub trait Transform: Send + Sync {
-    fn transform(&self, images: TransformData) -> Result<TransformData>;
+    fn transform(&self, images: TransformData) -> Result<TransformData> {
+        self.transform_with_resize(images, &default_resize)
+    }
+    fn transform_with_resize(
+        &self,
+        images: TransformData,
+        resize: &ResizeFn,
+    ) -> Result<TransformData>;
 }
 
 struct ConvertToRGB;
 
 impl Transform for ConvertToRGB {
-    fn transform(&self, data: TransformData) -> Result<TransformData> {
+    fn transform_with_resize(&self, data: TransformData, _: &ResizeFn) -> Result<TransformData> {
         let image = data.image()?;
         let image = image.into_rgb8().into();
         Ok(TransformData::Image(image))
@@ -47,31 +66,47 @@ pub struct Resize {
 }
 
 impl Transform for Resize {
-    fn transform(&self, data: TransformData) -> Result<TransformData> {
+    fn transform_with_resize(
+        &self,
+        data: TransformData,
+        resize: &ResizeFn,
+    ) -> Result<TransformData> {
         let image = data.image()?;
-        let image = image.resize_exact(self.size.1, self.size.0, self.resample);
+        let image = resize(image, self.size.1, self.size.0, self.resample)?;
         Ok(TransformData::Image(image))
     }
 }
 
 // Pillow performs horizontal filtering into RGB8 before its vertical pass. Separate
 // single-axis passes preserve that intermediate rounding and clipping.
-fn pillow_resize(image: DynamicImage, width: u32, height: u32, filter: FilterType) -> DynamicImage {
-    let horizontal = image.resize_exact(width, image.height(), filter);
-    horizontal.resize_exact(width, height, filter)
+fn pillow_resize(
+    image: DynamicImage,
+    width: u32,
+    height: u32,
+    filter: FilterType,
+    resize: &ResizeFn,
+) -> Result<DynamicImage> {
+    let source_height = image.height();
+    let horizontal = resize(image, width, source_height, filter)?;
+    resize(horizontal, width, height, filter)
 }
 struct ResizePillow {
     size: (u32, u32),
     filter: FilterType,
 }
 impl Transform for ResizePillow {
-    fn transform(&self, data: TransformData) -> Result<TransformData> {
+    fn transform_with_resize(
+        &self,
+        data: TransformData,
+        resize: &ResizeFn,
+    ) -> Result<TransformData> {
         Ok(TransformData::Image(pillow_resize(
             data.image()?,
             self.size.1,
             self.size.0,
             self.filter,
-        )))
+            resize,
+        )?))
     }
 }
 
@@ -87,7 +122,11 @@ struct ResizeDeepGhs {
     max_size: u32,
 }
 impl Transform for ResizeDeepGhs {
-    fn transform(&self, data: TransformData) -> Result<TransformData> {
+    fn transform_with_resize(
+        &self,
+        data: TransformData,
+        resize: &ResizeFn,
+    ) -> Result<TransformData> {
         let image = data.image()?;
         let (width, height) = image.dimensions();
         let (mut output_width, mut output_height) = if width < height {
@@ -120,12 +159,17 @@ impl Transform for ResizeDeepGhs {
                 output_width.max(1),
                 output_height.max(1),
                 FilterType::CatmullRom,
-            )))
+                resize,
+            )?))
         }
     }
 }
 impl Transform for ResizeShortestEdge {
-    fn transform(&self, data: TransformData) -> Result<TransformData> {
+    fn transform_with_resize(
+        &self,
+        data: TransformData,
+        resize: &ResizeFn,
+    ) -> Result<TransformData> {
         let image = data.image()?;
         let (width, height) = image.dimensions();
         let shorter = width.min(height) as u64;
@@ -139,7 +183,8 @@ impl Transform for ResizeShortestEdge {
             width,
             height,
             FilterType::CatmullRom,
-        )))
+            resize,
+        )?))
     }
 }
 
@@ -149,7 +194,7 @@ pub struct CenterCrop {
 }
 
 impl Transform for CenterCrop {
-    fn transform(&self, data: TransformData) -> Result<TransformData> {
+    fn transform_with_resize(&self, data: TransformData, _: &ResizeFn) -> Result<TransformData> {
         let mut image = data.image()?;
         let (mut origin_width, mut origin_height) = image.dimensions();
         let (crop_width, crop_height) = self.size;
@@ -200,7 +245,7 @@ impl Transform for CenterCrop {
 struct PILToNDarray;
 
 impl Transform for PILToNDarray {
-    fn transform(&self, data: TransformData) -> Result<TransformData> {
+    fn transform_with_resize(&self, data: TransformData, _: &ResizeFn) -> Result<TransformData> {
         match data {
             TransformData::Image(image) => {
                 let image = image.to_rgb8();
@@ -224,7 +269,7 @@ pub struct Rescale {
 }
 
 impl Transform for Rescale {
-    fn transform(&self, data: TransformData) -> Result<TransformData> {
+    fn transform_with_resize(&self, data: TransformData, _: &ResizeFn) -> Result<TransformData> {
         let array = data.array()?;
         let array = array * self.scale;
         Ok(TransformData::NdArray(array))
@@ -237,7 +282,7 @@ pub struct Normalize {
 }
 
 impl Transform for Normalize {
-    fn transform(&self, data: TransformData) -> Result<TransformData> {
+    fn transform_with_resize(&self, data: TransformData, _: &ResizeFn) -> Result<TransformData> {
         let array = data.array()?;
         let mean = Array::from_vec(self.mean.clone())
             .into_shape_with_order((3, 1, 1))
@@ -372,7 +417,19 @@ impl Compose {
     }
 
     pub fn preprocess_image(&self, image: DynamicImage) -> Result<Array3<f32>> {
-        match self.transform(TransformData::Image(image))? {
+        Self::pixels(self.transform(TransformData::Image(image))?)
+    }
+
+    pub(crate) fn preprocess_image_with_resize(
+        &self,
+        image: DynamicImage,
+        resize: &ResizeFn,
+    ) -> Result<Array3<f32>> {
+        Self::pixels(self.transform_with_resize(TransformData::Image(image), resize)?)
+    }
+
+    fn pixels(data: TransformData) -> Result<Array3<f32>> {
+        match data {
             TransformData::NdArray(array) => Ok(array),
             _ => Err(Error::PreprocessorConfig(
                 "Preprocessor configuration did not produce image pixels".into(),
@@ -382,9 +439,13 @@ impl Compose {
 }
 
 impl Transform for Compose {
-    fn transform(&self, mut image: TransformData) -> Result<TransformData> {
+    fn transform_with_resize(
+        &self,
+        mut image: TransformData,
+        resize: &ResizeFn,
+    ) -> Result<TransformData> {
         for transform in &self.transforms {
-            image = transform.transform(image)?;
+            image = transform.transform_with_resize(image, resize)?;
         }
         Ok(image)
     }

@@ -9,6 +9,10 @@ packages on September 13, 2026, matching the pinned requirements:
   and `ThirdPartyNotices.txt` from the `onnxruntime-openvino==1.24.1` wheel.
 - `openvino-2025.4.1`: `.venv-openvino/Lib/site-packages/openvino-2025.4.1.dist-info/licenses/LICENSE`
   from the `openvino==2025.4.1` wheel.
+- `onnxruntime-1.30.0`: Linux wheel's `onnxruntime/LICENSE` and
+  `ThirdPartyNotices.txt` from the native WebGPU test environment.
+- `onnxruntime-ep-webgpu-0.3.0`: `LICENSE` and `ThirdPartyNotices.txt` from
+  the Linux plugin wheel's `.dist-info/licenses` directory.
 
 The collector reads these snapshots so building the notices document does not need
 runtime installations. On runtime upgrades, copy the corresponding upstream text

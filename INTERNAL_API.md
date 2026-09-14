@@ -382,9 +382,15 @@ Version 1 routes:
   avoids a follow-up request when the client only needs to decide whether OCR indexing is available;
   use `GET /v1/ocr/models` for loaded model identities and their actual session provider.
 - `GET /v1/runtime` returns the `runtime` object shown above. `PUT /v1/runtime` accepts exactly
-  `{"executionProvider":"cpu"|"directml"|"openvino"}` and persists that selection. It returns the
+  `{"executionProvider":"cpu"|"directml"|"openvino"|"webgpu"}` and persists that selection.
+  Saved selections absent from the current build migrate to its bundled default at startup;
+  explicit unsupported selections are rejected. Retired CUDA/MIGraphX settings also migrate.
+  The runtime's `availableExecutionProviders` lists choices supported by this platform and build;
+  the desktop shows those choices and the update endpoint rejects unavailable ones. It returns the
   same runtime object with `restartRequired: true` when a restart is needed. It never tries to
-  unload or replace ONNX Runtime in the current process.
+  unload or replace ONNX Runtime in the current process. The desktop applies both
+  provider and model selections through its shared backend restart flow, leaving
+  the app open. Updates are rejected while a job is active.
 - `GET /v1/catalog?root=<absolute-root>&timeline=modified|capture` returns the desktop gallery
   array. `timeline` defaults to modified; capture falls back to modified when EXIF time is absent.
   Both sorts descend with asset ID as the descending tie-breaker. Root matching uses literal path
@@ -1160,3 +1166,21 @@ changes while an indexing job is active. The caller restarts the backend to
 activate the selection. Settings persist to `image-model.json` beside the runtime
 configuration. `--image-model` / `NICEGAL_IMAGE_MODEL` overrides only the active
 model for that launch, useful for sequential evaluation scripts.
+
+All image models now use byte-intermediate convolution for downscaling, retaining
+their configured filter, crop, and normalization. Upscaling keeps float intermediates.
+Existing vectors remain valid and are not automatically rebuilt.
+
+### Selective indexing
+
+`ocrIndex.params` accepts `ocr` and `image` booleans, both enabled by default.
+`ocr:false,image:true` catalogs files and runs only image embeddings, without loading PaddleOCR
+or BGE. `ocr:true,image:false` runs OCR and its text embeddings, without loading the image model
+or its text tower. Both false is rejected. Selection survives desktop restart and provider fallback.
+The legacy `embed:false` still disables text embeddings and defaults image indexing to off;
+an explicit `image` overrides that legacy default. Existing indexed results are retained when
+a search type is unchecked; reconciliation still removes missing files after a complete scan.
+This supersedes the earlier always-all-models indexing description for selective requests.
+
+Index job snapshots include `indexStages: {ocr, image, text}` so progress displays only stages
+that will run, including when a client attaches to an existing job.
