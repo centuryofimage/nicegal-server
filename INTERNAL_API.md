@@ -1013,6 +1013,21 @@ on phase changes. During OCR it excludes that phase's skipped assets, so a resum
 previously indexed images advance progress without inflating OCR speed. It is `null` until
 non-skipped OCR work completes. The progress bar still includes skipped assets.
 
+During model downloads, `progress.download` optionally identifies the **current file**:
+`{modelId, filename, downloadedBytes, totalBytes}`. `totalBytes: 0` means the size is
+not known yet. Use this file's byte ratio in preference to the enclosing phase's
+item counts. This applies to PaddleOCR, BGE, and all image-search model families,
+including the Windows fallback transport. Cache hits do not emit download progress;
+the field disappears after the file resolves and while sessions load. Embedding jobs
+keep `loadingModels` and their model-step counters throughout, so file transfers do
+not reset the preparation count. Retries reset the current file's bytes; they do not
+double-count the legacy OCR transfer totals.
+
+Updates are throttled to about 100 ms, with initial and final reports. The user's
+2026-09-14 follow-up restored this time-based cadence, superseding the intervening
+request for one callback per MiB. Settings → Search and the top-bar job display both
+show these updates.
+
 | Job type | Phase | Fields that move in the phase | `total` in the phase | Honest within-phase UI |
 | --- | --- | --- | --- | --- |
 | Any | `queued` | None | `null` | Queued state, not a progress bar. |

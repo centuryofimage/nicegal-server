@@ -73,17 +73,26 @@ impl TextEmbedder {
     /// feature for now.
     #[instrument(name = "embedder_load", skip_all, fields(model = %options.model))]
     pub fn load(options: &TextEmbedderOptions) -> Result<Self> {
-        Self::load_with_cache_policy(options, false)?.context("model loader returned no model")
+        Self::load_with_progress(options, &())
+    }
+
+    pub fn load_with_progress(
+        options: &TextEmbedderOptions,
+        progress: &dyn crate::hub::DownloadObserver,
+    ) -> Result<Self> {
+        Self::load_with_cache_policy(options, false, progress)?
+            .context("model loader returned no model")
     }
 
     /// Load only existing local model files. Never downloads; None means setup is needed.
     pub fn load_cached(options: &TextEmbedderOptions) -> Result<Option<Self>> {
-        Self::load_with_cache_policy(options, true)
+        Self::load_with_cache_policy(options, true, &())
     }
 
     fn load_with_cache_policy(
         options: &TextEmbedderOptions,
         cached_only: bool,
+        progress: &dyn crate::hub::DownloadObserver,
     ) -> Result<Option<Self>> {
         if options.max_input_bytes == 0 {
             bail!("embedding input limit must be greater than zero");
@@ -98,6 +107,7 @@ impl TextEmbedder {
                 &options.model.to_string(),
                 options.runtime,
                 cached_only,
+                progress,
             )?
         else {
             return Ok(None);

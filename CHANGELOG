@@ -1,8 +1,2 @@
-- Fixed compose search behavior
-- Revamped "all" search
-- Added auto updater
-- Switched to better clip models
-- Added experimental anime model :)
-- Added documentation and tutorials
-- Added backup model downloader for network problems
-- Added about page
+- Fixed auto updater 😱
+- Added download progress bar

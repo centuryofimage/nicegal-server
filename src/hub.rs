@@ -11,6 +11,48 @@ use hf_hub::api::tokio::{Api, ApiBuilder, Progress};
 use hf_hub::{Cache, Repo, RepoType};
 use tracing::{debug, error, info};
 
+/// Receives byte counts for the current file. A retry starts again at zero.
+/// Updates are emitted about every 100 ms, plus initial and final updates.
+pub trait DownloadObserver: Send + Sync {
+    fn progress(&self, source: &ModelSource, downloaded: usize, total: usize);
+    fn finish(&self) {}
+}
+
+impl DownloadObserver for () {
+    fn progress(&self, _: &ModelSource, _: usize, _: usize) {}
+}
+
+struct SyncProgress<'a> {
+    source: &'a ModelSource,
+    observer: &'a dyn DownloadObserver,
+    downloaded: usize,
+    total: usize,
+    last_update: Instant,
+}
+
+impl hf_hub::api::Progress for SyncProgress<'_> {
+    fn init(&mut self, total: usize, _: &str) {
+        self.total = total;
+        self.downloaded = 0;
+        self.observer.progress(self.source, 0, total);
+        self.last_update = Instant::now();
+    }
+
+    fn update(&mut self, bytes: usize) {
+        self.downloaded = self.downloaded.saturating_add(bytes);
+        if self.last_update.elapsed().as_millis() >= 100 {
+            self.observer
+                .progress(self.source, self.downloaded, self.total);
+            self.last_update = Instant::now();
+        }
+    }
+
+    fn finish(&mut self) {
+        self.observer
+            .progress(self.source, self.downloaded, self.total);
+    }
+}
+
 #[cfg(windows)]
 mod windows;
 
@@ -79,7 +121,7 @@ impl ModelSource {
         &self,
         api: &Api,
         cache: &Cache,
-        progress: P,
+        mut progress: P,
     ) -> Result<PathBuf>
     where
         P: Progress + Clone + Send + Sync + 'static,
@@ -94,6 +136,7 @@ impl ModelSource {
         }
 
         let started = self.log_download_start();
+        progress.init(0, &self.filename).await;
         let result = api
             .repo(repo)
             .download_with_progress(&self.filename, progress.clone())
@@ -109,29 +152,38 @@ impl ModelSource {
             Err(original) if windows::is_connection_error(&original) => {
                 let source = self.clone();
                 let cache = cache.clone();
-                let path = tokio::task::spawn_blocking(move || {
-                    windows::fallback(&source, &cache, original)
+                let handle = tokio::runtime::Handle::current();
+                let mut progress = progress.clone();
+                tokio::task::spawn_blocking(move || {
+                    let mut previous = 0;
+                    windows::fallback(&source, &cache, original, |downloaded, total| {
+                        handle.block_on(async {
+                            if downloaded == 0 {
+                                progress.init(total, &source.filename).await;
+                                previous = 0;
+                            }
+                            progress.update(downloaded.saturating_sub(previous)).await;
+                            previous = downloaded;
+                        });
+                    })
                 })
                 .await
-                .context("joining Windows download fallback")?;
-                if let Ok(path) = &path {
-                    let mut progress = progress;
-                    let size = std::fs::metadata(path)?.len() as usize;
-                    progress.init(size, &self.filename).await;
-                    progress.update(size).await;
-                    progress.finish().await;
-                }
-                path
+                .context("joining Windows download fallback")?
             }
             other => other,
         };
         self.log_download_result(started, &result);
+        progress.finish().await;
         result
     }
 
     /// Resolve from the same cache in a blocking model-preparation worker. A search may use
     /// `cached()` instead, keeping the no-network-on-search contract.
     pub fn get_sync(&self) -> Result<PathBuf> {
+        self.get_sync_with_progress(&())
+    }
+
+    pub fn get_sync_with_progress(&self, observer: &dyn DownloadObserver) -> Result<PathBuf> {
         if let Some(path) = self.cached() {
             return Ok(path);
         }
@@ -140,20 +192,35 @@ impl ModelSource {
             .build()
             .context("building the Hugging Face API client")?;
         let started = self.log_download_start();
-        let result = api.repo(self.repo()).get(&self.filename).with_context(|| {
-            format!(
-                "downloading {}/{} from Hugging Face",
-                self.model_id, self.filename
-            )
-        });
+        // Surface the filename even while the remote metadata request is pending.
+        observer.progress(self, 0, 0);
+        let progress = SyncProgress {
+            source: self,
+            observer,
+            downloaded: 0,
+            total: 0,
+            last_update: Instant::now(),
+        };
+        let result = api
+            .repo(self.repo())
+            .download_with_progress(&self.filename, progress)
+            .with_context(|| {
+                format!(
+                    "downloading {}/{} from Hugging Face",
+                    self.model_id, self.filename
+                )
+            });
         #[cfg(windows)]
         let result = match result {
             Err(original) if windows::is_connection_error(&original) => {
-                windows::fallback(self, &cache(), original)
+                windows::fallback(self, &cache(), original, |downloaded, total| {
+                    observer.progress(self, downloaded, total);
+                })
             }
             other => other,
         };
         self.log_download_result(started, &result);
+        observer.finish();
         result
     }
 
@@ -218,6 +285,43 @@ impl ModelSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sync_progress_throttles_chunks_and_flushes_the_final_bytes() {
+        use hf_hub::api::Progress;
+        use std::sync::Mutex;
+        struct Observer(Mutex<Vec<(usize, usize)>>);
+        impl DownloadObserver for Observer {
+            fn progress(&self, _: &ModelSource, downloaded: usize, total: usize) {
+                self.0.lock().unwrap().push((downloaded, total));
+            }
+        }
+        let observer = Observer(Mutex::new(Vec::new()));
+        let source = ModelSource::local(Path::new("model.onnx")).unwrap();
+        let mut progress = SyncProgress {
+            source: &source,
+            observer: &observer,
+            downloaded: 0,
+            total: 0,
+            last_update: Instant::now(),
+        };
+        progress.init(100, "model.onnx");
+        progress.update(10);
+        progress.update(20);
+        assert_eq!(*observer.0.lock().unwrap(), [(0, 100)]);
+        progress.last_update = Instant::now() - std::time::Duration::from_millis(101);
+        progress.update(30);
+        progress.update(40);
+        progress.finish();
+        assert_eq!(
+            *observer.0.lock().unwrap(),
+            [(0, 100), (60, 100), (100, 100)]
+        );
+        progress.init(100, "model.onnx");
+        progress.update(5);
+        progress.finish();
+        assert_eq!(observer.0.lock().unwrap().last(), Some(&(5, 100)));
+    }
 
     #[test]
     fn a_local_file_is_described_by_its_own_path() {

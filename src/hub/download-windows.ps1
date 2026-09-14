@@ -24,7 +24,30 @@ try {
     [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($target)) | Out-Null
     $partial = "$target.$([guid]::NewGuid().ToString('N')).partial"
     $filename = ($env:NICEGAL_HF_FILE.Split('/') | ForEach-Object { [Uri]::EscapeDataString($_) }) -join '/'
-    Invoke-WebRequest -UseBasicParsing -Uri "$endpoint/$repo/resolve/$commit/$filename" -Headers $headers -OutFile $partial -TimeoutSec 1800 | Out-Null
+    [Console]::Out.WriteLine("PROGRESS 0 $($file.size)")
+    $request = [Net.HttpWebRequest]::Create("$endpoint/$repo/resolve/$commit/$filename")
+    $request.Timeout = 1800000
+    $request.ReadWriteTimeout = 1800000
+    foreach ($key in $headers.Keys) { $request.Headers[$key] = $headers[$key] }
+    $response = $request.GetResponse()
+    try {
+        $inputStream = $response.GetResponseStream()
+        $outputStream = [IO.File]::Create($partial)
+        try {
+            $buffer = New-Object byte[] 65536
+            $downloaded = [long]0
+            $timer = [Diagnostics.Stopwatch]::StartNew()
+            while (($count = $inputStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                $outputStream.Write($buffer, 0, $count)
+                $downloaded += $count
+                if ($timer.ElapsedMilliseconds -ge 100) {
+                    [Console]::Out.WriteLine("PROGRESS $downloaded $($file.size)")
+                    $timer.Restart()
+                }
+            }
+            [Console]::Out.WriteLine("PROGRESS $downloaded $($file.size)")
+        } finally { $outputStream.Dispose(); $inputStream.Dispose() }
+    } finally { $response.Dispose() }
     if ((Get-Item -LiteralPath $partial).Length -ne [long]$file.size) { throw 'Downloaded file size does not match Hub metadata.' }
     if ($file.lfs.sha256) {
         $hash = [Security.Cryptography.SHA256]::Create()

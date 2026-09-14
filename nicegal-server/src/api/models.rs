@@ -162,6 +162,15 @@ pub(crate) type ImageQueryModel = LazyModel<ImageQueryEmbedder, ImageQueryEmbedd
 macro_rules! model {
     ($alias:ident, $session:ident, $options:ident, $kind:ty, $name:literal, $cached:expr) => {
         impl $alias {
+            pub(super) fn prepare_with_progress(
+                &self,
+                progress: &dyn nicegal_core::hub::DownloadObserver,
+            ) -> Result<Arc<$session>> {
+                self.prepare_with(|| {
+                    $session::load_with_progress(&self.options, progress).map(Some)
+                })?
+                .context("download-capable loader returned no model")
+            }
             pub(crate) fn deferred(options: $options) -> Self {
                 let mut model = Self::new(options, $name, $session::load);
                 model.cached_loader = $cached;

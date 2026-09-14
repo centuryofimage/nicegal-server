@@ -22,9 +22,9 @@ impl FastEmbedBackend {
         model_label: &str,
         runtime_options: RuntimeOptions,
         cached_only: bool,
+        progress: &dyn crate::hub::DownloadObserver,
     ) -> Result<Option<(Self, PathBuf, ExecutionProvider)>> {
         let cache_dir = crate::hub::cache_dir();
-        #[cfg(windows)]
         if !cached_only {
             let info = TextEmbedding::get_model_info(&model)?;
             for filename in [
@@ -42,7 +42,7 @@ impl FastEmbedBackend {
                     revision: None,
                     filename: filename.to_owned(),
                 }
-                .get_sync()?;
+                .get_sync_with_progress(progress)?;
             }
         }
         let intra_threads = runtime_options.intra_threads;
@@ -55,11 +55,7 @@ impl FastEmbedBackend {
                 .with_show_download_progress(true)
                 .with_execution_providers(vec![configured.dispatch])
                 .with_intra_threads(configured.intra_threads.get());
-            let loaded = if cached_only || cfg!(windows) {
-                TextEmbedding::try_new_cached(init)
-            } else {
-                TextEmbedding::try_new(init).map(Some)
-            };
+            let loaded = TextEmbedding::try_new_cached(init);
             loaded.with_context(|| {
                 format!(
                     "loading {model_label} from {} on the {provider} execution provider",
@@ -83,8 +79,9 @@ impl FastEmbedBackend {
         model: ImageEmbeddingModel,
         options: RuntimeOptions,
         cached_only: bool,
+        progress: &dyn crate::hub::DownloadObserver,
     ) -> Result<Option<(Self, PathBuf, ExecutionProvider)>> {
-        let Some(path) = model.validated_model_directory(cached_only)? else {
+        let Some(path) = model.validated_model_directory(cached_only, progress)? else {
             return Ok(None);
         };
         let (backend, provider) = runtime::with_fallback(options, |provider| {
@@ -118,10 +115,11 @@ impl FastEmbedBackend {
         model: ImageEmbeddingModel,
         options: RuntimeOptions,
         cached_only: bool,
+        progress: &dyn crate::hub::DownloadObserver,
     ) -> Result<Option<(Self, PathBuf, ExecutionProvider)>> {
-        let text = model.deepghs_file("text_encode.onnx", cached_only)?;
-        let tokenizer = model.deepghs_file("tokenizer.json", cached_only)?;
-        let meta = model.deepghs_file("meta.json", cached_only)?;
+        let text = model.deepghs_file("text_encode.onnx", cached_only, progress)?;
+        let tokenizer = model.deepghs_file("tokenizer.json", cached_only, progress)?;
+        let meta = model.deepghs_file("meta.json", cached_only, progress)?;
         let (Some(text), Some(tokenizer), Some(meta)) = (text, tokenizer, meta) else {
             return Ok(None);
         };

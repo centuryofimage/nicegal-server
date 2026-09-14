@@ -14,6 +14,7 @@ use axum::response::sse::{Event, KeepAlive};
 use axum::response::{IntoResponse, Sse};
 use axum::routing::{get, post};
 use camino::Utf8PathBuf as PathBuf;
+use nicegal_core::hub::{DownloadObserver, ModelSource};
 use nicegal_core::index::{IndexEvent, IndexObserver, IndexPhase, IndexProgressDelta};
 use nicegal_core::thumbs::ThumbnailService;
 use serde::{Deserialize, Serialize};
@@ -181,10 +182,41 @@ struct JobProgress {
     deleted: usize,
     downloaded_bytes: usize,
     download_total_bytes: usize,
+    /// Current file only; absent while loading sessions or using cached files.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    download: Option<ModelDownload>,
     models_loaded: usize,
     /// The rate of completed work since the current phase began. OCR excludes skipped assets
     /// so resuming an index does not count previously indexed images as new OCR work.
     items_per_second: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct ModelDownload {
+    model_id: String,
+    filename: String,
+    downloaded_bytes: usize,
+    total_bytes: usize,
+}
+
+impl DownloadObserver for Job {
+    fn progress(&self, source: &ModelSource, downloaded: usize, total: usize) {
+        let mut data = self.data();
+        data.progress.download = Some(ModelDownload {
+            model_id: source.model_id.clone(),
+            filename: source.filename.clone(),
+            downloaded_bytes: downloaded,
+            total_bytes: total,
+        });
+        self.publish(&mut data);
+    }
+
+    fn finish(&self) {
+        let mut data = self.data();
+        data.progress.download = None;
+        self.publish(&mut data);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -303,6 +335,7 @@ impl Job {
         if self.cancel_requested.load(Ordering::Acquire) {
             data.status = JobStatus::Cancelled;
             data.phase = JobPhase::Finished;
+            data.progress.download = None;
             data.active_asset_paths.clear();
             self.publish(&mut data);
             info!("job cancelled before it started");
@@ -334,26 +367,42 @@ impl Job {
         };
         data.active_asset_paths.clear();
         data.phase = JobPhase::Finished;
+        data.progress.download = None;
         self.publish(&mut data);
         info!(progress = ?data.progress, cancelled, "job finished");
     }
 
-    pub(super) fn downloading_model(&self, total_bytes: usize) {
+    pub(super) fn ocr_download_progress(
+        &self,
+        source: &ModelSource,
+        downloaded: usize,
+        total: usize,
+        previous: usize,
+        previous_total: usize,
+    ) {
         let mut data = self.data();
-        set_phase(&mut data, JobPhase::DownloadingModels);
-        data.progress.download_total_bytes += total_bytes;
+        data.progress.downloaded_bytes = data
+            .progress
+            .downloaded_bytes
+            .saturating_sub(previous)
+            .saturating_add(downloaded);
+        data.progress.download_total_bytes = data
+            .progress
+            .download_total_bytes
+            .saturating_sub(previous_total)
+            .saturating_add(total);
+        data.progress.download = Some(ModelDownload {
+            model_id: source.model_id.clone(),
+            filename: source.filename.clone(),
+            downloaded_bytes: downloaded,
+            total_bytes: total,
+        });
         self.publish(&mut data);
     }
 
     pub(super) fn downloading_models(&self) {
         let mut data = self.data();
         set_phase(&mut data, JobPhase::DownloadingModels);
-        self.publish(&mut data);
-    }
-
-    pub(super) fn downloaded_bytes(&self, bytes: usize) {
-        let mut data = self.data();
-        data.progress.downloaded_bytes += bytes;
         self.publish(&mut data);
     }
 
@@ -388,8 +437,10 @@ impl Job {
         let mut data = self.data();
         refresh_phase_throughput(&mut data);
         data.status = JobStatus::Failed;
+        data.progress.download = None;
         data.active_asset_paths.clear();
         data.phase = JobPhase::Finished;
+        data.progress.download = None;
         let message = message.into();
         data.error = Some(message.clone());
         self.publish(&mut data);
@@ -615,20 +666,20 @@ impl JobManager {
                     u64::from(needs_text) + u64::from(needs_image) + u64::from(needs_image_text),
                 );
                 if needs_text {
-                    embedder.prepare()?;
+                    embedder.prepare_with_progress(job.as_ref())?;
                     job.models_loaded(1);
                 }
                 if job.is_cancelled() {
                     return Ok(true);
                 }
                 if needs_image {
-                    image_embedder.prepare()?;
+                    image_embedder.prepare_with_progress(job.as_ref())?;
                     job.models_loaded(1);
                     if job.is_cancelled() {
                         return Ok(true);
                     }
                     if needs_image_text {
-                        image_query_embedder.prepare()?;
+                        image_query_embedder.prepare_with_progress(job.as_ref())?;
                         job.models_loaded(1);
                     }
                 }
@@ -985,6 +1036,39 @@ mod tests {
         );
         assert_eq!(response.errors[0].message, "OCR failed: invalid image");
         assert!(job.is_cancelled());
+    }
+
+    #[test]
+    fn file_downloads_preserve_model_steps_and_retry_byte_totals() {
+        let job = Job::new(88, JobKind::ModelPrepare);
+        job.begin();
+        job.preparing_models(3);
+        job.models_loaded(1);
+        let source = ModelSource::local(std::path::Path::new("image.onnx")).unwrap();
+        job.progress(&source, 25, 100);
+        let response = serde_json::to_value(job.response()).unwrap();
+        assert_eq!(response["phase"], "loadingModels");
+        assert_eq!(response["progress"]["phaseCompleted"], 1);
+        assert_eq!(response["progress"]["total"], 3);
+        assert_eq!(response["progress"]["download"]["filename"], "image.onnx");
+        assert_eq!(response["progress"]["download"]["downloadedBytes"], 25);
+        DownloadObserver::finish(&job);
+        assert!(job.response().progress.download.is_none());
+        assert_eq!(job.response().progress.phase_completed, 1);
+
+        let ocr = Job::new(89, JobKind::OcrModelLoad);
+        ocr.ocr_download_progress(&source, 50, 100, 0, 0);
+        // Retrying this file replaces its contribution instead of double-counting it.
+        ocr.ocr_download_progress(&source, 0, 100, 50, 100);
+        ocr.ocr_download_progress(&source, 100, 100, 0, 100);
+        // A second file adds to the legacy job totals but has its own current-file counters.
+        ocr.ocr_download_progress(&source, 20, 40, 0, 0);
+        let progress = ocr.response().progress;
+        assert_eq!(progress.downloaded_bytes, 120);
+        assert_eq!(progress.download_total_bytes, 140);
+        assert_eq!(progress.download.unwrap().downloaded_bytes, 20);
+        ocr.fail("network error");
+        assert!(ocr.response().progress.download.is_none());
     }
 
     #[test]

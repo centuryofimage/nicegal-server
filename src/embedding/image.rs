@@ -163,12 +163,13 @@ impl ImageEmbeddingModel {
         self,
         filename: &str,
         cached_only: bool,
+        progress: &dyn crate::hub::DownloadObserver,
     ) -> Result<Option<std::path::PathBuf>> {
         let source = self.deepghs_source(filename)?;
         if cached_only {
             Ok(source.cached())
         } else {
-            source.get_sync().map(Some)
+            source.get_sync_with_progress(progress).map(Some)
         }
     }
 
@@ -264,6 +265,7 @@ impl ImageEmbeddingModel {
     pub(super) fn validated_model_directory(
         self,
         cached_only: bool,
+        progress: &dyn crate::hub::DownloadObserver,
     ) -> Result<Option<std::path::PathBuf>> {
         let path = if let Some(path) = self.local_directory() {
             if cached_only && !self.available() {
@@ -279,7 +281,7 @@ impl ImageEmbeddingModel {
                 let file = if cached_only {
                     source.cached()
                 } else {
-                    Some(source.get_sync()?)
+                    Some(source.get_sync_with_progress(progress)?)
                 };
                 let Some(file) = file else { return Ok(None) };
                 let parent = file.parent().context("model cache file has no directory")?;
@@ -379,24 +381,36 @@ pub struct ImageEmbedder {
 impl ImageEmbedder {
     #[instrument(name = "image_embedder_load", skip_all, fields(model = %options.model))]
     pub fn load(options: &ImageEmbedderOptions) -> Result<Self> {
-        Self::load_with_cache_policy(options, false)?
+        Self::load_with_cache_policy(options, false, &())?
             .context("image model loader returned no model")
     }
 
+    pub fn load_with_progress(
+        options: &ImageEmbedderOptions,
+        progress: &dyn crate::hub::DownloadObserver,
+    ) -> Result<Self> {
+        Self::load_with_cache_policy(options, false, progress)?
+            .context("model loader returned no model")
+    }
+
     pub fn load_cached(options: &ImageEmbedderOptions) -> Result<Option<Self>> {
-        Self::load_with_cache_policy(options, true)
+        Self::load_with_cache_policy(options, true, &())
     }
 
     fn load_with_cache_policy(
         options: &ImageEmbedderOptions,
         cached_only: bool,
+        progress: &dyn crate::hub::DownloadObserver,
     ) -> Result<Option<Self>> {
         if options.max_batch_size == 0 {
             bail!("image embedding batch size must be greater than zero");
         }
         let local =
             if options.model != ImageEmbeddingModel::ClipVitB32 && !options.model.is_deepghs() {
-                let Some(path) = options.model.validated_model_directory(cached_only)? else {
+                let Some(path) = options
+                    .model
+                    .validated_model_directory(cached_only, progress)?
+                else {
                     return Ok(None);
                 };
                 Some(path)
@@ -408,13 +422,17 @@ impl ImageEmbedder {
         let (backend, execution_provider) = runtime::with_fallback(options.runtime, |provider| {
             let configured = runtime::configure_provider(provider, intra_threads)?;
             if options.model.is_deepghs() {
-                let image = options
+                let image =
+                    options
+                        .model
+                        .deepghs_file("image_encode.onnx", cached_only, progress)?;
+                let preprocessor =
+                    options
+                        .model
+                        .deepghs_file("preprocessor.json", cached_only, progress)?;
+                let meta = options
                     .model
-                    .deepghs_file("image_encode.onnx", cached_only)?;
-                let preprocessor = options
-                    .model
-                    .deepghs_file("preprocessor.json", cached_only)?;
-                let meta = options.model.deepghs_file("meta.json", cached_only)?;
+                    .deepghs_file("meta.json", cached_only, progress)?;
                 let (Some(image), Some(preprocessor), Some(meta)) = (image, preprocessor, meta)
                 else {
                     return Ok(None);
@@ -453,7 +471,6 @@ impl ImageEmbedder {
                 })
                 .context("loading local image ONNX encoder");
             }
-            #[cfg(windows)]
             if !cached_only {
                 let info = ImageEmbedding::get_model_info(&FastEmbedImageModel::ClipVitB32);
                 for filename in [info.model_file.as_str(), "preprocessor_config.json"] {
@@ -462,7 +479,7 @@ impl ImageEmbedder {
                         revision: None,
                         filename: filename.to_owned(),
                     }
-                    .get_sync()?;
+                    .get_sync_with_progress(progress)?;
                 }
             }
             let init = ImageInitOptions::new(FastEmbedImageModel::ClipVitB32)
@@ -470,11 +487,7 @@ impl ImageEmbedder {
                 .with_show_download_progress(true)
                 .with_execution_providers(vec![configured.dispatch])
                 .with_intra_threads(configured.intra_threads.get());
-            let loaded = if cached_only || cfg!(windows) {
-                ImageEmbedding::try_new_cached(init)
-            } else {
-                ImageEmbedding::try_new(init).map(Some)
-            };
+            let loaded = ImageEmbedding::try_new_cached(init);
             loaded.with_context(|| {
                 format!(
                     "loading {} from {} on the {provider} execution provider",
@@ -653,17 +666,27 @@ pub struct ImageQueryEmbedder {
 impl ImageQueryEmbedder {
     #[instrument(name = "image_query_embedder_load", skip_all, fields(model = %options.model))]
     pub fn load(options: &ImageQueryEmbedderOptions) -> Result<Self> {
-        Self::load_with_cache_policy(options, false)?.context("model loader returned no model")
+        Self::load_with_cache_policy(options, false, &())?.context("model loader returned no model")
+    }
+
+    /// Load the paired text encoder, reporting any model-file downloads.
+    pub fn load_with_progress(
+        options: &ImageQueryEmbedderOptions,
+        progress: &dyn crate::hub::DownloadObserver,
+    ) -> Result<Self> {
+        Self::load_with_cache_policy(options, false, progress)?
+            .context("model loader returned no model")
     }
 
     /// Load the paired text encoder strictly from cached files, without a network client.
     pub fn load_cached(options: &ImageQueryEmbedderOptions) -> Result<Option<Self>> {
-        Self::load_with_cache_policy(options, true)
+        Self::load_with_cache_policy(options, true, &())
     }
 
     fn load_with_cache_policy(
         options: &ImageQueryEmbedderOptions,
         cached_only: bool,
+        progress: &dyn crate::hub::DownloadObserver,
     ) -> Result<Option<Self>> {
         if options.max_input_bytes == 0 {
             bail!("image query embedding input limit must be greater than zero");
@@ -675,15 +698,26 @@ impl ImageQueryEmbedder {
             );
         }
         let loaded = if options.model.is_deepghs() {
-            FastEmbedBackend::load_deepghs_image_query(options.model, options.runtime, cached_only)?
+            FastEmbedBackend::load_deepghs_image_query(
+                options.model,
+                options.runtime,
+                cached_only,
+                progress,
+            )?
         } else if options.model != ImageEmbeddingModel::ClipVitB32 {
-            FastEmbedBackend::load_local_image_query(options.model, options.runtime, cached_only)?
+            FastEmbedBackend::load_local_image_query(
+                options.model,
+                options.runtime,
+                cached_only,
+                progress,
+            )?
         } else {
             FastEmbedBackend::load_with_cache_policy(
                 fastembed::EmbeddingModel::ClipVitB32,
                 &options.model.to_string(),
                 options.runtime,
                 cached_only,
+                progress,
             )?
         };
         let Some((backend, cache_dir, execution_provider)) = loaded else {

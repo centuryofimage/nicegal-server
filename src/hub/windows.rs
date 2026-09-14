@@ -2,7 +2,12 @@
 use super::ModelSource;
 use anyhow::{Context, Result, bail};
 use hf_hub::Cache;
-use std::{os::windows::process::CommandExt, path::PathBuf, process::Command};
+use std::{
+    io::{BufRead, BufReader, Read},
+    os::windows::process::CommandExt,
+    path::PathBuf,
+    process::{Command, Stdio},
+};
 
 pub(super) fn is_connection_error(error: &anyhow::Error) -> bool {
     for cause in error.chain() {
@@ -37,10 +42,11 @@ pub(super) fn fallback(
     source: &ModelSource,
     cache: &Cache,
     original: anyhow::Error,
+    progress: impl FnMut(usize, usize),
 ) -> Result<PathBuf> {
     tracing::warn!(model_id = %source.model_id, filename = %source.filename,
         error_chain = %format!("{original:#}"), "Retrying Hugging Face download with powershell.exe");
-    download(source, cache).with_context(|| {
+    download_with_progress(source, cache, progress).with_context(|| {
         format!("Windows PowerShell fallback failed after hf-hub failed: {original:#}")
     })
 }
@@ -52,7 +58,16 @@ fn safe_relative(value: &str) -> bool {
         })
 }
 
+#[cfg(test)]
 pub(super) fn download(source: &ModelSource, cache: &Cache) -> Result<PathBuf> {
+    download_with_progress(source, cache, |_, _| {})
+}
+
+fn download_with_progress(
+    source: &ModelSource,
+    cache: &Cache,
+    mut progress: impl FnMut(usize, usize),
+) -> Result<PathBuf> {
     let revision = source.revision.as_deref().unwrap_or("main");
     if !safe_relative(&source.model_id)
         || !safe_relative(&source.filename)
@@ -61,7 +76,7 @@ pub(super) fn download(source: &ModelSource, cache: &Cache) -> Result<PathBuf> {
         bail!("invalid Hugging Face repository path");
     }
     // All variable inputs are environment values, never interpolated into PowerShell code.
-    let output = Command::new("powershell.exe")
+    let mut child = Command::new("powershell.exe")
         .args([
             "-NoLogo",
             "-NoProfile",
@@ -77,13 +92,40 @@ pub(super) fn download(source: &ModelSource, cache: &Cache) -> Result<PathBuf> {
         .env("NICEGAL_HF_CACHE", cache.path())
         .env("NICEGAL_HF_TOKEN", cache.token().unwrap_or_default())
         .creation_flags(0x08000000) // CREATE_NO_WINDOW
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .context("starting powershell.exe for Hugging Face download")?;
-    if !output.status.success() {
-        bail!(
-            "powershell.exe download failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+    let mut stderr = child.stderr.take().context("missing download stderr")?;
+    // Drain both pipes while running, so errors cannot block a large download.
+    let errors = std::thread::spawn(move || {
+        let mut message = String::new();
+        stderr.read_to_string(&mut message).map(|_| message)
+    });
+    let stdout = child.stdout.take().context("missing download stdout")?;
+    let reports = (|| -> Result<()> {
+        for line in BufReader::new(stdout).lines() {
+            let line = line?;
+            let mut fields = line.split_whitespace();
+            if fields.next() == Some("PROGRESS") {
+                let downloaded: usize =
+                    fields.next().context("missing downloaded bytes")?.parse()?;
+                let total: usize = fields.next().context("missing total bytes")?.parse()?;
+                progress(downloaded, total);
+            }
+        }
+        Ok(())
+    })();
+    if reports.is_err() {
+        let _ = child.kill();
+    }
+    let status = child.wait()?;
+    let stderr = errors
+        .join()
+        .map_err(|_| anyhow::anyhow!("download stderr reader panicked"))??;
+    reports?;
+    if !status.success() {
+        bail!("powershell.exe download failed: {}", stderr.trim());
     }
     cache
         .repo(source.repo())

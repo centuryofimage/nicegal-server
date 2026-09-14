@@ -1,8 +1,8 @@
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use hf_hub::api::tokio::Progress;
-use nicegal_core::hub::{self, ModelSource};
+use nicegal_core::hub::{self, DownloadObserver, ModelSource};
 use nicegal_core::index::IndexObserver;
 use nicegal_core::ocr::PaddleOcrPool;
 use nicegal_core::runtime::{ExecutionProvider, RuntimeOptions};
@@ -112,7 +112,11 @@ pub(crate) async fn run(
     job.downloading_models();
     let detection_path = spec
         .detection
-        .get_with_progress(&api, &cache, ModelDownloadProgress::new(Arc::clone(&job)))
+        .get_with_progress(
+            &api,
+            &cache,
+            ModelDownloadProgress::new(Arc::clone(&job), spec.detection.clone()),
+        )
         .await?;
     job.model_download_complete();
     if job.is_cancelled() {
@@ -120,7 +124,11 @@ pub(crate) async fn run(
     }
     let detection_config_path = spec
         .detection_config
-        .get_with_progress(&api, &cache, ModelDownloadProgress::new(Arc::clone(&job)))
+        .get_with_progress(
+            &api,
+            &cache,
+            ModelDownloadProgress::new(Arc::clone(&job), spec.detection_config.clone()),
+        )
         .await?;
     if job.is_cancelled() {
         return Ok(true);
@@ -128,7 +136,11 @@ pub(crate) async fn run(
 
     let recognition_path = spec
         .recognition
-        .get_with_progress(&api, &cache, ModelDownloadProgress::new(Arc::clone(&job)))
+        .get_with_progress(
+            &api,
+            &cache,
+            ModelDownloadProgress::new(Arc::clone(&job), spec.recognition.clone()),
+        )
         .await?;
     job.model_download_complete();
     if job.is_cancelled() {
@@ -136,7 +148,11 @@ pub(crate) async fn run(
     }
     let recognition_config_path = spec
         .recognition_config
-        .get_with_progress(&api, &cache, ModelDownloadProgress::new(Arc::clone(&job)))
+        .get_with_progress(
+            &api,
+            &cache,
+            ModelDownloadProgress::new(Arc::clone(&job), spec.recognition_config.clone()),
+        )
         .await?;
     if job.is_cancelled() {
         return Ok(true);
@@ -199,24 +215,69 @@ fn schedule_restart() {
 #[derive(Clone)]
 struct ModelDownloadProgress {
     job: Arc<Job>,
+    source: ModelSource,
+    // hf-hub clones progress for concurrent chunks; all clones share counters and throttling.
+    state: Arc<Mutex<DownloadState>>,
+}
+
+struct DownloadState {
+    downloaded: usize,
+    total: usize,
+    reported: usize,
+    reported_total: usize,
+    last_update: Instant,
 }
 
 impl ModelDownloadProgress {
-    fn new(job: Arc<Job>) -> Self {
-        Self { job }
+    fn new(job: Arc<Job>, source: ModelSource) -> Self {
+        Self {
+            job,
+            source,
+            state: Arc::new(Mutex::new(DownloadState {
+                downloaded: 0,
+                total: 0,
+                reported: 0,
+                reported_total: 0,
+                last_update: Instant::now(),
+            })),
+        }
+    }
+
+    fn report(&self, state: &mut DownloadState) {
+        self.job.ocr_download_progress(
+            &self.source,
+            state.downloaded,
+            state.total,
+            state.reported,
+            state.reported_total,
+        );
+        state.reported = state.downloaded;
+        state.reported_total = state.total;
+        state.last_update = Instant::now();
     }
 }
 
 impl Progress for ModelDownloadProgress {
     async fn init(&mut self, size: usize, _filename: &str) {
-        self.job.downloading_model(size);
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.downloaded = 0;
+        state.total = size;
+        self.report(&mut state);
     }
 
     async fn update(&mut self, size: usize) {
-        self.job.downloaded_bytes(size);
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.downloaded = state.downloaded.saturating_add(size);
+        if state.last_update.elapsed() >= Duration::from_millis(100) {
+            self.report(&mut state);
+        }
     }
 
-    async fn finish(&mut self) {}
+    async fn finish(&mut self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        self.report(&mut state);
+        DownloadObserver::finish(self.job.as_ref());
+    }
 }
 
 fn default_model_filename() -> String {
