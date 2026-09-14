@@ -56,6 +56,7 @@ struct ScanOptions {
     #[serde(default)]
     cleanup: bool,
     max_dimensions: Option<MaxDimensions>,
+    debug_limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -78,6 +79,7 @@ impl Default for ScanOptions {
             retry_failed: false,
             cleanup: false,
             max_dimensions: None,
+            debug_limit: None,
         }
     }
 }
@@ -170,6 +172,10 @@ impl Spec {
     pub(crate) fn retry_failed(&self) -> bool {
         self.options.retry_failed
     }
+
+    pub(crate) fn debug_limit(&self) -> Option<usize> {
+        self.options.limit
+    }
 }
 
 fn index_options(scan: ScanOptions) -> Result<IndexOptions, ApiError> {
@@ -178,6 +184,12 @@ fn index_options(scan: ScanOptions) -> Result<IndexOptions, ApiError> {
     options.retry_failed = scan.retry_failed;
     options.commit_chunk_size = OCR_COMMIT_CHUNK_SIZE;
     options.cleanup = scan.cleanup;
+    if scan.debug_limit == Some(0) {
+        return Err(ApiError::bad_request(
+            "index debug limit must be greater than zero",
+        ));
+    }
+    options.limit = scan.debug_limit;
     options.max_dimensions = scan
         .max_dimensions
         .map(|dimensions| {
@@ -279,6 +291,17 @@ mod tests {
         let request: CatalogSyncRequest =
             serde_json::from_str(r#"{"root":"/gallery","scan":{"debugLimit":0}}"#).unwrap();
         assert!(catalog_sync_options(request.scan).is_err());
+    }
+
+    #[test]
+    fn ocr_index_accepts_a_positive_debug_limit() {
+        let request: Request =
+            serde_json::from_str(r#"{"root":"/gallery","scan":{"debugLimit":100}}"#).unwrap();
+        assert_eq!(index_options(request.scan).unwrap().limit, Some(100));
+
+        let request: Request =
+            serde_json::from_str(r#"{"root":"/gallery","scan":{"debugLimit":0}}"#).unwrap();
+        assert!(index_options(request.scan).is_err());
     }
 
     #[test]

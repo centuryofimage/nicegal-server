@@ -30,6 +30,7 @@ enum ModelState {
     Preparing,
     Ready,
     Failed,
+    Unsupported,
 }
 
 type CachedLoader<T, O> = fn(&O) -> Result<Option<T>>;
@@ -188,7 +189,7 @@ model!(
     ImageEmbedder,
     ImageEmbedderOptions,
     nicegal_core::embedding::ImageEmbeddingModel,
-    "CLIP image model",
+    "Image model",
     Some(ImageEmbedder::load_cached)
 );
 model!(
@@ -196,7 +197,7 @@ model!(
     ImageQueryEmbedder,
     ImageQueryEmbedderOptions,
     nicegal_core::embedding::ImageEmbeddingModel,
-    "CLIP text model",
+    "Image description model",
     Some(ImageQueryEmbedder::load_cached)
 );
 
@@ -215,7 +216,14 @@ async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
     Json(StatusResponse {
         text: state.embedder.status(),
         clip_image: state.image_embedder.status(),
-        clip_text: state.image_query_embedder.status(),
+        clip_text: if state.image_embedder.model().supports_text_queries() {
+            state.image_query_embedder.status()
+        } else {
+            ModelStatus {
+                state: ModelState::Unsupported,
+                error: None,
+            }
+        },
     })
 }
 

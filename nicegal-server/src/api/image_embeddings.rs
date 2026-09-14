@@ -3,7 +3,7 @@
 use camino::Utf8PathBuf as PathBuf;
 use nicegal_core::assets::AssetCatalog;
 use nicegal_core::embedding::ImageEmbedder;
-use nicegal_core::image_index::{ImageIndexDb, index_images_observed};
+use nicegal_core::image_index::{ImageIndexDb, ImageIndexOptions, index_images_observed};
 use nicegal_core::index::IndexObserver;
 use serde::Deserialize;
 
@@ -16,30 +16,43 @@ pub(crate) struct Request {
     root: PathBuf,
     #[serde(default)]
     force: bool,
+    debug_limit: Option<usize>,
 }
 
 pub(crate) struct Spec {
     root: PathBuf,
     force: bool,
     retry_failed: bool,
+    debug_limit: Option<usize>,
 }
 
 impl Spec {
-    pub(crate) fn pending_for(root: PathBuf, retry_failed: bool) -> Self {
+    pub(crate) fn pending_for(
+        root: PathBuf,
+        retry_failed: bool,
+        debug_limit: Option<usize>,
+    ) -> Self {
         Self {
             root,
             force: false,
             retry_failed,
+            debug_limit,
         }
     }
 }
 
 pub(crate) fn prepare(request: Request) -> Result<Spec, ApiError> {
+    if request.debug_limit == Some(0) {
+        return Err(ApiError::bad_request(
+            "debugLimit must be greater than zero",
+        ));
+    }
     let root = roots::resolve_root("image embeddings", &request.root)?;
     Ok(Spec {
         root,
         force: request.force,
         retry_failed: false,
+        debug_limit: request.debug_limit,
     })
 }
 
@@ -57,8 +70,11 @@ pub(crate) fn run(
         &mut images,
         embedder,
         &spec.root,
-        spec.force,
-        spec.retry_failed,
+        ImageIndexOptions {
+            force: spec.force,
+            retry_failed: spec.retry_failed,
+            limit: spec.debug_limit,
+        },
         observer,
     )
 }
@@ -83,5 +99,15 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn image_debug_limit_is_positive_and_optional() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_str().unwrap();
+        let parsed = request(serde_json::json!({"root": root, "debugLimit": 2000})).unwrap();
+        assert_eq!(prepare(parsed).unwrap().debug_limit, Some(2000));
+        let parsed = request(serde_json::json!({"root": root, "debugLimit": 0})).unwrap();
+        assert!(prepare(parsed).is_err());
     }
 }

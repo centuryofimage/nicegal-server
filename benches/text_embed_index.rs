@@ -21,8 +21,13 @@ struct Arguments {
 }
 
 fn main() -> Result<()> {
-    if env::args_os().any(|argument| argument == "--help") {
+    let arguments: Vec<OsString> = env::args_os().skip(1).collect();
+    if arguments.iter().any(|argument| argument == "--help") {
         print_help();
+        return Ok(());
+    }
+    if !arguments.iter().any(|argument| argument == "--provider") {
+        eprintln!("text_embed_index benchmark skipped; pass --provider <PROVIDER> to run it");
         return Ok(());
     }
 

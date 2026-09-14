@@ -54,8 +54,98 @@ impl Transform for Resize {
     }
 }
 
+// Pillow performs horizontal filtering into RGB8 before its vertical pass. Separate
+// single-axis passes preserve that intermediate rounding and clipping.
+fn pillow_resize(image: DynamicImage, width: u32, height: u32, filter: FilterType) -> DynamicImage {
+    let horizontal = image.resize_exact(width, image.height(), filter);
+    horizontal.resize_exact(width, height, filter)
+}
+struct ResizePillow {
+    size: (u32, u32),
+    filter: FilterType,
+}
+impl Transform for ResizePillow {
+    fn transform(&self, data: TransformData) -> Result<TransformData> {
+        Ok(TransformData::Image(pillow_resize(
+            data.image()?,
+            self.size.1,
+            self.size.0,
+            self.filter,
+        )))
+    }
+}
+
+/// Resize the shorter side without distorting the image before a center crop.
+struct ResizeShortestEdge {
+    size: u32,
+}
+
+/// The exported DeepGHS pipeline resizes the short side to `size`, caps the long side at
+/// `max_size`, then center-crops (padding the shorter side black). Both steps truncate to int.
+struct ResizeDeepGhs {
+    size: u32,
+    max_size: u32,
+}
+impl Transform for ResizeDeepGhs {
+    fn transform(&self, data: TransformData) -> Result<TransformData> {
+        let image = data.image()?;
+        let (width, height) = image.dimensions();
+        let (mut output_width, mut output_height) = if width < height {
+            (
+                self.size,
+                (u64::from(self.size) * u64::from(height) / u64::from(width)) as u32,
+            )
+        } else {
+            (
+                (u64::from(self.size) * u64::from(width) / u64::from(height)) as u32,
+                self.size,
+            )
+        };
+        if output_width.max(output_height) > self.max_size {
+            if output_height > output_width {
+                output_width = (u64::from(self.max_size) * u64::from(output_width)
+                    / u64::from(output_height)) as u32;
+                output_height = self.max_size;
+            } else {
+                output_height = (u64::from(self.max_size) * u64::from(output_height)
+                    / u64::from(output_width)) as u32;
+                output_width = self.max_size;
+            }
+        }
+        if (width, height) == (output_width, output_height) {
+            Ok(TransformData::Image(image))
+        } else {
+            Ok(TransformData::Image(pillow_resize(
+                image,
+                output_width.max(1),
+                output_height.max(1),
+                FilterType::CatmullRom,
+            )))
+        }
+    }
+}
+impl Transform for ResizeShortestEdge {
+    fn transform(&self, data: TransformData) -> Result<TransformData> {
+        let image = data.image()?;
+        let (width, height) = image.dimensions();
+        let shorter = width.min(height) as u64;
+        let size = self.size as u64;
+        let (width, height) = (
+            (width as u64 * size / shorter) as u32,
+            (height as u64 * size / shorter) as u32,
+        );
+        Ok(TransformData::Image(pillow_resize(
+            image,
+            width,
+            height,
+            FilterType::CatmullRom,
+        )))
+    }
+}
+
 pub struct CenterCrop {
     pub size: (u32, u32),
+    pub round_even: bool,
 }
 
 impl Transform for CenterCrop {
@@ -65,8 +155,16 @@ impl Transform for CenterCrop {
         let (crop_width, crop_height) = self.size;
         if origin_width >= crop_width && origin_height >= crop_height {
             // cropped area is within image boundaries
-            let x = (origin_width - crop_width) / 2;
-            let y = (origin_height - crop_height) / 2;
+            let offset = |difference: u32| {
+                let floor = difference / 2;
+                if self.round_even && difference % 2 == 1 && floor % 2 == 1 {
+                    floor + 1
+                } else {
+                    floor
+                }
+            };
+            let x = offset(origin_width - crop_width);
+            let y = offset(origin_height - crop_height);
             let image = image.crop_imm(x, y, crop_width, crop_height);
             Ok(TransformData::Image(image))
         } else {
@@ -196,6 +294,83 @@ impl Compose {
         load_preprocessor(config)
     }
 
+    /// Read the five-stage pipeline bundled with DeepGHS SigLIP checkpoints. Validate its
+    /// parameters rather than silently changing preprocessing if upstream revises the file.
+    pub fn from_deepghs_bytes(bytes: &[u8]) -> Result<Compose> {
+        let config: serde_json::Value =
+            serde_json::from_slice(bytes).map_err(|e| Error::PreprocessorConfig(e.to_string()))?;
+        let stages = config["stages"]
+            .as_array()
+            .ok_or_else(|| Error::PreprocessorConfig("DeepGHS stages are missing".into()))?;
+        if stages.len() != 5
+            || stages[0]["type"] != "convert_rgb"
+            || stages[0]["force_background"] != "white"
+            || stages[1]["type"] != "resize"
+            || stages[1]["interpolation"] != "bicubic"
+            || stages[1]["antialias"] != true
+            || stages[2]["type"] != "center_crop"
+            || stages[3]["type"] != "maybe_to_tensor"
+            || stages[4]["type"] != "normalize"
+        {
+            return Err(Error::PreprocessorConfig(
+                "unsupported DeepGHS preprocessing stages".into(),
+            ));
+        }
+        let size = stages[1]["size"]
+            .as_u64()
+            .ok_or_else(|| Error::PreprocessorConfig("DeepGHS resize size is missing".into()))?
+            as u32;
+        let max_size = stages[1]["max_size"]
+            .as_u64()
+            .ok_or_else(|| Error::PreprocessorConfig("DeepGHS maximum size is missing".into()))?
+            as u32;
+        let crop = stages[2]["size"]
+            .as_u64()
+            .ok_or_else(|| Error::PreprocessorConfig("DeepGHS crop size is missing".into()))?
+            as u32;
+        if size == 0 || max_size == 0 || crop == 0 {
+            return Err(Error::PreprocessorConfig(
+                "DeepGHS image size must be positive".into(),
+            ));
+        }
+        let channels = |key: &str| -> Result<Vec<f32>> {
+            let values = stages[4][key]
+                .as_array()
+                .ok_or_else(|| Error::PreprocessorConfig(format!("DeepGHS {key} is missing")))?;
+            if values.len() != 3 {
+                return Err(Error::PreprocessorConfig(format!(
+                    "DeepGHS {key} must have three channels"
+                )));
+            }
+            values
+                .iter()
+                .map(|value| {
+                    value.as_f64().map(|v| v as f32).ok_or_else(|| {
+                        Error::PreprocessorConfig(format!("DeepGHS {key} must be numeric"))
+                    })
+                })
+                .collect()
+        };
+        let mean = channels("mean")?;
+        let std = channels("std")?;
+        if std.contains(&0.0) {
+            return Err(Error::PreprocessorConfig(
+                "DeepGHS standard deviation is zero".into(),
+            ));
+        }
+        Ok(Self::new(vec![
+            Box::new(ConvertToRGB),
+            Box::new(ResizeDeepGhs { size, max_size }),
+            Box::new(CenterCrop {
+                size: (crop, crop),
+                round_even: false,
+            }),
+            Box::new(PILToNDarray),
+            Box::new(Rescale { scale: 1.0 / 255.0 }),
+            Box::new(Normalize { mean, std }),
+        ]))
+    }
+
     pub fn preprocess_image(&self, image: DynamicImage) -> Result<Array3<f32>> {
         match self.transform(TransformData::Image(image))? {
             TransformData::NdArray(array) => Ok(array),
@@ -223,24 +398,47 @@ fn load_preprocessor(config: serde_json::Value) -> Result<Compose> {
         .as_str()
         .unwrap_or("CLIPImageProcessor");
     match mode {
-        "CLIPImageProcessor" => {
+        "CLIPImageProcessor"
+        | "SiglipImageProcessor"
+        | "Siglip2ImageProcessor"
+        | "DINOv3ViTImageProcessorFast" => {
             if config["do_resize"].as_bool().unwrap_or(false) {
                 let size = config["size"].clone();
                 let shortest_edge = size["shortest_edge"].as_u64();
                 let (height, width) = (size["height"].as_u64(), size["width"].as_u64());
 
                 if let Some(shortest_edge) = shortest_edge {
-                    let size = (shortest_edge as u32, shortest_edge as u32);
-                    transformers.push(Box::new(Resize {
-                        size,
-                        resample: FilterType::CatmullRom,
-                    }));
+                    if config["nicegal_preserve_aspect_ratio"]
+                        .as_bool()
+                        .unwrap_or(false)
+                    {
+                        transformers.push(Box::new(ResizeShortestEdge {
+                            size: shortest_edge as u32,
+                        }));
+                    } else {
+                        let size = (shortest_edge as u32, shortest_edge as u32);
+                        transformers.push(Box::new(Resize {
+                            size,
+                            resample: FilterType::CatmullRom,
+                        }));
+                    }
                 } else if let (Some(height), Some(width)) = (height, width) {
                     let size = (height as u32, width as u32);
-                    transformers.push(Box::new(Resize {
-                        size,
-                        resample: FilterType::CatmullRom,
-                    }));
+                    if config["nicegal_pillow_resize"].as_bool().unwrap_or(false) {
+                        transformers.push(Box::new(ResizePillow {
+                            size,
+                            filter: if config["resample"].as_u64() == Some(2) {
+                                FilterType::Triangle
+                            } else {
+                                FilterType::CatmullRom
+                            },
+                        }));
+                    } else {
+                        transformers.push(Box::new(Resize {
+                            size,
+                            resample: FilterType::CatmullRom,
+                        }));
+                    }
                 } else {
                     return Err(Error::PreprocessorConfig(
                         "Size must contain either 'shortest_edge' or 'height' and 'width'.".into(),
@@ -281,6 +479,9 @@ fn load_preprocessor(config: serde_json::Value) -> Result<Compose> {
                 };
                 transformers.push(Box::new(CenterCrop {
                     size: (width, height),
+                    round_even: config["nicegal_center_crop_round"]
+                        .as_bool()
+                        .unwrap_or(false),
                 }));
             }
         }
@@ -301,6 +502,7 @@ fn load_preprocessor(config: serde_json::Value) -> Result<Compose> {
                 }));
                 transformers.push(Box::new(CenterCrop {
                     size: (shortest_edge, shortest_edge),
+                    round_even: false,
                 }))
             } else {
                 transformers.push(Box::new(Resize {
@@ -370,6 +572,9 @@ fn load_preprocessor(config: serde_json::Value) -> Result<Compose> {
                 };
                 transformers.push(Box::new(CenterCrop {
                     size: (width, height),
+                    round_even: config["nicegal_center_crop_round"]
+                        .as_bool()
+                        .unwrap_or(false),
                 }));
             }
         }
@@ -416,4 +621,103 @@ fn load_preprocessor(config: serde_json::Value) -> Result<Compose> {
     }
 
     Ok(Compose::new(transformers))
+}
+
+#[cfg(test)]
+mod nicegal_tests {
+    use super::*;
+    #[test]
+    fn deepghs_fit_long_side_pads_the_short_side_black() {
+        let config = serde_json::json!({"stages": [
+            {"type": "convert_rgb", "force_background": "white"},
+            {"type": "resize", "size": 4, "max_size": 4,
+                "interpolation": "bicubic", "antialias": true},
+            {"type": "center_crop", "size": 4},
+            {"type": "maybe_to_tensor"},
+            {"type": "normalize", "mean": [0.5, 0.5, 0.5],
+                "std": [0.5, 0.5, 0.5]},
+        ]});
+        let preprocessor =
+            Compose::from_deepghs_bytes(&serde_json::to_vec(&config).unwrap()).unwrap();
+        let image = image::RgbImage::from_pixel(8, 4, image::Rgb([255, 0, 0]));
+        let pixels = preprocessor.preprocess_image(image.into()).unwrap();
+        assert_eq!(pixels.shape(), &[3, 4, 4]);
+        assert_eq!(pixels[[0, 0, 0]], -1.0); // black top padding
+        assert_eq!(pixels[[0, 1, 0]], 1.0); // red image
+        assert_eq!(pixels[[1, 1, 0]], -1.0);
+        assert_eq!(pixels[[0, 3, 0]], -1.0); // black bottom padding
+    }
+    #[test]
+    fn local_clip_preserves_aspect_while_legacy_config_stays_unchanged() {
+        // Wide three-color image: a true center crop should exclude the outer columns.
+        let mut image = image::RgbImage::new(12, 4);
+        for (x, _, pixel) in image.enumerate_pixels_mut() {
+            *pixel = image::Rgb(if x < 4 {
+                [255, 0, 0]
+            } else if x < 8 {
+                [0, 255, 0]
+            } else {
+                [0, 0, 255]
+            });
+        }
+        let base = serde_json::json!({"do_resize": true, "size": {"shortest_edge": 4},
+            "do_center_crop": true, "crop_size": 4, "do_rescale": false, "do_normalize": false,
+            "nicegal_preserve_aspect_ratio": true});
+        let tensor = load_preprocessor(base.clone())
+            .unwrap()
+            .preprocess_image(DynamicImage::ImageRgb8(image.clone()))
+            .unwrap();
+        assert_eq!(tensor.shape(), &[3, 4, 4]);
+        assert!(tensor
+            .index_axis(ndarray::Axis(0), 1)
+            .iter()
+            .all(|value| *value == 255.0));
+        let mut legacy = base;
+        legacy["nicegal_preserve_aspect_ratio"] = false.into();
+        let tensor = load_preprocessor(legacy)
+            .unwrap()
+            .preprocess_image(DynamicImage::ImageRgb8(image))
+            .unwrap();
+        assert!(tensor[[0, 0, 0]] > 100.0);
+    }
+    #[test]
+    fn torchvision_center_crop_rounds_half_offsets_to_even() {
+        let mut pixels = image::RgbImage::new(7, 4);
+        for (x, _, pixel) in pixels.enumerate_pixels_mut() {
+            *pixel = image::Rgb([x as u8, 0, 0]);
+        }
+        let image = DynamicImage::ImageRgb8(pixels);
+        let rounded = CenterCrop {
+            size: (4, 4),
+            round_even: true,
+        }
+        .transform(TransformData::Image(image.clone()))
+        .unwrap()
+        .image()
+        .unwrap();
+        let floored = CenterCrop {
+            size: (4, 4),
+            round_even: false,
+        }
+        .transform(TransformData::Image(image))
+        .unwrap()
+        .image()
+        .unwrap();
+        assert_eq!(rounded.to_rgb8().get_pixel(0, 0)[0], 2);
+        assert_eq!(floored.to_rgb8().get_pixel(0, 0)[0], 1);
+    }
+
+    #[test]
+    fn siglip_resizes_to_exact_square_and_normalizes() {
+        let config = serde_json::json!({"image_processor_type": "SiglipImageProcessor",
+            "do_resize": true, "size": {"height": 256, "width": 256},
+            "do_rescale": true, "rescale_factor": 0.00392156862745098,
+            "do_normalize": true, "image_mean": [0.5,0.5,0.5], "image_std": [0.5,0.5,0.5]});
+        let tensor = load_preprocessor(config)
+            .unwrap()
+            .preprocess_image(DynamicImage::ImageRgb8(image::RgbImage::new(12, 4)))
+            .unwrap();
+        assert_eq!(tensor.shape(), &[3, 256, 256]);
+        assert!(tensor.iter().all(|value| *value == -1.0));
+    }
 }

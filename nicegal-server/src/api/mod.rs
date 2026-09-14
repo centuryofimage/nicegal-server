@@ -3,6 +3,7 @@ mod catalog;
 mod error;
 mod extract;
 mod image_embeddings;
+mod image_model;
 mod indexing;
 mod jobs;
 pub(crate) mod models;
@@ -39,6 +40,7 @@ use tracing::{Span, debug_span, field, info, info_span};
 
 use error::ApiError;
 
+pub(crate) use image_model::ImageModelSettings;
 pub(crate) use jobs::JobManager;
 pub(crate) use ocr_models::ModelStore;
 pub(crate) use runtime::RuntimeSettings;
@@ -100,6 +102,7 @@ pub(crate) struct AppState {
     /// The process's selected ONNX Runtime distribution and the persisted selection for its next
     /// launch. It is separate from model state because a loaded dynamic library cannot change.
     pub(crate) runtime: Arc<RuntimeSettings>,
+    pub(crate) image_model_settings: Arc<ImageModelSettings>,
 }
 
 #[derive(Clone)]
@@ -202,7 +205,7 @@ async fn health() -> Json<HealthResponse> {
 async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
     Json(StatusResponse {
         api_version: API_VERSION,
-        runtime: runtime::status_response(&state.runtime),
+        runtime: runtime::status_response(&state),
         ocr_models_loaded: state.ocr_models.is_loaded(),
     })
 }
@@ -338,7 +341,15 @@ mod tests {
             .unwrap(),
         );
         runtime.set_onnx_runtime_build_info("test build".to_owned());
+        let image_model_settings = Arc::new(
+            ImageModelSettings::load(
+                databases.assets.parent().unwrap().join("image-model.json"),
+                None,
+            )
+            .unwrap(),
+        );
         let state = AppState {
+            image_model_settings,
             jobs: Arc::new(JobManager::new(
                 Arc::clone(&databases),
                 Arc::clone(&thumbnails),
@@ -499,6 +510,53 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["configuredExecutionProvider"], "openvino");
         assert_eq!(body["restartRequired"], true);
+    }
+
+    #[tokio::test]
+    async fn runtime_includes_image_catalog_and_accepts_model_only_updates() {
+        use nicegal_core::embedding::ImageEmbeddingModel;
+        let temp = TempDir::new().unwrap();
+        let router = test_router(&temp);
+        let (status, body) = send(&router, Method::GET, "/v1/runtime").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["imageModel"]["activeModel"],
+            ImageEmbeddingModel::MetaClip2B32.id()
+        );
+        let models = body["imageModel"]["models"].as_array().unwrap();
+        assert_eq!(models.len(), ImageEmbeddingModel::SELECTABLE.len());
+        assert!(
+            models
+                .iter()
+                .any(|model| model["id"] == ImageEmbeddingModel::SigLipBetaSwinV2Frozen.id())
+        );
+        assert!(
+            !models
+                .iter()
+                .any(|model| model["id"] == ImageEmbeddingModel::ClipVitB32.id())
+        );
+        let (status, body) = send_json(
+            &router,
+            Method::PUT,
+            "/v1/runtime",
+            r#"{"imageModel":"facebook/metaclip-2-worldwide-b16"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["imageModel"]["restartRequired"], true);
+        assert_eq!(
+            body["imageModel"]["selectedModel"],
+            ImageEmbeddingModel::MetaClip2B16.id()
+        );
+        for request in [
+            r#"{}"#,
+            r#"{"imageModel":"unknown"}"#,
+            r#"{"imageModel":"Qdrant/clip-ViT-B-32"}"#,
+            r#"{"imageModel":"deepghs/siglip_beta/smilingwolf/siglip_eva02_base_2025_05_02_21h53m54s"}"#,
+        ] {
+            let (status, _) = send_json(&router, Method::PUT, "/v1/runtime", request).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
     }
 
     #[tokio::test]

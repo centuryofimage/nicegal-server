@@ -609,7 +609,11 @@ impl JobManager {
             let needs_image = matches!(&spec, JobSpec::ImageEmbed(_) | JobSpec::ModelPrepare)
                 || matches!(&spec, JobSpec::OcrIndex(spec) if spec.embeds());
             if needs_text || needs_image {
-                job.preparing_models(u64::from(needs_text) + 2 * u64::from(needs_image));
+                let needs_image_text =
+                    needs_image && image_embedder.model().supports_text_queries();
+                job.preparing_models(
+                    u64::from(needs_text) + u64::from(needs_image) + u64::from(needs_image_text),
+                );
                 if needs_text {
                     embedder.prepare()?;
                     job.models_loaded(1);
@@ -623,8 +627,10 @@ impl JobManager {
                     if job.is_cancelled() {
                         return Ok(true);
                     }
-                    image_query_embedder.prepare()?;
-                    job.models_loaded(1);
+                    if needs_image_text {
+                        image_query_embedder.prepare()?;
+                        job.models_loaded(1);
+                    }
                 }
                 if job.is_cancelled() {
                     return Ok(true);
@@ -641,6 +647,7 @@ impl JobManager {
                     let embed = spec.embeds();
                     let root = spec.root().clone();
                     let retry_failed = spec.retry_failed();
+                    let debug_limit = spec.debug_limit();
                     let reconciliation = spec.reconciliation();
                     let summary = indexing::run(
                         spec,
@@ -662,7 +669,11 @@ impl JobManager {
                         return Ok(cancelled);
                     }
                     let cancelled = image_embeddings::run(
-                        image_embeddings::Spec::pending_for(root.clone(), retry_failed),
+                        image_embeddings::Spec::pending_for(
+                            root.clone(),
+                            retry_failed,
+                            debug_limit,
+                        ),
                         &databases.assets,
                         &databases.images,
                         image_embedder.prepare()?.as_ref(),
@@ -672,7 +683,7 @@ impl JobManager {
                         return Ok(true);
                     }
                     text_embeddings::job::run(
-                        text_embeddings::job::Spec::pending_for(root),
+                        text_embeddings::job::Spec::pending_for(root, debug_limit),
                         &databases.ocr,
                         embedder.prepare()?.as_ref(),
                         job.as_ref(),
@@ -762,6 +773,10 @@ impl JobManager {
                 .map(|job| job.response())
                 .collect(),
         }
+    }
+
+    pub(super) fn has_active_job(&self) -> bool {
+        self.list().active_job_id.is_some()
     }
 
     pub(crate) fn cancel_all(&self) {

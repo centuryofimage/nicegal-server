@@ -41,16 +41,18 @@ pub(crate) struct Spec {
     root: PathBuf,
     force: bool,
     batch_size: Option<usize>,
+    debug_limit: Option<usize>,
 }
 
 impl Spec {
     /// Build the incremental default used after an OCR index run. The root was already resolved
     /// when its index-job request was accepted.
-    pub(crate) fn pending_for(root: PathBuf) -> Self {
+    pub(crate) fn pending_for(root: PathBuf, debug_limit: Option<usize>) -> Self {
         Self {
             root,
             force: false,
             batch_size: None,
+            debug_limit,
         }
     }
 }
@@ -70,6 +72,7 @@ pub(crate) fn prepare(request: Request) -> Result<Spec, ApiError> {
         root,
         force: request.force,
         batch_size: request.batch_size,
+        debug_limit: None,
     })
 }
 
@@ -100,15 +103,21 @@ pub(crate) fn run(
     observer.on_event(IndexEvent::PhaseChanged(IndexPhase::TextEmbedding));
     let filters = SearchFilters::new(&spec.root);
     let backlog = ocr.text_embedding_coverage(SPACE, &filters)?.pending();
+    let backlog = spec.debug_limit.map_or(backlog, |limit| backlog.min(limit));
     observer.on_event(IndexEvent::Discovered { count: backlog });
     observer.on_event(IndexEvent::DiscoveryComplete { total: backlog });
 
+    let mut remaining = spec.debug_limit;
     loop {
         if observer.is_cancelled() {
             return Ok(true);
         }
+        let next_batch_size = remaining.map_or(batch_size, |limit| batch_size.min(limit));
+        if next_batch_size == 0 {
+            return Ok(false);
+        }
         let pending =
-            ocr.pending_text_embeddings(SPACE, &filters, batch_size, MAX_CONTENT_BYTES)?;
+            ocr.pending_text_embeddings(SPACE, &filters, next_batch_size, MAX_CONTENT_BYTES)?;
         if pending.is_empty() {
             return Ok(false);
         }
@@ -146,6 +155,9 @@ pub(crate) fn run(
             .collect();
         let attempted = items.len();
         let stored = ocr.save_text_embeddings(SPACE, embedder.model().id(), items)?;
+        if let Some(limit) = &mut remaining {
+            *limit -= attempted;
+        }
         observer.on_event(IndexEvent::Progress(IndexProgressDelta {
             processed: attempted,
             phase_completed: attempted,

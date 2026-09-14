@@ -154,6 +154,49 @@ impl TextEmbedding {
         ))
     }
 
+    /// Load a local paired text encoder with a fixed context window and external tensor files.
+    pub fn try_new_from_path(
+        path: impl AsRef<std::path::Path>,
+        tokenizer_files: crate::common::TokenizerFiles,
+        options: InitOptionsUserDefined,
+    ) -> Result<Self> {
+        let mut tokenizer = load_tokenizer(tokenizer_files, options.max_length)?;
+        if let Some(padding) = tokenizer.get_padding().cloned() {
+            tokenizer.with_padding(Some(tokenizers::PaddingParams {
+                strategy: tokenizers::PaddingStrategy::Fixed(options.max_length),
+                ..padding
+            }));
+        }
+        let session = init_session_builder(options.execution_providers, options.intra_threads)?
+            .commit_from_file(path)?;
+        Ok(Self::new(
+            tokenizer,
+            session,
+            None,
+            QuantizationMode::None,
+            Some(OutputKey::ByName("text_embeds")),
+        ))
+    }
+
+    /// DeepGHS embeds its complete fixed-length tokenizer configuration in tokenizer.json.
+    pub fn try_new_from_deepghs_path(
+        path: impl AsRef<std::path::Path>,
+        tokenizer_path: impl AsRef<std::path::Path>,
+        options: InitOptionsUserDefined,
+    ) -> Result<Self> {
+        let tokenizer = Tokenizer::from_file(tokenizer_path)
+            .map_err(|error| Error::Tokenization(error.to_string()))?;
+        let session = init_session_builder(options.execution_providers, options.intra_threads)?
+            .commit_from_file(path)?;
+        Ok(Self::new(
+            tokenizer,
+            session,
+            None,
+            QuantizationMode::None,
+            Some(OutputKey::ByName("embeddings")),
+        ))
+    }
+
     /// Private method to return an instance
     fn new(
         tokenizer: Tokenizer,
@@ -431,9 +474,19 @@ impl TextEmbedding {
 
                 let mut session_inputs = ort::inputs![
                     "input_ids" => Value::from_array(inputs_ids_array)?,
-                    "attention_mask" => Value::from_array(attention_mask_array.clone())?,
                 ];
 
+                if self
+                    .session
+                    .inputs()
+                    .iter()
+                    .any(|input| input.name() == "attention_mask")
+                {
+                    session_inputs.push((
+                        "attention_mask".into(),
+                        Value::from_array(attention_mask_array.clone())?.into(),
+                    ));
+                }
                 if self.need_token_type_ids {
                     session_inputs.push((
                         "token_type_ids".into(),

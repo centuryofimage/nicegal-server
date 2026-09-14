@@ -84,7 +84,7 @@ pub(super) fn embed(bytes: &[u8], model: &ImageEmbedder) -> Result<Vec<f32>, Api
     if let Some(vector) = cache.get(&key) {
         return Ok(vector);
     }
-    let raster = nicegal_core::imaging::decode(bytes).map_err(|_| {
+    let raster = model.decode_image(bytes).map_err(|_| {
         ApiError::bad_request("external image could not be decoded; choose another file")
     })?;
     if u64::from(raster.width()) * u64::from(raster.height()) > MAX_PIXELS as u64 {

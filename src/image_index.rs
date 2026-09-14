@@ -472,6 +472,14 @@ pub struct ImageVectorHit {
     pub distance: f64,
 }
 
+/// Flags for an incremental image-indexing pass.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ImageIndexOptions {
+    pub force: bool,
+    pub retry_failed: bool,
+    pub limit: Option<usize>,
+}
+
 /// Incrementally embed cataloged images beneath `root`.
 ///
 /// Decode workers overlap source I/O with a single batched inference lane. ONNX Runtime owns all
@@ -486,10 +494,14 @@ pub fn index_images_observed(
     db: &mut ImageIndexDb,
     embedder: &ImageEmbedder,
     root: &Path,
-    force: bool,
-    retry_failed: bool,
+    options: ImageIndexOptions,
     observer: &dyn IndexObserver,
 ) -> Result<bool> {
+    let ImageIndexOptions {
+        force,
+        retry_failed,
+        limit,
+    } = options;
     let assets = catalog.under_root(root)?;
     observer.on_event(IndexEvent::PhaseChanged(IndexPhase::ImageEmbedding));
     let images = assets
@@ -519,12 +531,15 @@ pub fn index_images_observed(
             .collect::<Vec<_>>();
         catalog.current_decode_failure_asset_ids(&fingerprints)?
     };
-    let sources = images
+    let mut sources = images
         .into_iter()
         .filter(|asset| {
             !current.contains(&asset.asset_id) && !decode_failed.contains(&asset.asset_id)
         })
         .collect::<Vec<_>>();
+    if let Some(limit) = limit {
+        sources.truncate(limit);
+    }
     tracing::Span::current().record("sources", sources.len());
     observer.on_event(IndexEvent::Discovered {
         count: sources.len(),
@@ -716,7 +731,12 @@ fn decode_sources(
             path: asset.path.clone(),
             active: true,
         });
-        let outcome = match prepare_image(&asset.path, |image| embedder.preprocess_image(image)) {
+        let outcome = match prepare_image(
+            &asset.path,
+            embedder.model() != crate::embedding::ImageEmbeddingModel::ClipVitB32,
+            embedder.model().is_deepghs(),
+            |image| embedder.preprocess_image(image),
+        ) {
             Ok(pixels) => DecodeOutcome::Success(DecodedImage {
                 asset: asset.clone(),
                 pixels,
@@ -750,13 +770,21 @@ fn decode_sources(
     skip_all,
     fields(path = %path)
 )]
-fn decode_image(path: &Path) -> Result<RgbImage> {
+fn decode_image(path: &Path, accurate: bool, white_background: bool) -> Result<RgbImage> {
     let data = std::fs::read(path).with_context(|| format!("opening image: {path}"))?;
-    let raster =
-        crate::imaging::decode(&data).with_context(|| format!("decoding image: {path}"))?;
+    let raster = if accurate {
+        crate::imaging::decode_accurate(&data)
+    } else {
+        crate::imaging::decode(&data)
+    }
+    .with_context(|| format!("decoding image: {path}"))?;
     let (width, height) = (raster.width(), raster.height());
-    RgbImage::from_raw(width, height, raster.into_rgb_bytes())
-        .context("assembling decoded image buffer")
+    let pixels = if white_background {
+        raster.flatten_rgb([255, 255, 255])
+    } else {
+        raster.into_rgb_bytes()
+    };
+    RgbImage::from_raw(width, height, pixels).context("assembling decoded image buffer")
 }
 
 enum PreparationError {
@@ -766,9 +794,11 @@ enum PreparationError {
 
 fn prepare_image(
     path: &Path,
+    accurate: bool,
+    white_background: bool,
     preprocess: impl FnOnce(RgbImage) -> Result<ndarray::Array3<f32>>,
 ) -> Result<ndarray::Array3<f32>, PreparationError> {
-    let image = decode_image(path).map_err(PreparationError::Decode)?;
+    let image = decode_image(path, accurate, white_background).map_err(PreparationError::Decode)?;
     // A model-specific transform failure says nothing about whether OCR can decode the file.
     preprocess(image).map_err(PreparationError::Preprocess)
 }
@@ -889,12 +919,14 @@ mod tests {
             crate::imaging::test_support::jpeg_with_orientation(1)?,
         )?;
         assert!(matches!(
-            prepare_image(&path, |_| anyhow::bail!("model transform failed")),
+            prepare_image(&path, false, false, |_| anyhow::bail!(
+                "model transform failed"
+            )),
             Err(PreparationError::Preprocess(_))
         ));
         std::fs::write(&path, b"invalid image")?;
         assert!(matches!(
-            prepare_image(&path, |_| panic!(
+            prepare_image(&path, false, false, |_| panic!(
                 "invalid pixels cannot reach the preprocessor"
             )),
             Err(PreparationError::Decode(_))

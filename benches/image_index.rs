@@ -13,8 +13,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use camino::{Utf8Path, Utf8PathBuf};
 use image::RgbImage;
 use nicegal_core::assets::AssetCatalog;
-use nicegal_core::embedding::{ImageEmbedder, ImageEmbedderOptions};
-use nicegal_core::image_index::{ImageIndexDb, index_images_observed};
+use nicegal_core::embedding::{ImageEmbedder, ImageEmbedderOptions, ImageEmbeddingModel};
+use nicegal_core::image_index::{ImageIndexDb, ImageIndexOptions, index_images_observed};
 use nicegal_core::index::{IndexEvent, IndexObserver, IndexOptions, catalog_dir_observed};
 use nicegal_core::runtime::{ExecutionProvider, RuntimeOptions};
 use strum::VariantNames;
@@ -30,6 +30,9 @@ struct Arguments {
     runs: usize,
     warmup_runs: usize,
     trace_jsonl: Option<PathBuf>,
+    model: ImageEmbeddingModel,
+    limit: Option<usize>,
+    asset_database: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -53,13 +56,20 @@ impl IndexObserver for BenchmarkObserver {
 }
 
 fn main() -> Result<()> {
-    if env::args_os().any(|argument| argument == "--help") {
+    let arguments: Vec<OsString> = env::args_os().skip(1).collect();
+    if arguments.iter().any(|argument| argument == "--help") {
         print_help();
         return Ok(());
     }
-    let arguments = parse_arguments()?;
-    init_tracing(arguments.trace_jsonl.as_deref())?;
-    run(arguments)
+    // Cargo runs custom-harness benchmarks during `test --all-targets`. Requiring an explicit
+    // model keeps that check from starting an unbounded index or downloading model weights.
+    if !arguments.iter().any(|argument| argument == "--model") {
+        eprintln!("image_index benchmark skipped; pass --model <MODEL_ID> to run it");
+        return Ok(());
+    }
+    let parsed = parse_arguments()?;
+    init_tracing(parsed.trace_jsonl.as_deref())?;
+    run(parsed)
 }
 
 fn init_tracing(path: Option<&Path>) -> Result<()> {
@@ -97,8 +107,9 @@ fn run(arguments: Arguments) -> Result<()> {
             arguments.corpus.display()
         );
     }
-    let corpus = nicegal_core::assets::canonicalize_path(&utf8_path(&arguments.corpus, "--corpus")?)
-        .context("canonicalizing corpus")?;
+    let corpus =
+        nicegal_core::assets::canonicalize_path(&utf8_path(&arguments.corpus, "--corpus")?)
+            .context("canonicalizing corpus")?;
     nicegal_core::runtime::initialize_bundled_runtime(arguments.provider)?;
     let runtime = RuntimeOptions {
         execution_provider: arguments.provider,
@@ -108,9 +119,9 @@ fn run(arguments: Arguments) -> Result<()> {
         replicas: None,
     };
     let options = ImageEmbedderOptions {
+        model: arguments.model,
         max_batch_size: arguments.batch_size,
         runtime,
-        ..ImageEmbedderOptions::default()
     };
 
     let model_load_started = Instant::now();
@@ -119,23 +130,34 @@ fn run(arguments: Arguments) -> Result<()> {
 
     let temporary = tempfile::tempdir().context("creating benchmark directory")?;
     let database_directory = utf8_path(temporary.path(), "benchmark directory")?;
-    let assets = AssetCatalog::new(&database_directory.join("assets.db"))?;
+    let asset_database = arguments
+        .asset_database
+        .as_deref()
+        .map(|path| utf8_path(path, "--asset-database"))
+        .transpose()?
+        .unwrap_or_else(|| database_directory.join("assets.db"));
+    let assets = AssetCatalog::new(&asset_database)?;
     let catalog_started = Instant::now();
-    let catalog_summary = catalog_dir_observed(
-        &assets,
-        &corpus,
-        IndexOptions::default(),
-        &BenchmarkObserver::default(),
-    )?;
+    let cataloged = if arguments.asset_database.is_some() {
+        assets.under_root(&corpus)?.len()
+    } else {
+        catalog_dir_observed(
+            &assets,
+            &corpus,
+            IndexOptions::default(),
+            &BenchmarkObserver::default(),
+        )?
+        .cataloged
+    };
     let catalog_duration = catalog_started.elapsed();
 
-    let warmup_image = first_supported_image(&corpus)?;
+    let warmup_image = first_supported_image(&corpus, &embedder)?;
     let warmup_pixels = embedder
         .preprocess_image(warmup_image)
         .context("preprocessing CLIP warmup image")?;
     let warmup_started = Instant::now();
     for _ in 0..arguments.warmup_runs {
-        embedder.embed_preprocessed_images(vec![warmup_pixels.clone()])?;
+        embedder.embed_preprocessed_images(vec![warmup_pixels.clone(); arguments.batch_size])?;
     }
     let warmup_duration = warmup_started.elapsed();
 
@@ -145,8 +167,13 @@ fn run(arguments: Arguments) -> Result<()> {
         Ok(parallelism) => println!("logical_parallelism={}", parallelism.get()),
         Err(_) => println!("logical_parallelism=unavailable"),
     }
-    println!("corpus={corpus}");
-    println!("cataloged={}", catalog_summary.cataloged);
+    println!("cataloged={cataloged}");
+    println!(
+        "image_limit={}",
+        arguments
+            .limit
+            .map_or_else(|| "unlimited".to_owned(), |limit| limit.to_string())
+    );
     println!("requested_provider={}", arguments.provider);
     println!("configured_provider={}", embedder.execution_provider());
     println!("threads={}", arguments.threads);
@@ -171,6 +198,8 @@ fn run(arguments: Arguments) -> Result<()> {
     );
 
     for run in 1..=arguments.runs {
+        let span = tracing::info_span!("benchmark_run", run, model = %embedder.model());
+        let _entered = span.enter();
         let database = database_directory.join(format!("image-index-{run}.db"));
         let mut image_index = ImageIndexDb::new(&database, embedder.dimensions())?;
         let observer = BenchmarkObserver::default();
@@ -180,8 +209,11 @@ fn run(arguments: Arguments) -> Result<()> {
             &mut image_index,
             &embedder,
             &corpus,
-            false,
-            false,
+            ImageIndexOptions {
+                limit: arguments.limit,
+                retry_failed: true,
+                ..Default::default()
+            },
             &observer,
         )?;
         let elapsed = started.elapsed();
@@ -272,12 +304,30 @@ fn parse_arguments() -> Result<Arguments> {
     let mut runs = None;
     let mut warmup_runs = None;
     let mut trace_jsonl = None;
+    let mut model = None;
+    let mut limit = None;
+    let mut asset_database = None;
     let mut values = env::args_os().skip(1);
     while let Some(argument) = values.next() {
         let argument = argument
             .into_string()
             .map_err(|value| anyhow!("argument is not UTF-8: {}", value.to_string_lossy()))?;
         match argument.as_str() {
+            "--model" => set_once(
+                &mut model,
+                next_value(&mut values, &argument)?.parse::<ImageEmbeddingModel>()?,
+                &argument,
+            )?,
+            "--limit" => set_once(
+                &mut limit,
+                parse_nonzero(&next_value(&mut values, &argument)?, &argument)?,
+                &argument,
+            )?,
+            "--asset-database" => set_once(
+                &mut asset_database,
+                PathBuf::from(next_value(&mut values, &argument)?),
+                &argument,
+            )?,
             "--corpus" => set_once(
                 &mut corpus,
                 PathBuf::from(next_value(&mut values, &argument)?),
@@ -328,6 +378,9 @@ fn parse_arguments() -> Result<Arguments> {
         runs: runs.unwrap_or(3),
         warmup_runs: warmup_runs.unwrap_or(1),
         trace_jsonl,
+        model: model.context("--model is required to run the image benchmark")?,
+        limit,
+        asset_database,
     })
 }
 
@@ -365,7 +418,7 @@ fn parse_nonzero(value: &str, flag: &str) -> Result<usize> {
     Ok(value)
 }
 
-fn first_supported_image(corpus: &Utf8Path) -> Result<RgbImage> {
+fn first_supported_image(corpus: &Utf8Path, embedder: &ImageEmbedder) -> Result<RgbImage> {
     for entry in WalkDir::new(corpus).follow_links(true) {
         let entry = entry.context("walking corpus for warmup image")?;
         if !entry.file_type().is_file() || !is_supported_image(entry.path()) {
@@ -373,11 +426,16 @@ fn first_supported_image(corpus: &Utf8Path) -> Result<RgbImage> {
         }
         let data = std::fs::read(entry.path())
             .with_context(|| format!("opening warmup image: {}", entry.path().display()))?;
-        let raster = nicegal_core::imaging::decode(&data)
+        let raster = embedder
+            .decode_image(&data)
             .with_context(|| format!("decoding warmup image: {}", entry.path().display()))?;
         let (width, height) = (raster.width(), raster.height());
-        return RgbImage::from_raw(width, height, raster.into_rgb_bytes())
-            .context("assembling warmup image buffer");
+        let pixels = if embedder.model().is_deepghs() {
+            raster.flatten_rgb([255, 255, 255])
+        } else {
+            raster.into_rgb_bytes()
+        };
+        return RgbImage::from_raw(width, height, pixels).context("assembling warmup image buffer");
     }
     bail!("--corpus contains no supported image: {corpus}")
 }
@@ -399,6 +457,12 @@ fn utf8_path(path: &Path, label: &str) -> Result<Utf8PathBuf> {
 }
 
 fn print_help() {
+    println!(
+        "Additional options: --model <MODEL_ID> --limit <N> --asset-database <COPIED_CATALOG_DB>"
+    );
+    println!(
+        "Use a private catalog copy: decode failures may update it. Every measured run gets a fresh vector index."
+    );
     println!(
         "Usage: cargo bench --bench image_index -- \\\n  [--corpus <DIR>] [--provider <{}>] [--threads <N>] [--batch-size <N>] \\\n  [--runs <N>] [--warmup-runs <N>] [--trace-jsonl <FILE>]\n\n\
 Measures catalog-backed decode, batched CLIP inference, and SQLite-vec ingestion. The corpus\n\

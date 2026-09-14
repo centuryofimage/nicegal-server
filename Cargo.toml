@@ -3,7 +3,7 @@ name = "nicegal-core"
 version = "0.3.0"
 build = "build.rs"
 authors = ["bep"]
-license = "PolyForm-Internal-Use-1.0.0"
+license = "AGPL-3.0-only"
 edition = "2024"
 description = "Library for indexing and searching images with OCR (optical character recognition)"
 repository = "https://github.com/centuryofimage/nicegal-server"
@@ -31,7 +31,7 @@ fastembed = { path = "vendor/fastembed", version = "6.0.0", default-features = f
 fast_image_resize = { version = "6.1.0", default-features = false, features = ["std"] }
 gif = { version = "0.14.2", default-features = false, features = ["std"] }
 glob = "0.3.4"
-hf-hub = { version = "0.4.3", default-features = false, features = ["native-tls", "tokio"] }
+hf-hub = { version = "0.4.3", default-features = false, features = ["native-tls", "tokio", "ureq"] }
 imagesize = "0.15.0"
 image = { version = "0.25.10", default-features = false, features = ["bmp"] }
 image-webp = "0.2.4"
@@ -46,6 +46,7 @@ rayon = "1.12.0"
 regex = { version = "1.13.1", optional = true }
 rusqlite = { version = "0.40.2", features = ["bundled", "hooks"] }
 sqlite-vec = "0.1.9"
+serde_json = "1.0.151"
 strum = { version = "0.28.0", features = ["derive"] }
 time = "0.3.55"
 tracing = { version = "0.1.44", default-features = false, features = ["std", "attributes"] }
@@ -82,3 +83,6 @@ harness = false
 [dev-dependencies]
 tempfile = "3.27.0"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["std", "fmt", "ansi", "env-filter", "json", "registry"] }
+
+[target.'cfg(windows)'.dependencies]
+tokio = { version = "1.53.1", features = ["rt"] }

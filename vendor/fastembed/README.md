@@ -18,3 +18,15 @@ encoders to reload without a network request.
 
 Build this package through the parent Nicegal workspace. See the backend
 [README](../../README.md) and [CLIP benchmark](../../benches/CLIP_INDEX.md).
+
+Local paired encoder loading uses `try_new_from_path` to resolve external ONNX
+tensors from disk without duplicating the entire checkpoint in Rust buffers.
+The paired text loader pads to its fixed context length and selects `text_embeds`.
+Local CLIP preprocessors can opt into aspect-preserving shortest-edge resizing;
+legacy configs retain their previous behavior. SigLIP image processor configs
+are also accepted for exact-square resizing and model-specific normalization.
+
+Local preprocessors honor the declared bilinear/bicubic interpolation and use
+horizontal then vertical RGB8 passes to match Pillow's clipping and rounding.
+A per-model center-crop option implements torchvision's ties-to-even offsets.
+Text inference only sends attention masks when the ONNX graph declares that input.

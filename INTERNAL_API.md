@@ -1130,3 +1130,18 @@ temporary databases for inspection.
 
 The Windows build packages ONNX Runtime libraries; model weights are downloaded separately
 when a model preparation or indexing request requires them.
+
+## Image model selection
+
+`GET /v1/runtime` includes `imageModel: {activeModel, selectedModel, restartRequired,
+models}`. Top-level `restartRequired` covers both the provider and model. Each catalog entry contains `id`, `name`, `dimensions`, `license`,
+`url`, and `available`. The original model can download normally; evaluation
+models require local export files under `NICEGAL_LOCAL_MODELS_DIR`.
+
+`PUT /v1/runtime` accepts `{"imageModel":"facebook/metaclip-2-worldwide-b32"}`
+and returns runtime status. `executionProvider` and `imageModel` are optional,
+but at least one must be supplied. Unknown or unavailable models are rejected, as are
+changes while an indexing job is active. The caller restarts the backend to
+activate the selection. Settings persist to `image-model.json` beside the runtime
+configuration. `--image-model` / `NICEGAL_IMAGE_MODEL` overrides only the active
+model for that launch, useful for sequential evaluation scripts.

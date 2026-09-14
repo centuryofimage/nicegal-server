@@ -44,7 +44,6 @@ use nicegal_core::db::{
     DB, SNIPPET_CLOSE, SNIPPET_OPEN, SearchFilters, SearchType, TextEmbeddingSpace,
     TextVectorSearchOptions, TimeRange, query_syntax_message,
 };
-use nicegal_core::embedding::ImageQueryEmbedder;
 use nicegal_core::highlight::{self, Highlight};
 use nicegal_core::image_index::{ImageIndexDb, ImageVectorSearchOptions};
 use serde::{Deserialize, Serialize};
@@ -492,8 +491,7 @@ async fn search(
             let images = databases.open_images_read_only(image_query_embedder.dimensions())?;
             images.set_search_cancellation(&cancellation)?;
             let mut snapshot = images.begin_read_snapshot()?;
-            let query_session = image_query_embedder.ready_or_cached()?;
-            let mut resolver = ImageQueryResolver::new(&query_session, &snapshot);
+            let mut resolver = ImageQueryResolver::new(&image_query_embedder, &snapshot);
             let vector = resolver.resolve(plan.image_query(), &cancellation)?;
             cancellation.check()?;
             let result = plan.run_image(&snapshot, Some(vector.as_slice()), &root, None)?;
@@ -680,8 +678,7 @@ async fn multi_search(
         }
         let mut image_vectors: HashMap<&str, Vec<f32>> = HashMap::new();
         if let Some(snapshot) = image_snapshot.as_ref() {
-            let query_session = image_query_embedder.ready_or_cached()?;
-            let mut resolver = ImageQueryResolver::new(&query_session, snapshot);
+            let mut resolver = ImageQueryResolver::new(&image_query_embedder, snapshot);
             resolver.image_embedder = Some(&image_embedder);
             for plan in &plans {
                 if matches!(plan.kind, PlanKind::Image) {
@@ -952,14 +949,14 @@ impl QueryPlan {
 struct ImageQueryResolver<'a> {
     image_embedder: Option<&'a super::models::ImageModel>,
     external_vector: Vec<f32>,
-    embedder: &'a ImageQueryEmbedder,
+    embedder: &'a super::models::ImageQueryModel,
     images: &'a ImageIndexDb,
     text_vectors: HashMap<String, Vec<f32>>,
     asset_vectors: HashMap<i64, Vec<f32>>,
 }
 
 impl<'a> ImageQueryResolver<'a> {
-    fn new(embedder: &'a ImageQueryEmbedder, images: &'a ImageIndexDb) -> Self {
+    fn new(embedder: &'a super::models::ImageQueryModel, images: &'a ImageIndexDb) -> Self {
         Self {
             embedder,
             image_embedder: None,
@@ -1013,9 +1010,16 @@ impl<'a> ImageQueryResolver<'a> {
                 Ok(&self.external_vector)
             }
             ImageQuerySource::Text(text) => {
+                if !self.embedder.model().supports_text_queries() {
+                    return Err(ApiError::bad_request(
+                        "This model supports image examples only. Remove text descriptions from visual search.",
+                    ));
+                }
                 if !self.text_vectors.contains_key(text) {
-                    self.text_vectors
-                        .insert(text.clone(), self.embedder.embed_query(text)?);
+                    self.text_vectors.insert(
+                        text.clone(),
+                        self.embedder.ready_or_cached()?.embed_query(text)?,
+                    );
                 }
                 Ok(self
                     .text_vectors
@@ -1385,6 +1389,38 @@ mod tests {
 
     use super::super::error::ErrorCode;
     use super::*;
+
+    #[test]
+    fn image_only_queries_do_not_prepare_a_text_encoder() {
+        use nicegal_core::embedding::{ImageEmbeddingModel, ImageQueryEmbedderOptions};
+        let temp = tempfile::tempdir().unwrap();
+        let path = camino::Utf8PathBuf::try_from(temp.path().join("images.db")).unwrap();
+        drop(ImageIndexDb::new(&path, 768).unwrap());
+        let catalog = camino::Utf8PathBuf::try_from(temp.path().join("assets.db")).unwrap();
+        drop(nicegal_core::assets::AssetCatalog::new(&catalog).unwrap());
+        let images = ImageIndexDb::new_read_only(&path, 768, &catalog).unwrap();
+        let query_model =
+            super::super::models::ImageQueryModel::deferred(ImageQueryEmbedderOptions {
+                model: ImageEmbeddingModel::DinoV3B16,
+                ..Default::default()
+            });
+        let mut resolver = ImageQueryResolver::new(&query_model, &images);
+        let error = resolver
+            .resolve(
+                &ImageQuery::from_text("a cat".into()),
+                &SearchCancellation::default(),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+        assert_eq!(error.component_index, Some(0));
+        assert!(error.message.contains("image examples only"));
+        // A missing indexed example is an index error, never a request to load a text model.
+        let error = resolver
+            .component_vector(&ImageQuerySource::AssetId(42))
+            .unwrap_err();
+        assert!(error.message.contains("no current image embedding"));
+        assert!(query_model.ready().is_err());
+    }
 
     #[tokio::test]
     async fn dropping_search_cancels_its_blocking_worker() {

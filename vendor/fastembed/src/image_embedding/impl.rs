@@ -106,11 +106,49 @@ impl ImageEmbedding {
         Ok(Self::new(preprocessor, session))
     }
 
+    /// Load local ONNX files, resolving external tensor data relative to the graph.
+    pub fn try_new_from_path(
+        path: impl AsRef<std::path::Path>,
+        preprocessor_file: &[u8],
+        options: ImageInitOptionsUserDefined,
+    ) -> Result<Self> {
+        let mut config: serde_json::Value = serde_json::from_slice(preprocessor_file)
+            .map_err(|error| Error::PreprocessorConfig(error.to_string()))?;
+        config["nicegal_pillow_resize"] = true.into();
+        let config = serde_json::to_vec(&config)
+            .map_err(|error| Error::PreprocessorConfig(error.to_string()))?;
+        let preprocessor = ImagePreprocessor::new(Compose::from_bytes(config)?);
+        let session = init_session_builder(options.execution_providers, options.intra_threads)?
+            .commit_from_file(path)?;
+        Ok(Self::new(preprocessor, session))
+    }
+
+    /// Load a DeepGHS SigLIP ONNX encoder with its native Pillow transform description.
+    pub fn try_new_from_deepghs_path(
+        path: impl AsRef<Path>,
+        preprocessor_file: &[u8],
+        options: ImageInitOptionsUserDefined,
+    ) -> Result<Self> {
+        let preprocessor = ImagePreprocessor::new(Compose::from_deepghs_bytes(preprocessor_file)?);
+        let session = init_session_builder(options.execution_providers, options.intra_threads)?
+            .commit_from_file(path)?;
+        let mut model = Self::new(preprocessor, session);
+        model.output_key = Some("embeddings");
+        Ok(model)
+    }
+
+    /// Select a named embedding output when an ONNX graph also returns token features.
+    pub fn with_output_key(mut self, key: &'static str) -> Self {
+        self.output_key = Some(key);
+        self
+    }
+
     /// Private method to return an instance
     fn new(preprocessor: ImagePreprocessor, session: Session) -> Self {
         Self {
             preprocessor,
             session,
+            output_key: None,
         }
     }
 
@@ -257,14 +295,18 @@ impl ImageEmbedding {
 
         // Try to get the only output key
         // If multiple, then default to few known keys `image_embeds` and `last_hidden_state`
-        let last_hidden_state_key = match outputs.len() {
-            1 => vec![outputs
-                .keys()
-                .next()
-                .ok_or_else(|| Error::OutputKeyMissing {
-                    key: "<only output>".into(),
-                })?],
-            _ => vec!["image_embeds", "last_hidden_state"],
+        let last_hidden_state_key = if let Some(key) = self.output_key {
+            vec![key]
+        } else {
+            match outputs.len() {
+                1 => vec![outputs
+                    .keys()
+                    .next()
+                    .ok_or_else(|| Error::OutputKeyMissing {
+                        key: "<only output>".into(),
+                    })?],
+                _ => vec!["image_embeds", "last_hidden_state"],
+            }
         };
 
         // Extract tensor and handle different dimensionalities

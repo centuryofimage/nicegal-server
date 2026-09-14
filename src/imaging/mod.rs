@@ -54,6 +54,15 @@ pub fn decode(data: &[u8]) -> Result<Raster> {
     Ok(raster.orient(orientation))
 }
 
+/// Decode with accurate JPEG IDCT/chroma upsampling for model preprocessing parity.
+pub fn decode_accurate(data: &[u8]) -> Result<Raster> {
+    if Format::detect(data)? == Format::Jpeg {
+        Ok(jpeg::decode_accurate(data)?.orient(orientation_from_jpeg(data)))
+    } else {
+        decode(data)
+    }
+}
+
 pub fn encode_jpeg(width: u32, height: u32, rgb: &[u8], quality: f32) -> Result<Vec<u8>> {
     jpeg::encode(width, height, rgb, quality)
 }

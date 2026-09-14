@@ -1,7 +1,7 @@
 use std::fs;
 use std::io::Write as _;
 use std::str::FromStr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow};
 use axum::Json;
@@ -68,6 +68,7 @@ impl RuntimeSettings {
                 .clone(),
             configured_execution_provider: configured_execution_provider.to_string(),
             restart_required: self.active_execution_provider != configured_execution_provider,
+            image_model: None,
         }
     }
 
@@ -92,6 +93,8 @@ pub(super) struct RuntimeStatusResponse {
     onnx_runtime_build_info: String,
     configured_execution_provider: String,
     restart_required: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image_model: Option<super::image_model::ModelStatus>,
 }
 
 /// CPU models can execute against either accelerated distribution. The Windows server uses the
@@ -109,7 +112,8 @@ fn runtime_distribution(execution_provider: ExecutionProvider) -> &'static str {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RuntimeUpdateRequest {
-    execution_provider: String,
+    execution_provider: Option<String>,
+    image_model: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -128,26 +132,67 @@ pub(super) fn route() -> MethodRouter<AppState> {
     get(status).put(update)
 }
 
-pub(super) fn status_response(settings: &RuntimeSettings) -> RuntimeStatusResponse {
-    settings.status()
+pub(super) fn status_response(state: &AppState) -> RuntimeStatusResponse {
+    let mut status = state.runtime.status();
+    let model = state.image_model_settings.status();
+    status.restart_required |= model.restart_required;
+    status.image_model = Some(model);
+    status
 }
 
 async fn status(State(state): State<AppState>) -> Json<RuntimeStatusResponse> {
-    Json(state.runtime.status())
+    Json(status_response(&state))
 }
 
 async fn update(
     State(state): State<AppState>,
     ApiJson(request): ApiJson<RuntimeUpdateRequest>,
 ) -> Result<(StatusCode, Json<RuntimeStatusResponse>), ApiError> {
-    let execution_provider = ExecutionProvider::from_str(&request.execution_provider)
+    if request.execution_provider.is_none() && request.image_model.is_none() {
+        return Err(ApiError::bad_request(
+            "Provide executionProvider or imageModel",
+        ));
+    }
+    let execution_provider = request
+        .execution_provider
+        .as_deref()
+        .map(ExecutionProvider::from_str)
+        .transpose()
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    let runtime = state.runtime;
-    let response = tokio::task::spawn_blocking(move || runtime.set(execution_provider))
-        .await
-        .map_err(|error| ApiError::internal(anyhow!("runtime settings task failed: {error}")))?
-        .map_err(ApiError::internal)?;
-    Ok((StatusCode::OK, Json(response)))
+    let model = request
+        .image_model
+        .as_deref()
+        .map(str::parse::<nicegal_core::embedding::ImageEmbeddingModel>)
+        .transpose()
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    if let Some(model) = model {
+        if !nicegal_core::embedding::ImageEmbeddingModel::SELECTABLE.contains(&model) {
+            return Err(ApiError::bad_request(
+                "This model is retired from the model selector",
+            ));
+        }
+        if !model.available() {
+            return Err(ApiError::bad_request("Image model is unavailable"));
+        }
+        if state.jobs.has_active_job() {
+            return Err(ApiError::job_busy());
+        }
+    }
+    let runtime = Arc::clone(&state.runtime);
+    let settings = Arc::clone(&state.image_model_settings);
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        if let Some(provider) = execution_provider {
+            runtime.set(provider)?;
+        }
+        if let Some(model) = model {
+            settings.set(model)?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|error| ApiError::internal(anyhow!("runtime settings task failed: {error}")))?
+    .map_err(ApiError::internal)?;
+    Ok((StatusCode::OK, Json(status_response(&state))))
 }
 
 fn read_provider(path: &PathBuf) -> Result<ExecutionProvider> {

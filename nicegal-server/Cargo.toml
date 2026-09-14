@@ -2,7 +2,7 @@
 name = "nicegal-server"
 version = "0.3.0"
 authors = ["bep"]
-license = "PolyForm-Internal-Use-1.0.0"
+license = "AGPL-3.0-only"
 edition = "2024"
 description = "Local HTTP server for nicegal-server"
 repository = "https://github.com/centuryofimage/nicegal-server"

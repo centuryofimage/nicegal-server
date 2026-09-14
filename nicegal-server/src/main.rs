@@ -43,6 +43,10 @@ struct Args {
     #[arg(long, env = "NICEGAL_EMBED_MODEL", value_name = "MODEL")]
     embed_model: Option<TextEmbeddingModel>,
 
+    /// Image/text encoder pair used for image similarity search.
+    #[arg(long, env = "NICEGAL_IMAGE_MODEL", value_name = "MODEL")]
+    image_model: Option<ImageEmbeddingModel>,
+
     /// ONNX Runtime execution provider every `ocrModelLoad` job requests. Falls back on its own
     /// through `runtime::fallback_chain` (DirectML tries OpenVINO before CPU; anything else goes
     /// straight to CPU) if this one is unavailable or fails to compile. This overrides the
@@ -86,15 +90,19 @@ async fn main() -> Result<()> {
         Some(path) => path,
         None => default_database("thumbnails.db")?,
     };
-    let image_model = ImageEmbeddingModel::ClipVitB32;
-    let image_database = asset_database
-        .parent()
-        .context("asset database path has no parent directory")?
-        .join(image_model.database_file_name());
     let runtime_config = match args.runtime_config {
         Some(path) => path,
         None => default_database("runtime.json")?,
     };
+    let image_model_settings = Arc::new(api::ImageModelSettings::load(
+        runtime_config.with_file_name("image-model.json"),
+        args.image_model,
+    )?);
+    let image_model = image_model_settings.active();
+    let image_database = asset_database
+        .parent()
+        .context("asset database path has no parent directory")?
+        .join(image_model.database_file_name());
     for database in [
         &asset_database,
         &image_database,
@@ -191,6 +199,7 @@ async fn main() -> Result<()> {
         embedder,
         image_query_embedder,
         image_embedder,
+        image_model_settings,
         ocr_models,
         runtime,
     };

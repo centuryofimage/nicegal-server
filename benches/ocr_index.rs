@@ -57,8 +57,13 @@ impl IndexObserver for BenchmarkObserver {
 }
 
 fn main() -> Result<()> {
-    if env::args_os().any(|argument| argument == "--help") {
+    let arguments: Vec<OsString> = env::args_os().skip(1).collect();
+    if arguments.iter().any(|argument| argument == "--help") {
         print_help();
+        return Ok(());
+    }
+    if !arguments.iter().any(|argument| argument == "--corpus") {
+        eprintln!("ocr_index benchmark skipped; pass --corpus <DIR> to run it");
         return Ok(());
     }
 

@@ -24,6 +24,27 @@ impl FastEmbedBackend {
         cached_only: bool,
     ) -> Result<Option<(Self, PathBuf, ExecutionProvider)>> {
         let cache_dir = crate::hub::cache_dir();
+        #[cfg(windows)]
+        if !cached_only {
+            let info = TextEmbedding::get_model_info(&model)?;
+            for filename in [
+                info.model_file.as_str(),
+                "tokenizer.json",
+                "config.json",
+                "special_tokens_map.json",
+                "tokenizer_config.json",
+            ]
+            .into_iter()
+            .chain(info.additional_files.iter().map(String::as_str))
+            {
+                crate::hub::ModelSource {
+                    model_id: info.model_code.clone(),
+                    revision: None,
+                    filename: filename.to_owned(),
+                }
+                .get_sync()?;
+            }
+        }
         let intra_threads = runtime_options.intra_threads;
         let (backend, execution_provider) = runtime::with_fallback(runtime_options, |provider| {
             let configured = runtime::configure_provider(provider, intra_threads)?;
@@ -34,7 +55,7 @@ impl FastEmbedBackend {
                 .with_show_download_progress(true)
                 .with_execution_providers(vec![configured.dispatch])
                 .with_intra_threads(configured.intra_threads.get());
-            let loaded = if cached_only {
+            let loaded = if cached_only || cfg!(windows) {
                 TextEmbedding::try_new_cached(init)
             } else {
                 TextEmbedding::try_new(init).map(Some)
@@ -58,6 +79,74 @@ impl FastEmbedBackend {
         )))
     }
 
+    pub(super) fn load_local_image_query(
+        model: ImageEmbeddingModel,
+        options: RuntimeOptions,
+        cached_only: bool,
+    ) -> Result<Option<(Self, PathBuf, ExecutionProvider)>> {
+        let Some(path) = model.validated_model_directory(cached_only)? else {
+            return Ok(None);
+        };
+        let (backend, provider) = runtime::with_fallback(options, |provider| {
+            let configured = runtime::configure_provider(provider, options.intra_threads)?;
+            let files = fastembed::TokenizerFiles {
+                tokenizer_file: std::fs::read(path.join("tokenizer.json"))?,
+                tokenizer_config_file: std::fs::read(path.join("tokenizer_config.json"))?,
+                special_tokens_map_file: std::fs::read(path.join("special_tokens_map.json"))?,
+                config_file: std::fs::read(path.join("config.json"))?,
+            };
+            TextEmbedding::try_new_from_path(
+                path.join("text.onnx"),
+                files,
+                fastembed::InitOptionsUserDefined::new()
+                    .with_max_length(model.context_length())
+                    .with_execution_providers(vec![configured.dispatch])
+                    .with_intra_threads(configured.intra_threads.get()),
+            )
+            .context("loading local paired text ONNX encoder")
+        })?;
+        Ok(Some((
+            Self {
+                inner: Mutex::new(backend),
+            },
+            path,
+            provider,
+        )))
+    }
+
+    pub(super) fn load_deepghs_image_query(
+        model: ImageEmbeddingModel,
+        options: RuntimeOptions,
+        cached_only: bool,
+    ) -> Result<Option<(Self, PathBuf, ExecutionProvider)>> {
+        let text = model.deepghs_file("text_encode.onnx", cached_only)?;
+        let tokenizer = model.deepghs_file("tokenizer.json", cached_only)?;
+        let meta = model.deepghs_file("meta.json", cached_only)?;
+        let (Some(text), Some(tokenizer), Some(meta)) = (text, tokenizer, meta) else {
+            return Ok(None);
+        };
+        model.validate_deepghs_meta(&meta)?;
+        let (backend, provider) = runtime::with_fallback(options, |provider| {
+            let configured = runtime::configure_provider(provider, options.intra_threads)?;
+            TextEmbedding::try_new_from_deepghs_path(
+                &text,
+                &tokenizer,
+                fastembed::InitOptionsUserDefined::new()
+                    .with_max_length(model.context_length())
+                    .with_execution_providers(vec![configured.dispatch])
+                    .with_intra_threads(configured.intra_threads.get()),
+            )
+            .context("loading DeepGHS paired text ONNX encoder")
+        })?;
+        Ok(Some((
+            Self {
+                inner: Mutex::new(backend),
+            },
+            crate::hub::cache_dir(),
+            provider,
+        )))
+    }
+
     pub(super) fn embed(&self, texts: &[&str], max_batch_size: usize) -> Result<Vec<Vec<f32>>> {
         let mut backend = self
             .inner
@@ -75,13 +164,5 @@ impl FastEmbedBackend {
 pub(super) fn ocr_model_to_fastembed(model: TextEmbeddingModel) -> EmbeddingModel {
     match model {
         TextEmbeddingModel::BgeSmallEnV15 => EmbeddingModel::BGESmallENV15,
-    }
-}
-
-/// The image engine's catalog: the paired text encoder of each image embedding model, whose
-/// vectors must land in that model's coordinate space to be comparable with its image vectors.
-pub(super) fn image_query_model_to_fastembed(model: ImageEmbeddingModel) -> EmbeddingModel {
-    match model {
-        ImageEmbeddingModel::ClipVitB32 => EmbeddingModel::ClipVitB32,
     }
 }

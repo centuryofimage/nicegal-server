@@ -9,16 +9,25 @@ use super::Raster;
 /// error path; catch that here so a corrupt JPEG on disk returns an error like every other
 /// decoder instead of taking down the caller's thread.
 pub fn decode(data: &[u8]) -> Result<Raster> {
-    catch_unwind(AssertUnwindSafe(|| decode_inner(data)))
+    catch_unwind(AssertUnwindSafe(|| decode_inner(data, false)))
         .unwrap_or_else(|_| Err(anyhow!("decoding JPEG panicked")))
 }
 
-fn decode_inner(data: &[u8]) -> Result<Raster> {
+pub fn decode_accurate(data: &[u8]) -> Result<Raster> {
+    catch_unwind(AssertUnwindSafe(|| decode_inner(data, true)))
+        .unwrap_or_else(|_| Err(anyhow!("decoding JPEG panicked")))
+}
+
+fn decode_inner(data: &[u8], accurate: bool) -> Result<Raster> {
     let mut decompress = Decompress::new_mem(data).context("reading JPEG header")?;
     // The thumbnail gets downscaled right after this, so the accuracy this trades away
     // (slow-but-precise IDCT, careful chroma upsampling) would be invisible anyway.
-    decompress.dct_method(DctMethod::IntegerFast);
-    decompress.do_fancy_upsampling(false);
+    decompress.dct_method(if accurate {
+        DctMethod::IntegerSlow
+    } else {
+        DctMethod::IntegerFast
+    });
+    decompress.do_fancy_upsampling(accurate);
     let mut decompress = decompress.rgb().context("starting JPEG decompression")?;
     let width = decompress.width() as u32;
     let height = decompress.height() as u32;
