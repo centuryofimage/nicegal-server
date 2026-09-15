@@ -31,7 +31,7 @@ DINOv3 accepts image examples only; it does not support text queries. Model weig
 
 ## License
 
-Original application code is [AGPL-3.0-only](LICENSE), Copyright 2026 bep. Modified third-party code in `vendor/` remains Apache-2.0 under its retained license files and notices. The [dependency license inventory](third-party-licenses.json) and [native runtime notices](third-party-notices/README.md) identify other separately licensed components. AGPL compatibility of the bundled DirectML redistributable remains unresolved; review its [Microsoft terms](https://www.nuget.org/packages/Microsoft.AI.DirectML/1.15.4/License) before redistributing a Windows build that includes it.
+Original application code is [AGPL-3.0-only with a DirectML linking exception](LICENSE), Copyright 2026 bep. Modified third-party code in `vendor/` remains Apache-2.0 under its retained license files and notices. The [dependency license inventory](third-party-licenses.json) and [native runtime notices](third-party-notices/README.md) identify other separately licensed components.
 
 To verify a downloaded server ZIP's GitHub build provenance, run:
 

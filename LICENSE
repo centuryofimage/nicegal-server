@@ -1,7 +1,24 @@
 Copyright 2026 bep
 
 The original application code in this repository is licensed under the GNU
-Affero General Public License, version 3 only (AGPL-3.0-only), reproduced below.
+Affero General Public License, version 3 only (AGPL-3.0-only), reproduced below,
+with the following additional permission under section 7.
+
+DirectML linking exception
+
+For the original application code covered by this license, the copyright
+holder grants permission to link or combine that code with Microsoft DirectML,
+including by dynamic loading and through ONNX Runtime, and to convey the
+resulting work. When exercising this permission, you need not provide the
+source code for Microsoft DirectML as part of the Corresponding Source.
+All other AGPL requirements remain applicable to the covered application code,
+including the source-sharing requirements for distribution and remote network
+interaction.
+
+Microsoft DirectML remains subject to its own license terms. This permission
+does not grant rights to Microsoft DirectML or change the license terms of
+any other third-party component. You may remove this additional permission
+from a copy or modified version as provided by section 7 of the AGPL.
 
 The modified third-party code in vendor/ remains licensed under Apache-2.0.
 Its license files and attribution notices are retained within that directory.
