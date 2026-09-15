@@ -1,14 +1,51 @@
 //! CLIP image embedding jobs.
 
+use super::{AppState, extract::ApiQuery, run_blocking};
+use axum::{
+    Json,
+    extract::State,
+    routing::{MethodRouter, get},
+};
 use camino::Utf8PathBuf as PathBuf;
 use nicegal_core::assets::AssetCatalog;
+use nicegal_core::db::SearchFilters;
 use nicegal_core::embedding::ImageEmbedder;
 use nicegal_core::image_index::{ImageIndexDb, ImageIndexOptions, index_images_observed};
 use nicegal_core::index::IndexObserver;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::error::ApiError;
 use super::roots;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CoverageRequest {
+    root: PathBuf,
+}
+
+#[derive(Serialize)]
+struct CoverageResponse {
+    total: usize,
+    indexed: usize,
+}
+
+pub(super) fn route() -> MethodRouter<AppState> {
+    get(coverage)
+}
+
+async fn coverage(
+    State(state): State<AppState>,
+    ApiQuery(request): ApiQuery<CoverageRequest>,
+) -> Result<Json<CoverageResponse>, ApiError> {
+    let dimensions = state.image_query_embedder.dimensions();
+    run_blocking(move || {
+        let root = roots::resolve_root("image embeddings", &request.root)?;
+        let db = state.databases.open_images_read_only(dimensions)?;
+        let (total, indexed) = db.coverage(&SearchFilters::new(&root))?;
+        Ok(Json(CoverageResponse { total, indexed }))
+    })
+    .await
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

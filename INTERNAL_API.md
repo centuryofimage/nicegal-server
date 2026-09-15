@@ -20,6 +20,7 @@ Electron owns the configured database paths. Rust owns catalog and metadata poli
 | Search several ways at once | `POST /v1/search` |
 | Underline what matched in an OCR result | `highlights`, see [Highlights](#highlights) |
 | Check vector-search coverage | `GET /v1/text-embeddings` |
+| Check image-search coverage | `GET /v1/image-embeddings?root=...` — `{total,indexed}`; cataloged images and current vectors for the active image model, excluding videos and stale fingerprints |
 | Start, monitor, and cancel work | `/v1/jobs` |
 | Backfill thumbnail variants | `POST /v1/thumbnails/generate`, then poll the returned job |
 | Explicitly backfill OCR text embeddings | `POST /v1/text-embeddings/generate`, then poll the returned job |

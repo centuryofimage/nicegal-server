@@ -139,6 +139,7 @@ pub(crate) fn router(state: AppState, authorization: HeaderValue) -> Router {
             search::route().layer(DefaultBodyLimit::max(48 * 1024 * 1024)),
         )
         .route("/v1/text-embeddings", text_embeddings::route())
+        .route("/v1/image-embeddings", image_embeddings::route())
         .route(
             "/v1/text-embeddings/generate",
             text_embeddings::generate_route(),
@@ -912,6 +913,22 @@ mod tests {
                 .contains("fts5: syntax error"),
             "{body}"
         );
+    }
+
+    #[tokio::test]
+    async fn image_embedding_coverage_is_available_without_loading_models() {
+        let temp = TempDir::new().unwrap();
+        let router = test_router(&temp);
+        let uri = format!(
+            "/v1/image-embeddings?root={}",
+            urlencode(temp.path().to_str().unwrap())
+        );
+        let (status, body) = send(&router, Method::GET, &uri).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["indexed"], 0);
+        assert!(body["total"].is_u64());
+        let (status, _) = send(&router, Method::GET, "/v1/image-embeddings").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

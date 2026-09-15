@@ -402,6 +402,27 @@ impl ImageIndexDb {
         ))
     }
 
+    /// Current image-search coverage, excluding videos, stale vectors and other roots.
+    pub fn coverage(&self, filters: &SearchFilters<'_>) -> Result<(usize, usize)> {
+        let bound = filters.bind(FilterScope::CATALOG_ROWS)?;
+        let sql = format!(
+            "SELECT count(*), count(image_embedding_state.asset_id) \
+             FROM catalog.assets \
+             LEFT JOIN image_embedding_state \
+               ON image_embedding_state.asset_id = catalog.assets.asset_id \
+              AND image_embedding_state.source_modified_ns = catalog.assets.source_modified_ns \
+              AND image_embedding_state.source_size = catalog.assets.source_size \
+             WHERE catalog.assets.media_kind = 'image'{}",
+            bound.sql
+        );
+        let (total, indexed): (i64, i64) =
+            self.conn
+                .query_row(&sql, bind_named(&bound.params).as_slice(), |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })?;
+        Ok((usize::try_from(total)?, usize::try_from(indexed)?))
+    }
+
     /// Return one asset's vector only while it is current with the attached catalog.
     ///
     /// Query-reference assets deliberately are not constrained to a search root: an image from
@@ -900,6 +921,48 @@ fn guard_decode_worker(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn coverage_excludes_stale_vectors_videos_and_other_roots() -> Result<()> {
+        let temp = TempDir::new()?;
+        let root = PathBuf::from("C:/gallery");
+        let rows = vec![
+            (1, root.join("current.png"), 10, None, 100),
+            (2, root.join("changed.png"), 20, None, 100),
+            (3, root.join("missing.png"), 10, None, 100),
+            (
+                4,
+                PathBuf::from("C:/gallery-other/outside.png"),
+                10,
+                None,
+                100,
+            ),
+            (5, root.join("video.mp4"), 10, None, 100),
+            (6, root.join("resized.png"), 10, None, 200),
+        ];
+        let catalog = catalog_with_rows(&temp, &rows)?;
+        Connection::open(&catalog)?.execute(
+            "UPDATE assets SET media_kind = 'video' WHERE asset_id = 5",
+            [],
+        )?;
+        let vectors = [1, 2, 4, 6].map(|id| {
+            (
+                id,
+                rows[(id - 1) as usize].1.clone(),
+                10,
+                100,
+                vec![1.0, 0.0],
+            )
+        });
+        let index = image_index_with_vectors(&temp, 2, &vectors)?;
+        let db = ImageIndexDb::new_read_only(&index, 2, &catalog)?;
+        assert_eq!(db.coverage(&SearchFilters::new(&root))?, (4, 1));
+        assert_eq!(
+            db.coverage(&SearchFilters::new(Path::new("C:/empty")))?,
+            (0, 0)
+        );
+        Ok(())
+    }
 
     #[test]
     fn preprocessing_errors_do_not_classify_valid_images_as_decode_failures() -> Result<()> {

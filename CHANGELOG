@@ -1,4 +1,4 @@
-- Added WebGPU based acceleration on linux
-- Accelerated CLIP by 10x
-- Redesigned all view, again
-- Reduced priority of OCR features
+- Fix dragging images out of the gallery
+- Fix selection
+- Add year to date indicator
+- Change app icon
