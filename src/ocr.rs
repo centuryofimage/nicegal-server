@@ -1,8 +1,6 @@
 //! PaddleOCR text detection and recognition.
 //!
-//! Model files are resolved by [`crate::hub`] and compiled by [`crate::runtime`]. What is left
-//! here is the pairing: the detector and the recognizer load, configure, and run together, and
-//! neither is useful without the other.
+//! Detector and recognizer models are loaded and run as a pair.
 
 use std::num::NonZeroUsize;
 use std::path::Path;
@@ -21,6 +19,14 @@ mod inference;
 use inference::{PaddleOcrConfig, PaddleOcrEngine, PaddleOcrScratch};
 pub use inference::{PaddleOcrOptions, PaddleOcrOutput};
 
+/// The source identity, ONNX graph, and preprocessing configuration for one OCR model.
+#[derive(Clone, Copy)]
+pub struct OcrModelFiles<'a> {
+    pub source: &'a ModelSource,
+    pub model_path: &'a Path,
+    pub config_path: &'a Path,
+}
+
 /// The PP-OCRv6 detector and recognizer compiled for one ONNX Runtime execution provider.
 pub struct PaddleOcrModels {
     detection_source: ModelSource,
@@ -32,55 +38,86 @@ pub struct PaddleOcrModels {
     execution_provider: ExecutionProvider,
 }
 
+// Keep the old positional API compatible while both implementations use file descriptors.
+macro_rules! legacy_loaders {
+    () => {
+        #[deprecated(note = "use load_files with OcrModelFiles")]
+        pub fn load(
+            detection_source: ModelSource,
+            detection_path: &Path,
+            detection_config_path: &Path,
+            recognition_source: ModelSource,
+            recognition_path: &Path,
+            recognition_config_path: &Path,
+        ) -> Result<Self> {
+            #[allow(deprecated)]
+            Self::load_with_options(
+                detection_source,
+                detection_path,
+                detection_config_path,
+                recognition_source,
+                recognition_path,
+                recognition_config_path,
+                RuntimeOptions::default(),
+            )
+        }
+
+        #[deprecated(note = "use load_files with OcrModelFiles")]
+        pub fn load_with_options(
+            detection_source: ModelSource,
+            detection_path: &Path,
+            detection_config_path: &Path,
+            recognition_source: ModelSource,
+            recognition_path: &Path,
+            recognition_config_path: &Path,
+            options: RuntimeOptions,
+        ) -> Result<Self> {
+            Self::load_files(
+                OcrModelFiles {
+                    source: &detection_source,
+                    model_path: detection_path,
+                    config_path: detection_config_path,
+                },
+                OcrModelFiles {
+                    source: &recognition_source,
+                    model_path: recognition_path,
+                    config_path: recognition_config_path,
+                },
+                options,
+            )
+        }
+    };
+}
+
 impl PaddleOcrModels {
-    pub fn load(
-        detection_source: ModelSource,
-        detection_path: &Path,
-        detection_config_path: &Path,
-        recognition_source: ModelSource,
-        recognition_path: &Path,
-        recognition_config_path: &Path,
-    ) -> Result<Self> {
-        Self::load_with_options(
-            detection_source,
-            detection_path,
-            detection_config_path,
-            recognition_source,
-            recognition_path,
-            recognition_config_path,
-            RuntimeOptions::default(),
-        )
-    }
+    legacy_loaders!();
 
     #[instrument(
         name = "paddle_ocr_load",
         skip_all,
         fields(
-            detection_model = %detection_source.model_id,
-            recognition_model = %recognition_source.model_id,
+            detection_model = %detection_files.source.model_id,
+            recognition_model = %recognition_files.source.model_id,
             requested_execution_provider = %options.execution_provider,
             execution_provider = field::Empty
         )
     )]
-    pub fn load_with_options(
-        detection_source: ModelSource,
-        detection_path: &Path,
-        detection_config_path: &Path,
-        recognition_source: ModelSource,
-        recognition_path: &Path,
-        recognition_config_path: &Path,
+    pub fn load_files(
+        detection_files: OcrModelFiles<'_>,
+        recognition_files: OcrModelFiles<'_>,
         options: RuntimeOptions,
     ) -> Result<Self> {
-        let config = PaddleOcrConfig::load(detection_config_path, recognition_config_path)
-            .context("loading PaddleOCR preprocessing and decoding configuration")?;
+        let config =
+            PaddleOcrConfig::load(detection_files.config_path, recognition_files.config_path)
+                .context("loading PaddleOCR preprocessing and decoding configuration")?;
 
         let LoadedSessions {
             sessions: [detection, recognition],
             execution_provider,
         } = load_sessions(
             [
-                SessionSpec::new("PaddleOCR detection", detection_path),
-                SessionSpec::new("PaddleOCR recognition", recognition_path),
+                SessionSpec::new("PaddleOCR detection", detection_files.model_path),
+                SessionSpec::new("PaddleOCR recognition", recognition_files.model_path),
             ],
             options,
         )
@@ -89,8 +126,8 @@ impl PaddleOcrModels {
         info!(execution_provider = %execution_provider, "PaddleOCR models compiled");
 
         Ok(Self {
-            detection_source,
-            recognition_source,
+            detection_source: detection_files.source.clone(),
+            recognition_source: recognition_files.source.clone(),
             detection,
             recognition,
             config,
@@ -114,9 +151,7 @@ impl PaddleOcrModels {
 
     /// Detect and recognize the text in one already-decoded RGB image.
     ///
-    /// The caller owns decode scheduling so it can keep a bounded queue in front of ONNX Runtime
-    /// without creating one session per worker. `ort` deliberately requires mutable sessions:
-    /// some execution-provider allocators and statistics are not safe for concurrent runs.
+    /// The caller owns decode scheduling. `ort` requires mutable session access.
     pub fn scan(
         &mut self,
         image: &image::RgbImage,
@@ -133,76 +168,28 @@ impl PaddleOcrModels {
     }
 }
 
-/// Replicas are opt-in, and this is why.
-///
-/// Measured over 490 images of a real photo corpus (CPU, 4 intra-op threads): four replicas ran
-/// 1.49x faster in wall time but burned 834s of CPU against a single replica's 311s, because
-/// per-image detection inference went from 362ms to 928ms. Four replicas times four intra-op
-/// threads is sixteen ORT threads, all spinning — ORT only stops spinning when a session is given
-/// a single thread — so most of the gain goes back into contending for cores.
-///
-/// Extra sessions are the wrong knob for that. ONNX Runtime already parallelizes one inference
-/// across its intra-op pool, and the default of four threads is precisely why a single replica
-/// used only 1.7 of 20 cores; raise [`RuntimeOptions::intra_threads`] to use a bigger machine.
-/// [`RuntimeOptions::replicas`] stays so the trade can be re-measured on other hardware.
+/// One replica avoids multiplying ONNX Runtime's intra-op thread pools by default. Callers can
+/// opt into concurrent sessions through [`RuntimeOptions::replicas`].
 const DEFAULT_REPLICAS: usize = 1;
 
-/// Several independent copies of the detector/recognizer pair, so more than one image can be in
-/// inference at a time.
-///
-/// `ort` deliberately requires `&mut Session`, so one pair can only ever hold one image. On CPU
-/// that pinned the whole OCR phase to a single consumer thread — measured at 1.7 of 20 cores on a
-/// 1,770-image run — and let one slow image stall every decoded image queued behind it. The two
-/// models are about 10 MB each, so a few copies cost far less memory than the throughput they buy.
-///
-/// Accelerated providers get exactly one replica: the device is already the parallel unit there,
-/// and extra sessions would only duplicate its memory and contend for it.
+/// Independent detector/recognizer pairs for concurrent inference. The count comes from
+/// [`RuntimeOptions::replicas`] and defaults to one.
 pub struct PaddleOcrPool {
     replicas: Vec<PaddleOcrModels>,
 }
 
 impl PaddleOcrPool {
-    pub fn load(
-        detection_source: ModelSource,
-        detection_path: &Path,
-        detection_config_path: &Path,
-        recognition_source: ModelSource,
-        recognition_path: &Path,
-        recognition_config_path: &Path,
-    ) -> Result<Self> {
-        Self::load_with_options(
-            detection_source,
-            detection_path,
-            detection_config_path,
-            recognition_source,
-            recognition_path,
-            recognition_config_path,
-            RuntimeOptions::default(),
-        )
-    }
+    legacy_loaders!();
 
-    /// Compile the pair, then compile any further replicas against the provider the first one
-    /// actually got. Reading the count from the configured provider rather than the requested one
-    /// keeps a DirectML request that quietly fell back to CPU from being left with a single
-    /// replica.
-    pub fn load_with_options(
-        detection_source: ModelSource,
-        detection_path: &Path,
-        detection_config_path: &Path,
-        recognition_source: ModelSource,
-        recognition_path: &Path,
-        recognition_config_path: &Path,
+    /// Compile the requested number of pairs, reusing their file descriptors.
+    /// Every replica after the first is pinned to the provider the first pair obtained,
+    /// so one pool never mixes providers.
+    pub fn load_files(
+        detection: OcrModelFiles<'_>,
+        recognition: OcrModelFiles<'_>,
         options: RuntimeOptions,
     ) -> Result<Self> {
-        let first = PaddleOcrModels::load_with_options(
-            detection_source.clone(),
-            detection_path,
-            detection_config_path,
-            recognition_source.clone(),
-            recognition_path,
-            recognition_config_path,
-            options,
-        )?;
+        let first = PaddleOcrModels::load_files(detection, recognition, options)?;
         let configured = first.execution_provider();
         let target = replica_target(options);
         let mut replicas = Vec::with_capacity(target.get());
@@ -215,13 +202,9 @@ impl PaddleOcrPool {
             ..options
         };
         while replicas.len() < target.get() {
-            replicas.push(PaddleOcrModels::load_with_options(
-                detection_source.clone(),
-                detection_path,
-                detection_config_path,
-                recognition_source.clone(),
-                recognition_path,
-                recognition_config_path,
+            replicas.push(PaddleOcrModels::load_files(
+                detection,
+                recognition,
                 replica_options,
             )?);
         }

@@ -1,60 +1,34 @@
 //! Estimated highlight spans for a search result.
 //!
-//! Vector search answers *which* chunk is relevant, never *why*: a nearest neighbour has a cosine
-//! distance and nothing else to point at. The FTS5 modes get their bracketed excerpt from SQLite,
-//! but the vector, glob, and regex modes hand back raw OCR text, so a UI that wants to show a
-//! reader what it thinks matched has nothing to underline.
-//!
-//! This module is that explanation pass, and it is deliberately a cheap lexical one rather than a
-//! second index: retrieval has already chosen the result, so all that is left is guessing which
-//! words in it the query was about. The guess is graded, strongest first:
-//!
-//! ```text
-//! exact token match   receipts    <-> receipts
-//! stem match          inspecting  <-> inspected
-//! prefix match        regul       <-> regulations
-//! fuzzy match         regulations <-> regulatlons   (one OCR error)
-//! ```
-//!
-//! Exact matching alone is too brittle for OCR output and prefix matching alone is too permissive,
-//! which is why the ladder exists — and why a caller gets the [`MatchKind`] back rather than a
-//! bare span, so a UI can style a guess differently from a certainty. A wrong highlight costs a
-//! reader a glance, so the tuning here leans towards showing something.
+//! Vector and literal searches return raw OCR text without match positions. This module estimates
+//! display-only exact, stem, prefix, and fuzzy spans. [`MatchKind`] distinguishes estimates from
+//! index-reported matches.
 
-/// A query term shorter than this never prefix-matches: two letters would light up half the page.
+/// Minimum query length for prefix matching.
 const MIN_PREFIX_LEN: usize = 3;
-/// A token shorter than this never fuzzy-matches, because one edit in a four-letter word is a
-/// different word far more often than it is an OCR error.
+/// Minimum token and query length for one-edit fuzzy matching.
 const MIN_FUZZY_LEN: usize = 5;
 
-/// Words that carry no information about what a picture says, dropped from the query so a search
-/// for "the receipt" does not underline every "the" on the page.
+/// Query words excluded from display highlighting.
 const STOPWORDS: &[&str] = &[
     "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from", "how", "in", "into",
     "is", "it", "its", "of", "on", "or", "that", "the", "this", "to", "was", "were", "what",
     "when", "which", "with",
 ];
 
-/// How a span was matched, in ascending confidence: [`MatchKind::Indexed`] is the strongest.
-///
-/// The ordering is the point of the type — [`Ord`] is what lets a merged span report the best
-/// evidence it contains.
+/// Match confidence, ordered weakest to strongest so merged spans retain the strongest evidence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MatchKind {
-    /// The tokens differ by a single character edit: the OCR-error case.
+    /// Tokens differ by one edit.
     Fuzzy,
-    /// A query term is a prefix of the token: the partially-typed-word case.
+    /// A query term prefixes the token.
     Prefix,
-    /// The tokens share a stem, as "searching" and "searches" do.
+    /// Tokens share a stem.
     Stem,
     /// The tokens are equal once case and punctuation are gone.
     Exact,
-    /// Not a guess at all: the full-text index reported this token as a match, and
-    /// [`from_marked`] recovered where it said so. Never produced by [`highlights`].
-    ///
-    /// It outranks [`MatchKind::Exact`] because it is evidence rather than inference, and it is
-    /// kept distinct from it because the two are not the same claim: a prefix query marks
-    /// `dresses` for `dre*`, which is a real match and not an equal token.
+    /// Reported by the full-text index and recovered by [`from_marked`].
+    /// Never produced by [`highlights`].
     Indexed,
 }
 
@@ -73,14 +47,13 @@ impl MatchKind {
 
 /// A span of the searched text worth highlighting.
 ///
-/// The bounds are **character** offsets, not byte offsets: the text they index into crosses the
-/// wire as JSON and gets sliced by a JavaScript client, which cannot act on a UTF-8 byte offset
-/// once OCR output contains an accent or a curly quote.
+/// Bounds are Unicode scalar-value offsets, not UTF-8 bytes or JavaScript UTF-16 code units.
+/// JavaScript clients can index the same units with `Array.from(text)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Highlight {
-    /// Inclusive start, in characters from the beginning of the text.
+    /// Inclusive start, in Unicode scalar values from the beginning of the text.
     pub start: usize,
-    /// Exclusive end, in characters.
+    /// Exclusive end, in Unicode scalar values.
     pub end: usize,
     /// The strongest evidence found inside the span.
     pub kind: MatchKind,
@@ -88,10 +61,8 @@ pub struct Highlight {
 
 /// Guesses which parts of `text` the words of `query` were about.
 ///
-/// Runs of neighbouring matched words collapse into one span, so a query of "construction
-/// regulations" over "... new construction regulations ..." underlines the phrase rather than two
-/// words with a gap. Spans come back in reading order and never overlap. A query made entirely of
-/// stopwords, or of nothing, highlights nothing.
+/// Adjacent matches merge; returned spans are ordered and non-overlapping. Empty and stopword-only
+/// queries return no spans.
 pub fn highlights(query: &str, text: &str) -> Vec<Highlight> {
     let mut terms: Vec<String> = tokens(query)
         .into_iter()
@@ -132,15 +103,8 @@ pub fn highlights(query: &str, text: &str) -> Vec<Highlight> {
 /// Turns a snippet that already carries match markers into the plain text and the spans those
 /// markers covered, so an FTS5 result and an estimated one reach a client in the same shape.
 ///
-/// FTS5's `snippet()` wraps the terms it matched in a pair of delimiters of the caller's choosing
-/// ([`crate::db::SNIPPET_OPEN`] and [`crate::db::SNIPPET_CLOSE`]); that is authoritative — the
-/// index is saying which tokens it matched — but it is also a string the client would have to
-/// parse. This does that parse once, here.
-///
 /// The delimiters are ordinary characters that OCR text can contain on its own, so the parse is
-/// deliberately conservative: an `open` with no `close` after it, a second `open` inside a marked
-/// run, and a `close` with nothing open are all left in the text as the literal characters they
-/// probably are, rather than being allowed to swallow the rest of the snippet.
+/// conservative: unmatched or nested delimiters remain literal text.
 pub fn from_marked(snippet: &str, open: char, close: char) -> (String, Vec<Highlight>) {
     let mut text = String::with_capacity(snippet.len());
     let mut spans = Vec::new();
@@ -207,9 +171,7 @@ struct Token {
     end: usize,
 }
 
-/// Splits on everything that is not a letter or a digit, which is the right split for OCR text:
-/// punctuation is where the recogniser invents characters most often, and a hyphen or a stray
-/// comma inside a phrase should not stop a word from matching.
+/// Split on non-alphanumeric Unicode scalar values.
 fn tokens(text: &str) -> Vec<Token> {
     let mut tokens = Vec::new();
     let mut word = String::new();
@@ -240,9 +202,7 @@ fn tokens(text: &str) -> Vec<Token> {
     tokens
 }
 
-/// A deliberately crude suffix stripper — enough to join "inspecting" to "inspected" and
-/// "regulation" to "regulations" without carrying a full Porter stemmer for a highlight hint.
-/// It only ever has to agree with itself, so it may return something that is not a word.
+/// Crude suffix stripping for display hints; the result need not be a word.
 fn stem(word: &str) -> String {
     let length = word.chars().count();
     let mut stemmed = word.to_owned();
@@ -276,8 +236,7 @@ fn stem(word: &str) -> String {
     stemmed
 }
 
-/// Whether one insertion, deletion, or substitution turns `left` into `right`. Cheaper than a full
-/// edit-distance matrix and all the OCR-error tolerance a highlight needs.
+/// Whether one insertion, deletion, or substitution turns `left` into `right`.
 fn within_one_edit(left: &str, right: &str) -> bool {
     let left: Vec<char> = left.chars().collect();
     let right: Vec<char> = right.chars().collect();

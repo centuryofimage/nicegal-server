@@ -10,7 +10,7 @@ use nicegal_core::db::OcrIndexState;
 use serde::{Deserialize, Serialize};
 
 use super::error::ApiError;
-use super::extract::ApiQuery;
+use super::extract::{ApiJson, ApiQuery};
 use super::{AppState, run_blocking};
 
 #[derive(Debug, Deserialize)]
@@ -146,7 +146,7 @@ async fn find_by_path(
 
 async fn find_by_ids(
     State(state): State<AppState>,
-    Json(request): Json<AssetBatchLookup>,
+    ApiJson(request): ApiJson<AssetBatchLookup>,
 ) -> Result<Json<AssetBatchResponse>, ApiError> {
     validate_batch_request(&request)?;
     let response = run_blocking(move || {

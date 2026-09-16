@@ -62,7 +62,7 @@ wait for download or compilation. OCR continues to use `GET /v1/ocr/models` and 
 `POST /v1/jobs` with `{"type":"modelPrepare","params":{}}` prepares the text, CLIP image,
 and paired CLIP text sessions without indexing a root. It is the Settings prepare/retry action.
 An `imageEmbed` job prepares the CLIP pair; `textEmbed` prepares the text session; an
-`ocrIndex` job with `embed:true` prepares all three. Already prepared sessions are reused.
+`libraryIndex` job with `embed:true` prepares all three. Already prepared sessions are reused.
 Failed jobs can be retried by starting the same request again. Preparation uses the usual
 single-active-job scheduling and reports failures through both the job error and model status.
 
@@ -105,9 +105,13 @@ ask the desktop launcher for an immediate, transparent restart into it, rather t
 rest of the session on CPU. The desktop launcher (`main/backend/nicegal-server-process.ts`) recognizes
 this exit code and respawns without reporting a crash.
 
-All three files use WAL mode. Their separation and the stable columns explicitly documented below
+All four stores use WAL mode. Their separation and the stable columns explicitly documented below
 are part of the desktop read contract. Any table or column shape change requires a `user_version`
 bump; readers should reject versions they do not support.
+
+Writable startup connections apply supported migrations in one transaction. Asset catalog
+versions 2–4 upgrade to 5; OCR version 8 upgrades to 9. Read-only connections require the
+current version and never migrate. Unsupported versions are rejected without changes.
 
 ## Asset catalog schema (version 5)
 
@@ -178,7 +182,7 @@ SELECT asset_id, path, source_modified_ns, source_created_ns, exif_taken_ns, sou
 transaction as every changed catalog row and does not change for an unchanged fingerprint, so a
 `GET /v1/catalog/revision` can cheaply poll it before refreshing the listing.
 
-## OCR schema (version 8)
+## OCR schema (version 9)
 
 OCR is a derived store. It receives `asset_id` from the catalog and never allocates gallery IDs.
 `source_path` is denormalized only for directory filtering and cleanup.
@@ -347,7 +351,7 @@ This chooses the smallest adequate current bucket, then the largest current smal
 Changing display size only changes `:requested_size`; it does not invalidate stored variants.
 Every thumbnail column shown above is a stable direct-read surface.
 
-Generator version 1 creates variants lazily by default. An OCR index job catalogs and OCRs media
+Generator version 1 creates variants lazily by default. A library index job catalogs and OCRs media
 without generating thumbnails; the gallery calls the synchronous ensure endpoint for its visible
 image IDs. Full-library generation remains available through the thumbnail backfill job. Still images are
 decoded once per asset for all missing buckets; opaque results are JPEG quality 85 and alpha-bearing
@@ -467,7 +471,7 @@ Version 1 routes:
   `batchSize` is 1 to 512 and is additionally clamped to what the backend accepts, so omitting it
   is normally right. The same job can be created through `POST /v1/jobs` with type `textEmbed`
 - `POST /v1/jobs` starts a typed background job and returns `202 Accepted`. Types are
-  `modelPrepare`, `ocrModelLoad`, `ocrIndex`, `catalogSync`, `thumbnailGenerate`, `textEmbed`, `imageEmbed`,
+  `modelPrepare`, `ocrModelLoad`, `libraryIndex`, `catalogSync`, `thumbnailGenerate`, `textEmbed`, `imageEmbed`,
   `pruneMissing`, and `libraryPurge`
 - `GET /v1/jobs` lists the active and retained recent jobs
 - `GET /v1/jobs/<job-id>` returns one job's current state and progress
@@ -484,7 +488,9 @@ Version 1 routes:
   the selected root's assets. The same job can be created through `POST /v1/jobs` with type
   `thumbnailGenerate`
 - `POST /v1/thumbnails` synchronously ensures variants for a visible image set. Its body is
-  `{assetIds:[...], requiredSize:<physical-pixels>}`. `requiredSize` is 1 through 1024; it selects
+  `{assetIds:[...], requiredSize:<physical-pixels>}` with at most 512 IDs before deduplication.
+  Abandoned requests stop between generation chunks; shared work already underway may finish.
+  `requiredSize` is 1 through 1024; it selects
   the smallest adequate fixed bucket. The response is `200` only after every requested current
   variant has been committed to `thumbnails.db`, and returns `{assetIds, requiredSize, sizeBucket,
   generatorVersion}`. Clients then read the bytes directly from SQLite.
@@ -748,7 +754,7 @@ user-input problem is never reported as a `500`.
 | `job_not_found` | 404 | The job never existed or is no longer retained |
 | `method_not_allowed` | 405 | The route exists but not for this method |
 | `job_busy` | 409 | Another resource-intensive job is already active |
-| `ocr_models_not_loaded` | 409 | `ocrIndex` was requested before a detector and recognizer were loaded |
+| `ocr_models_not_loaded` | 409 | `libraryIndex` was requested before a detector and recognizer were loaded |
 | `payload_too_large` | 413 | The body exceeded 48 MiB for search, or 8 MiB for other routes |
 | `unsupported_media_type` | 415 | A JSON route received a body that was not JSON |
 | `shutting_down` | 503 | The server is shutting down and will not start another job |
@@ -871,6 +877,9 @@ CLIP-vector, and thumbnail records. Unavailable roots, traversal errors,
 cancelled scans, and any `debugLimit` preserve existing entries. Recursive and exclusion scope also
 apply to reconciliation; an excluded folder's descendants are retained. Filesystem checks finish
 before deletion starts, with root and file availability checked again before each bounded batch.
+Reconciliation inserts the completed scan's stable asset IDs into a connection-local temporary
+`WITHOUT ROWID` table, so SQLite selects only unseen rows for those filesystem checks without
+rewriting persistent catalog rows. The table is cleared and reused on that catalog connection.
 Derived stores are deleted first, so an interrupted cross-database deletion retains the catalog
 entry for the next update to finish. Its worker phase order is
 `scanning` → `cataloging` → optional `pruning` → `finished`; it shares ordinary cooperative cancellation and the single
@@ -881,7 +890,7 @@ After the pair is loaded, scan and OCR a gallery root with:
 
 ```json
 {
-  "type": "ocrIndex",
+  "type": "libraryIndex",
   "params": {
     "root": "C:/absolute/gallery",
     "embed": true,
@@ -1044,14 +1053,14 @@ show these updates.
 | `catalogSync` | `scanning` | `discovered`; when walking ends, `total` and `phaseCompleted` become the final discovered count | `null` while walking; final count of catalogable media when discovery completes | Show “discovered N” while indeterminate; the final scan snapshot is complete. |
 | `catalogSync` | `cataloging` | `phaseCompleted`; `cataloged` for successful upserts and `failed` for failed metadata/upserts | Count of media discovered by scanning | `phaseCompleted / total`. |
 | `catalogSync` | `finished` | None | Last value is retained until the terminal snapshot | Terminal state, no progress bar. |
-| `ocrIndex` | `scanning` | `discovered`; when walking ends, `total` and `phaseCompleted` become the final discovered count | `null` while walking; final count of catalogable media when discovery completes | Show “discovered N” while indeterminate; the final scan snapshot is complete. |
-| `ocrIndex` | `cataloging` | `phaseCompleted`; `cataloged` for successful upserts and `failed` for failed metadata/upserts | Count of media discovered by scanning | `phaseCompleted / total`. |
-| `ocrIndex` | `ocr` | `phaseCompleted`, `processed`, `skipped`, `failed`; `indexed` advances when committed OCR chunks save | Count of successfully cataloged media, including non-OCR images that are skipped | `phaseCompleted / total`; display cumulative `indexed` separately if useful. |
-| `ocrIndex` | `cleanup` | `phaseCompleted`, `deleted` | `1` (the one cleanup sweep, even if cleanup was disabled and deletes zero rows) | A one-step completion indicator, or simply “finalizing”. |
-| `catalogSync` or `ocrIndex` | `pruning` | `phaseCompleted`, `deleted` | Confirmed-missing entries in the completed scan scope | `phaseCompleted / total`; `deleted` supplies the compact removal summary. Phase is omitted when nothing is missing. |
-| `ocrIndex` with `embed: true` | `imageEmbedding` | `phaseCompleted`, `processed`, `embedded`, `failed` | Pending current CLIP image vectors under the root | `phaseCompleted / total`; `embedded` remains cumulative for the job. |
-| `ocrIndex` with `embed: true` | `textEmbedding` | `phaseCompleted`, `processed`, `embedded`, `skipped`, `failed` | Pending current `ocrText` vectors under the root | `phaseCompleted / total`; `embedded` remains cumulative for the job. |
-| `ocrIndex` | `finished` | None | Last value is retained until the terminal snapshot | Terminal state, no progress bar. |
+| `libraryIndex` | `scanning` | `discovered`; when walking ends, `total` and `phaseCompleted` become the final discovered count | `null` while walking; final count of catalogable media when discovery completes | Show “discovered N” while indeterminate; the final scan snapshot is complete. |
+| `libraryIndex` | `cataloging` | `phaseCompleted`; `cataloged` for successful upserts and `failed` for failed metadata/upserts | Count of media discovered by scanning | `phaseCompleted / total`. |
+| `libraryIndex` | `ocr` | `phaseCompleted`, `processed`, `skipped`, `failed`; `indexed` advances when committed OCR chunks save | Count of successfully cataloged media, including non-OCR images that are skipped | `phaseCompleted / total`; display cumulative `indexed` separately if useful. |
+| `libraryIndex` | `cleanup` | `phaseCompleted`, `deleted` | `1` (the one cleanup sweep, even if cleanup was disabled and deletes zero rows) | A one-step completion indicator, or simply “finalizing”. |
+| `catalogSync` or `libraryIndex` | `pruning` | `phaseCompleted`, `pruneCandidates`, `deleted` | Confirmed-missing entries in the completed scan scope | `phaseCompleted / total`; `pruneCandidates` reports the confirmed count and `deleted` reports rows actually removed after the per-batch recheck. Phase is omitted when nothing is missing. |
+| `libraryIndex` with `embed: true` | `imageEmbedding` | `phaseCompleted`, `processed`, `embedded`, `failed` | Pending current CLIP image vectors under the root | `phaseCompleted / total`; `embedded` remains cumulative for the job. |
+| `libraryIndex` with `embed: true` | `textEmbedding` | `phaseCompleted`, `processed`, `embedded`, `skipped`, `failed` | Pending current `ocrText` vectors under the root | `phaseCompleted / total`; `embedded` remains cumulative for the job. |
+| `libraryIndex` | `finished` | None | Last value is retained until the terminal snapshot | Terminal state, no progress bar. |
 | `textEmbed` | `textEmbedding` | `phaseCompleted`, `processed`, `embedded`, `skipped`, `failed` | Pending current `ocrText` vectors under the requested root after an optional force clear | `phaseCompleted / total`; a zero backlog is immediately complete. |
 | `textEmbed` | `finished` | None | Last value is retained until the terminal snapshot | Terminal state, no progress bar. |
 | `imageEmbed` | `imageEmbedding` | `phaseCompleted`, `processed`, `embedded`, `failed` | Pending current CLIP image vectors under the requested root | `phaseCompleted / total`; a zero backlog is immediately complete. |
@@ -1063,7 +1072,7 @@ show these updates.
 | `libraryPurge` | `pruning` | `phaseCompleted`, `processed`, `deleted`, `failed` | Catalog assets under the requested root | `phaseCompleted / total`; `deleted` and `failed` are cumulative per-asset outcomes. |
 | `libraryPurge` | `finished` | None | Last value is retained until the terminal snapshot | Terminal state, no progress bar. |
 
-An `ocrIndex` does not enter `textEmbedding` when `embed` is false, and cancellation after OCR but
+A `libraryIndex` does not enter `textEmbedding` when `embed` is false, and cancellation after OCR but
 before or during text embedding leaves the job cancelled without starting more text embedding batches.
 
 Cancellation is cooperative between model files, scan entries, catalog entries, image decodes,
@@ -1130,8 +1139,11 @@ catalog row in place, and cancellation may leave already completed assets remove
 same root is safe and resumes from the rows that remain. Unregistering a library without deleting
 data is renderer-local and does not create a backend job.
 
-Removing orphaned derived rows whose catalog IDs no longer exist and explicit SQLite
-checkpoint/optimization work are outside `libraryPurge`.
+After every resource-intensive job, the server removes derived rows whose catalog IDs no longer
+exist, runs bounded incremental vacuum and `PRAGMA optimize` on all four stores, and requests a
+passive WAL checkpoint. This common epilogue is best-effort: a maintenance failure is logged but
+does not replace the job's own result. `libraryPurge` itself still deletes derived rows before the
+catalog row, so interruption leaves a retryable catalog record rather than creating a new orphan.
 
 ## Verification
 
@@ -1164,8 +1176,13 @@ models require local export files under `NICEGAL_LOCAL_MODELS_DIR`.
 and returns runtime status. `executionProvider` and `imageModel` are optional,
 but at least one must be supplied. Unknown or unavailable models are rejected, as are
 changes while an indexing job is active. The caller restarts the backend to
-activate the selection. Settings persist to `image-model.json` beside the runtime
-configuration. `--image-model` / `NICEGAL_IMAGE_MODEL` overrides only the active
+activate the selection. Provider and image-model selections persist together in the runtime
+configuration, so a combined update either saves both selections or neither. Existing
+`image-model.json` files are read when the runtime record has no `imageModel`; the next
+successful settings update incorporates that selection into the runtime record. The
+legacy file is retained but no longer consulted once `imageModel` is present. Older
+server versions that reject unknown runtime settings fields cannot read the migrated
+record. `--image-model` / `NICEGAL_IMAGE_MODEL` overrides only the active
 model for that launch, useful for sequential evaluation scripts.
 
 All image models now use byte-intermediate convolution for downscaling, retaining
@@ -1174,7 +1191,7 @@ Existing vectors remain valid and are not automatically rebuilt.
 
 ### Selective indexing
 
-`ocrIndex.params` accepts `ocr` and `image` booleans, both enabled by default.
+`libraryIndex.params` accepts `ocr` and `image` booleans, both enabled by default.
 `ocr:false,image:true` catalogs files and runs only image embeddings, without loading PaddleOCR
 or BGE. `ocr:true,image:false` runs OCR and its text embeddings, without loading the image model
 or its text tower. Both false is rejected. Selection survives desktop restart and provider fallback.

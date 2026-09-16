@@ -1,7 +1,6 @@
 //! Resolving model files from Hugging Face.
 //!
-//! Every model family names its files as [`ModelSource`]s and resolves them through the one
-//! standard cache, so a file downloaded for one family is never fetched again for another.
+//! Every model family resolves [`ModelSource`] files through the standard shared cache.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -69,10 +68,7 @@ pub fn cache_dir() -> PathBuf {
     cache().path().clone()
 }
 
-/// An API client for downloading on a cache miss.
-///
-/// hf-hub's own progress bar is off: callers report progress through the [`Progress`] they pass to
-/// [`ModelSource::get_with_progress`], so downloads surface wherever that caller reports work.
+/// An API client for downloading on a cache miss. Callers report progress through [`Progress`].
 pub fn api() -> Result<Api> {
     ApiBuilder::from_env()
         .with_progress(false)
@@ -81,9 +77,6 @@ pub fn api() -> Result<Api> {
 }
 
 /// One versioned file in a Hugging Face model repository.
-///
-/// Repository IDs are supplied by the caller rather than compiled into the application. This lets
-/// the UI select a model release and makes a future model upgrade independent of a binary release.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelSource {
     pub model_id: String,
@@ -126,19 +119,15 @@ impl ModelSource {
     where
         P: Progress + Clone + Send + Sync + 'static,
     {
-        let repo = self.repo();
-        if let Some(path) = cache.repo(repo.clone()).get(&self.filename) {
-            debug!(model_id = %self.model_id, filename = %self.filename, path = %path.display(), "Hugging Face cache hit");
-            return Ok(path);
-        }
         if let Some(path) = self.cached_in(cache) {
+            debug!(model_id = %self.model_id, filename = %self.filename, path = %path.display(), "Hugging Face cache hit");
             return Ok(path);
         }
 
         let started = self.log_download_start();
         progress.init(0, &self.filename).await;
         let result = api
-            .repo(repo)
+            .repo(self.repo())
             .download_with_progress(&self.filename, progress.clone())
             .await
             .with_context(|| {

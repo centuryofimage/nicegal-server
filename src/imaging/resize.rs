@@ -7,6 +7,16 @@ use super::Raster;
 
 const MAX_FLOAT_SOURCE_BYTES: usize = 64 * 1024 * 1024;
 
+fn resize_algorithm(filter: image::imageops::FilterType) -> Option<ResizeAlg> {
+    Some(match filter {
+        image::imageops::FilterType::Nearest => ResizeAlg::Nearest,
+        image::imageops::FilterType::Triangle => ResizeAlg::Convolution(FilterType::Bilinear),
+        image::imageops::FilterType::CatmullRom => ResizeAlg::Convolution(FilterType::CatmullRom),
+        image::imageops::FilterType::Lanczos3 => ResizeAlg::Convolution(FilterType::Lanczos3),
+        image::imageops::FilterType::Gaussian => return None,
+    })
+}
+
 /// Byte convolution for shrinking model inputs; enlargement keeps float intermediates.
 pub fn resize_rgb(
     source: image::RgbImage,
@@ -18,14 +28,8 @@ pub fn resize_rgb(
     {
         return resize_rgb_float(source, width, height, filter);
     }
-    let algorithm = match filter {
-        image::imageops::FilterType::Nearest => ResizeAlg::Nearest,
-        image::imageops::FilterType::Triangle => ResizeAlg::Convolution(FilterType::Bilinear),
-        image::imageops::FilterType::CatmullRom => ResizeAlg::Convolution(FilterType::CatmullRom),
-        image::imageops::FilterType::Lanczos3 => ResizeAlg::Convolution(FilterType::Lanczos3),
-        image::imageops::FilterType::Gaussian => {
-            return resize_rgb_float(source, width, height, filter);
-        }
+    let Some(algorithm) = resize_algorithm(filter) else {
+        return resize_rgb_float(source, width, height, filter);
     };
     let input = ImageRef::new(
         source.width(),
@@ -75,14 +79,8 @@ fn resize_rgb_with_budget(
     {
         return Ok(image::imageops::resize(&source, width, height, filter));
     }
-    let algorithm = match filter {
-        image::imageops::FilterType::Nearest => ResizeAlg::Nearest,
-        image::imageops::FilterType::Triangle => ResizeAlg::Convolution(FilterType::Bilinear),
-        image::imageops::FilterType::CatmullRom => ResizeAlg::Convolution(FilterType::CatmullRom),
-        image::imageops::FilterType::Lanczos3 => ResizeAlg::Convolution(FilterType::Lanczos3),
-        image::imageops::FilterType::Gaussian => {
-            return Ok(image::imageops::resize(&source, width, height, filter));
-        }
+    let Some(algorithm) = resize_algorithm(filter) else {
+        return Ok(image::imageops::resize(&source, width, height, filter));
     };
     let dimensions = source.dimensions();
     let pixels: Vec<_> = source

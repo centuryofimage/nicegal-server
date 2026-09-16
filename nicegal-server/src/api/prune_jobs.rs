@@ -1,3 +1,4 @@
+use super::jobs::cancel_if;
 use std::fs;
 
 use anyhow::Context;
@@ -56,31 +57,32 @@ pub(super) fn reconcile(
     databases: &super::Databases,
     image_dimensions: usize,
     thumbnails: &ThumbnailService,
+    scanned: &[nicegal_core::assets::Asset],
     observer: &dyn IndexObserver,
-) -> anyhow::Result<bool> {
-    if observer.is_cancelled() {
-        return Ok(true);
-    }
+) -> anyhow::Result<()> {
+    cancel_if(observer.is_cancelled())?;
     if scope.limited {
-        return Ok(false);
+        return Ok(());
     }
     scope.root = nicegal_core::assets::canonicalize_path(&scope.root)?;
     ensure_root_available(&scope.root)?;
-    let assets = AssetCatalog::new(&databases.assets)?;
-    let candidates = assets.under_root(&scope.root)?;
+    let mut assets = AssetCatalog::new(&databases.assets)?;
+    let seen = scanned
+        .iter()
+        .map(|asset| asset.asset_id)
+        .collect::<Vec<_>>();
+    let candidates = assets.unseen_under_root(&scope.root, seen)?;
     let mut missing = Vec::new();
     // Complete all filesystem checks before deleting any row. An inaccessible subtree must not
     // turn a partial check into a partial automatic purge.
     for asset in &candidates {
-        if observer.is_cancelled() {
-            return Ok(true);
-        }
+        cancel_if(observer.is_cancelled())?;
         if scope.includes(&asset.path) && confirmed_missing(&asset.path, &scope.root)? {
             missing.push(asset);
         }
     }
     if missing.is_empty() {
-        return Ok(observer.is_cancelled());
+        return cancel_if(observer.is_cancelled());
     }
     let mut ocr = DB::new(&databases.ocr)?;
     let mut images = ImageIndexDb::new(&databases.images, image_dimensions)?;
@@ -88,10 +90,12 @@ pub(super) fn reconcile(
     observer.on_event(IndexEvent::DiscoveryComplete {
         total: missing.len(),
     });
+    observer.on_event(IndexEvent::Progress(IndexProgressDelta {
+        prune_candidates: missing.len(),
+        ..IndexProgressDelta::default()
+    }));
     for chunk in missing.chunks(PRUNE_BATCH_SIZE) {
-        if observer.is_cancelled() {
-            return Ok(true);
-        }
+        cancel_if(observer.is_cancelled())?;
         ensure_root_available(&scope.root)?;
         // Files can reappear after discovery (for example during a move). Recheck each batch.
         let missing_now = chunk
@@ -103,9 +107,7 @@ pub(super) fn reconcile(
                 Err(error) => Some(Err(error)),
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        if observer.is_cancelled() {
-            return Ok(true);
-        }
+        cancel_if(observer.is_cancelled())?;
         let deleted = delete_asset_batch(&missing_now, &assets, &mut ocr, &mut images, thumbnails)?;
         observer.on_event(IndexEvent::Progress(IndexProgressDelta {
             phase_completed: chunk.len(),
@@ -113,7 +115,7 @@ pub(super) fn reconcile(
             ..IndexProgressDelta::default()
         }));
     }
-    Ok(observer.is_cancelled())
+    cancel_if(observer.is_cancelled())
 }
 
 fn confirmed_missing(path: &camino::Utf8Path, root: &camino::Utf8Path) -> anyhow::Result<bool> {
@@ -192,7 +194,7 @@ pub(super) fn run(
     image_dimensions: usize,
     thumbnails: &ThumbnailService,
     observer: &dyn IndexObserver,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<()> {
     ensure_root_available(&spec.root)?;
     let assets = AssetCatalog::new(asset_database)?;
     let candidates = assets.under_root(&spec.root)?;
@@ -238,7 +240,7 @@ pub(super) fn run(
         }
         if missing.is_empty() {
             if cancelled {
-                return Ok(true);
+                return cancel_if(true);
             }
             continue;
         }
@@ -253,7 +255,7 @@ pub(super) fn run(
                 ..IndexProgressDelta::default()
             }));
             if cancelled {
-                return Ok(true);
+                return cancel_if(true);
             }
             continue;
         }
@@ -268,10 +270,10 @@ pub(super) fn run(
             Err(error) => report_batch_failure(&missing, error, observer),
         }
         if cancelled {
-            return Ok(true);
+            return cancel_if(true);
         }
     }
-    Ok(false)
+    Ok(())
 }
 
 pub(super) fn run_library_purge(
@@ -282,7 +284,7 @@ pub(super) fn run_library_purge(
     image_dimensions: usize,
     thumbnails: &ThumbnailService,
     observer: &dyn IndexObserver,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<()> {
     ensure_library_purge_root_available(&spec.root)?;
     let assets = AssetCatalog::new(asset_database)?;
     // `under_root` uses a separator-delimited prefix, so a purge of `C:/photos` cannot select
@@ -309,7 +311,7 @@ pub(super) fn run_library_purge(
             assets_to_delete.push(asset);
         }
         if assets_to_delete.is_empty() {
-            return Ok(cancelled);
+            return cancel_if(cancelled);
         }
         match delete_asset_batch(
             &assets_to_delete,
@@ -327,10 +329,10 @@ pub(super) fn run_library_purge(
             Err(error) => report_batch_failure(&assets_to_delete, error, observer),
         }
         if cancelled {
-            return Ok(true);
+            return cancel_if(true);
         }
     }
-    Ok(false)
+    Ok(())
 }
 
 fn delete_asset_batch(
@@ -407,6 +409,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+    use crate::api::jobs::is_cancelled;
     use tempfile::TempDir;
 
     struct LibraryFixture {
@@ -457,8 +460,17 @@ mod tests {
                 &self.databases,
                 512,
                 &self.thumbnails,
+                &[],
                 observer,
             )
+            .map(|()| false)
+            .or_else(|error| {
+                if is_cancelled(&error) {
+                    Ok(true)
+                } else {
+                    Err(error)
+                }
+            })
         }
     }
 
@@ -490,23 +502,26 @@ mod tests {
             }],
         )?;
         let thumbs = ThumbnailDb::new(&library.databases.thumbnails)?;
-        thumbs.put(
-            removed.asset_id,
-            128,
-            1,
-            removed.fingerprint,
-            1,
-            1,
-            ThumbnailEncoding::Png,
-            &nicegal_core::imaging::encode_png(1, 1, &[0, 0, 0, 0])?,
-        )?;
+        thumbs.put(nicegal_core::thumbs::DecodedThumbnail {
+            asset_id: removed.asset_id,
+            size_bucket: 128,
+            generator_version: 1,
+            fingerprint: removed.fingerprint,
+            width: 1,
+            height: 1,
+            encoding: ThumbnailEncoding::Png,
+            data: nicegal_core::imaging::encode_png(1, 1, &[0, 0, 0, 0])?,
+        })?;
+
         assert!(
             thumbs
                 .get(removed.asset_id, 128, 1, removed.fingerprint)?
                 .is_some()
         );
         fs::remove_file(&removed.path)?;
-        assert!(!library.reconcile(IndexOptions::default(), &NeverCancelled)?);
+        let observer = CandidateCounter(AtomicUsize::new(0));
+        assert!(!library.reconcile(IndexOptions::default(), &observer)?);
+        assert_eq!(observer.0.load(Ordering::Relaxed), 1);
         assert!(library.catalog.get(removed.asset_id)?.is_none());
         assert!(library.catalog.get(retained.asset_id)?.is_some());
         assert!(!ocr.is_indexed(removed.asset_id, removed.fingerprint)?);
@@ -622,6 +637,16 @@ mod tests {
         fn on_event(&self, _event: IndexEvent) {}
     }
 
+    struct CandidateCounter(AtomicUsize);
+
+    impl IndexObserver for CandidateCounter {
+        fn on_event(&self, event: IndexEvent) {
+            if let IndexEvent::Progress(delta) = event {
+                self.0.fetch_add(delta.prune_candidates, Ordering::Relaxed);
+            }
+        }
+    }
+
     struct CancelBeforeSecondAsset(AtomicUsize);
 
     impl IndexObserver for CancelBeforeSecondAsset {
@@ -695,7 +720,7 @@ mod tests {
         let included = catalog.upsert(&inside, &fs::metadata(&inside)?)?;
         let excluded = catalog.upsert(&outside, &fs::metadata(&outside)?)?;
 
-        assert!(!run_library_purge(
+        run_library_purge(
             prepare_library_purge(LibraryPurgeRequest { root })
                 .expect("temporary root should prepare for library purge"),
             &asset_database,
@@ -704,7 +729,7 @@ mod tests {
             512,
             &thumbnails,
             &NeverCancelled,
-        )?);
+        )?;
 
         let catalog = AssetCatalog::new(&asset_database)?;
         assert!(catalog.get(included.asset_id)?.is_none());
@@ -731,7 +756,7 @@ mod tests {
         let first = catalog.upsert(&first_path, &fs::metadata(&first_path)?)?;
         let second = catalog.upsert(&second_path, &fs::metadata(&second_path)?)?;
 
-        assert!(run_library_purge(
+        let error = run_library_purge(
             prepare_library_purge(LibraryPurgeRequest { root })
                 .expect("temporary root should prepare for library purge"),
             &asset_database,
@@ -740,7 +765,9 @@ mod tests {
             512,
             &thumbnails,
             &CancelBeforeSecondAsset(AtomicUsize::new(0)),
-        )?);
+        )
+        .unwrap_err();
+        assert!(is_cancelled(&error));
 
         let catalog = AssetCatalog::new(&asset_database)?;
         assert!(catalog.get(first.asset_id)?.is_none());

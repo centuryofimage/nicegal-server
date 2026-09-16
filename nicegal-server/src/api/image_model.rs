@@ -1,37 +1,28 @@
-use anyhow::{Context, Result, bail};
-use camino::Utf8PathBuf as PathBuf;
 use nicegal_core::embedding::ImageEmbeddingModel;
-use serde::{Deserialize, Serialize};
-use std::{fs, io::Write, sync::Mutex};
+use serde::Serialize;
+use std::sync::Arc;
+
+use super::RuntimeSettings;
 
 pub(crate) struct ImageModelSettings {
-    path: PathBuf,
     active: ImageEmbeddingModel,
-    selected: Mutex<ImageEmbeddingModel>,
+    runtime: Arc<RuntimeSettings>,
 }
 impl ImageModelSettings {
-    pub(crate) fn load(path: PathBuf, override_model: Option<ImageEmbeddingModel>) -> Result<Self> {
-        let selected = match fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice::<Selection>(&bytes)?.model.parse()?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                ImageEmbeddingModel::default()
-            }
-            Err(error) => return Err(error).context("reading image model settings"),
-        };
-        Ok(Self {
-            path,
-            active: override_model.unwrap_or(selected),
-            selected: Mutex::new(selected),
-        })
+    pub(crate) fn new(
+        runtime: Arc<RuntimeSettings>,
+        override_model: Option<ImageEmbeddingModel>,
+    ) -> Self {
+        Self {
+            active: override_model.unwrap_or_else(|| runtime.image_model()),
+            runtime,
+        }
     }
     pub(crate) fn active(&self) -> ImageEmbeddingModel {
         self.active
     }
     pub(super) fn status(&self) -> ModelStatus {
-        let selected = *self
-            .selected
-            .lock()
-            .expect("image model settings lock poisoned");
+        let selected = self.runtime.image_model();
         ModelStatus {
             active_model: self.active.id(),
             selected_model: selected.id(),
@@ -51,36 +42,6 @@ impl ImageModelSettings {
                 .collect(),
         }
     }
-    pub(super) fn set(&self, model: ImageEmbeddingModel) -> Result<ModelStatus> {
-        if !ImageEmbeddingModel::SELECTABLE.contains(&model) {
-            bail!("{} is retired from the model selector", model);
-        }
-        // Serialize updates, including the atomic replacement, under one lock.
-        let mut selected = self
-            .selected
-            .lock()
-            .expect("image model settings lock poisoned");
-        let parent = self
-            .path
-            .parent()
-            .context("image model settings path has no parent")?;
-        fs::create_dir_all(parent)?;
-        let temporary = self.path.with_extension("json.tmp");
-        let mut file = fs::File::create(&temporary)?;
-        file.write_all(&serde_json::to_vec_pretty(&Selection {
-            model: model.id().to_owned(),
-        })?)?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(temporary, &self.path)?;
-        *selected = model;
-        drop(selected);
-        Ok(self.status())
-    }
-}
-#[derive(Deserialize, Serialize)]
-struct Selection {
-    model: String,
 }
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -105,24 +66,34 @@ struct ModelInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Result;
+    use camino::Utf8PathBuf as PathBuf;
     #[test]
     fn selection_persists_without_replacing_active_model() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let path = PathBuf::try_from(temp.path().join("image-model.json"))?;
-        let settings = ImageModelSettings::load(path.clone(), None)?;
-        let status = settings.set(ImageEmbeddingModel::SigLip2Base256)?;
+        let path = PathBuf::try_from(temp.path().join("runtime.json"))?;
+        let runtime = Arc::new(RuntimeSettings::load(path.clone(), None)?);
+        let settings = ImageModelSettings::new(Arc::clone(&runtime), None);
+        runtime.update(None, Some(ImageEmbeddingModel::SigLip2Base256))?;
+        let status = settings.status();
         assert_eq!(status.active_model, ImageEmbeddingModel::MetaClip2B32.id());
         assert!(status.restart_required);
-        let restarted = ImageModelSettings::load(path.clone(), None)?;
+        let restarted =
+            ImageModelSettings::new(Arc::new(RuntimeSettings::load(path.clone(), None)?), None);
         assert_eq!(restarted.active(), ImageEmbeddingModel::SigLip2Base256);
         assert!(!restarted.status().restart_required);
-        let overridden = ImageModelSettings::load(path, Some(ImageEmbeddingModel::MetaClip2B16))?;
+        let overridden =
+            ImageModelSettings::new(runtime.clone(), Some(ImageEmbeddingModel::MetaClip2B16));
         assert_eq!(overridden.active(), ImageEmbeddingModel::MetaClip2B16);
         assert_eq!(
             overridden.status().selected_model,
             ImageEmbeddingModel::SigLip2Base256.id()
         );
-        assert!(overridden.set(ImageEmbeddingModel::LaionClipB32).is_err());
+        assert!(
+            runtime
+                .update(None, Some(ImageEmbeddingModel::LaionClipB32))
+                .is_err()
+        );
         assert!(
             !overridden
                 .status()

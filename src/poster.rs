@@ -122,14 +122,7 @@ const WHITE: [u8; 3] = [255, 255, 255];
 /// Decode the GIF canvas's first composited frame and encode that static poster.
 /// The animated source is never resized, re-encoded, or returned as thumbnail bytes.
 pub fn gif_first_frame(path: &Path, maximum_edge: u32) -> Result<StaticPoster> {
-    if maximum_edge == 0 {
-        bail!("poster maximum edge must be greater than zero");
-    }
-    let span = debug_span!("gif_poster", path = %path, maximum_edge);
-    let _entered = span.enter();
-    let source = still_image_source(path)?;
-    let poster = resize_for_poster(path, &source, maximum_edge, maximum_edge)?;
-    encode_poster(path, poster)
+    still_image(path, maximum_edge)
 }
 
 #[cfg(test)]

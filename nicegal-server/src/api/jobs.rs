@@ -33,6 +33,41 @@ use super::{
 
 const MAX_RETAINED_JOBS: usize = 32;
 
+#[derive(Debug)]
+pub(crate) struct JobCancelled;
+
+impl std::fmt::Display for JobCancelled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("job cancelled")
+    }
+}
+
+impl std::error::Error for JobCancelled {}
+
+pub(crate) fn cancel_if(cancelled: bool) -> anyhow::Result<()> {
+    if cancelled {
+        Err(JobCancelled.into())
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn is_cancelled(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<JobCancelled>().is_some()
+}
+
+fn reconcile_after_discovery(
+    cancelled: bool,
+    scan_complete: bool,
+    reconcile: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    cancel_if(cancelled)?;
+    if !scan_complete {
+        return Ok(());
+    }
+    reconcile()
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(
     tag = "type",
@@ -43,7 +78,7 @@ const MAX_RETAINED_JOBS: usize = 32;
 enum JobRequest {
     ModelPrepare(EmptyParams),
     OcrModelLoad(ocr_models::job::Request),
-    OcrIndex(indexing::Request),
+    LibraryIndex(indexing::Request),
     CatalogSync(indexing::CatalogSyncRequest),
     ThumbnailGenerate(thumbnails::job::Request),
     TextEmbed(text_embeddings::job::Request),
@@ -59,7 +94,7 @@ struct EmptyParams {}
 pub(super) enum JobSpec {
     ModelPrepare,
     OcrModelLoad(ocr_models::job::Spec),
-    OcrIndex(indexing::Spec),
+    LibraryIndex(indexing::Spec),
     CatalogSync(indexing::CatalogSyncSpec),
     ThumbnailGenerate(thumbnails::job::Spec),
     TextEmbed(text_embeddings::job::Spec),
@@ -75,7 +110,7 @@ impl JobRequest {
             Self::OcrModelLoad(request) => {
                 Ok(JobSpec::OcrModelLoad(ocr_models::job::prepare(request)?))
             }
-            Self::OcrIndex(request) => Ok(JobSpec::OcrIndex(indexing::prepare(request)?)),
+            Self::LibraryIndex(request) => Ok(JobSpec::LibraryIndex(indexing::prepare(request)?)),
             Self::CatalogSync(request) => Ok(JobSpec::CatalogSync(indexing::prepare_catalog_sync(
                 request,
             )?)),
@@ -101,7 +136,7 @@ impl JobSpec {
         match self {
             Self::ModelPrepare => JobKind::ModelPrepare,
             Self::OcrModelLoad(_) => JobKind::OcrModelLoad,
-            Self::OcrIndex(_) => JobKind::OcrIndex,
+            Self::LibraryIndex(_) => JobKind::LibraryIndex,
             Self::CatalogSync(_) => JobKind::CatalogSync,
             Self::ThumbnailGenerate(_) => JobKind::ThumbnailGenerate,
             Self::TextEmbed(_) => JobKind::TextEmbed,
@@ -112,7 +147,7 @@ impl JobSpec {
     }
 
     fn requires_loaded_ocr_models(&self) -> bool {
-        matches!(self, Self::OcrIndex(spec) if spec.recognizes_text())
+        matches!(self, Self::LibraryIndex(spec) if spec.recognizes_text())
     }
 }
 
@@ -121,7 +156,7 @@ impl JobSpec {
 enum JobKind {
     OcrModelLoad,
     ModelPrepare,
-    OcrIndex,
+    LibraryIndex,
     CatalogSync,
     ThumbnailGenerate,
     TextEmbed,
@@ -367,6 +402,10 @@ impl Job {
             self.publish(&mut data);
             info!(job_id = self.id, kind = ?self.kind, "job cancellation requested");
         }
+    }
+
+    pub(super) fn check_cancelled(&self) -> anyhow::Result<()> {
+        cancel_if(self.cancel_requested.load(Ordering::Acquire))
     }
 
     fn complete(&self, cancelled: bool) {
@@ -624,7 +663,7 @@ impl JobManager {
             evict_retained_jobs(&mut registry);
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
             let job = Arc::new(Job::new(id, spec.kind()));
-            if let JobSpec::OcrIndex(spec) = &spec {
+            if let JobSpec::LibraryIndex(spec) = &spec {
                 let mut data = job.data();
                 data.index_stages = Some(IndexStages {
                     ocr: spec.recognizes_text(),
@@ -644,7 +683,8 @@ impl JobManager {
         tokio::spawn(
             async move {
                 match manager.run_job(spec, Arc::clone(&worker_job)).await {
-                    Ok(cancelled) => worker_job.complete(cancelled),
+                    Ok(()) => worker_job.complete(false),
+                    Err(error) if is_cancelled(&error) => worker_job.complete(true),
                     Err(error) => worker_job.fail(format!("{error:#}")),
                 }
                 manager.finish(worker_job.id);
@@ -654,9 +694,9 @@ impl JobManager {
         Ok(job)
     }
 
-    async fn run_job(&self, spec: JobSpec, job: Arc<Job>) -> anyhow::Result<bool> {
+    async fn run_job(self: &Arc<Self>, spec: JobSpec, job: Arc<Job>) -> anyhow::Result<()> {
         if !job.begin() {
-            return Ok(true);
+            return Err(JobCancelled.into());
         }
         let spec = match spec {
             JobSpec::OcrModelLoad(spec) => {
@@ -669,7 +709,7 @@ impl JobManager {
         let thumbnails = Arc::clone(&self.thumbnails);
         let embedder = Arc::clone(&self.embedder);
         let image_embedder = Arc::clone(&self.image_embedder);
-        let image_query_embedder = Arc::clone(&self.image_query_embedder);
+        let manager = Arc::clone(self);
         let ocr_models = spec
             .requires_loaded_ocr_models()
             .then(|| self.ocr_models.snapshot())
@@ -677,145 +717,191 @@ impl JobManager {
         let span = Span::current();
         tokio::task::spawn_blocking(move || {
             let _entered = span.enter();
-            let needs_text = matches!(&spec, JobSpec::TextEmbed(_) | JobSpec::ModelPrepare)
-                || matches!(&spec, JobSpec::OcrIndex(spec) if spec.embeds_text());
-            let needs_image = matches!(&spec, JobSpec::ImageEmbed(_) | JobSpec::ModelPrepare)
-                || matches!(&spec, JobSpec::OcrIndex(spec) if spec.embeds_images());
-            if needs_text || needs_image {
-                let needs_image_text =
-                    needs_image && image_embedder.model().supports_text_queries();
-                job.preparing_models(
-                    u64::from(needs_text) + u64::from(needs_image) + u64::from(needs_image_text),
-                );
-                if needs_text {
-                    embedder.prepare_with_progress(job.as_ref())?;
-                    job.models_loaded(1);
-                }
-                if job.is_cancelled() {
-                    return Ok(true);
-                }
-                if needs_image {
-                    image_embedder.prepare_with_progress(job.as_ref())?;
-                    job.models_loaded(1);
-                    if job.is_cancelled() {
-                        return Ok(true);
+            let result = (|| {
+                manager.prepare_job_models(&spec, &job)?;
+                match spec {
+                    JobSpec::ModelPrepare => Ok(()),
+                    JobSpec::LibraryIndex(spec) => {
+                        manager.run_index_pipeline(spec, ocr_models.as_ref(), &job)
                     }
-                    if needs_image_text {
-                        image_query_embedder.prepare_with_progress(job.as_ref())?;
-                        job.models_loaded(1);
-                    }
-                }
-                if job.is_cancelled() {
-                    return Ok(true);
-                }
-            }
-            match spec {
-                JobSpec::ModelPrepare => Ok(false),
-                JobSpec::OcrIndex(spec) => {
-                    let embed_text = spec.embeds_text();
-                    let embed_image = spec.embeds_images();
-                    let root = spec.root().clone();
-                    let retry_failed = spec.retry_failed();
-                    let debug_limit = spec.debug_limit();
-                    let reconciliation = spec.reconciliation();
-                    let summary = indexing::run(
-                        spec,
-                        &databases.assets,
-                        &databases.ocr,
-                        ocr_models.as_ref(),
-                        job.as_ref(),
-                        || {
-                            Ok(embed_image
-                                && image_embeddings::run(
-                                    image_embeddings::Spec::pending_for(
-                                        root.clone(),
-                                        retry_failed,
-                                        debug_limit,
-                                    ),
-                                    &databases.assets,
-                                    &databases.images,
-                                    image_embedder.prepare()?.as_ref(),
-                                    job.as_ref(),
-                                )?)
-                        },
-                    )?;
-                    let cancelled = summary.cancelled
-                        || (summary.scan_complete
-                            && prune_jobs::reconcile(
+                    JobSpec::CatalogSync(spec) => {
+                        let reconciliation = spec.reconciliation();
+                        let (summary, scanned) =
+                            indexing::run_catalog_sync(spec, &databases.assets, job.as_ref())?;
+                        reconcile_after_discovery(summary.cancelled, summary.scan_complete, || {
+                            prune_jobs::reconcile(
                                 reconciliation,
                                 &databases,
                                 image_embedder.dimensions(),
                                 &thumbnails,
+                                &scanned,
                                 job.as_ref(),
-                            )?);
-                    if cancelled {
-                        return Ok(cancelled);
+                            )
+                        })
                     }
-                    if !embed_text {
-                        return Ok(false);
+                    JobSpec::ThumbnailGenerate(spec) => {
+                        thumbnails::job::run(spec, &databases.assets, &thumbnails, job.as_ref())
                     }
-                    text_embeddings::job::run(
-                        text_embeddings::job::Spec::pending_for(root, debug_limit),
+                    JobSpec::TextEmbed(spec) => text_embeddings::job::run(
+                        spec,
                         &databases.ocr,
                         embedder.prepare()?.as_ref(),
                         job.as_ref(),
-                    )
+                    ),
+                    JobSpec::ImageEmbed(spec) => image_embeddings::run(
+                        spec,
+                        &databases.assets,
+                        &databases.images,
+                        image_embedder.prepare()?.as_ref(),
+                        job.as_ref(),
+                        None,
+                    ),
+                    JobSpec::PruneMissing(spec) => prune_jobs::run(
+                        spec,
+                        &databases.assets,
+                        &databases.ocr,
+                        &databases.images,
+                        image_embedder.dimensions(),
+                        &thumbnails,
+                        job.as_ref(),
+                    ),
+                    JobSpec::LibraryPurge(spec) => prune_jobs::run_library_purge(
+                        spec,
+                        &databases.assets,
+                        &databases.ocr,
+                        &databases.images,
+                        image_embedder.dimensions(),
+                        &thumbnails,
+                        job.as_ref(),
+                    ),
+                    JobSpec::OcrModelLoad(_) => {
+                        unreachable!("handled before the blocking job boundary")
+                    }
                 }
-                JobSpec::CatalogSync(spec) => {
-                    let reconciliation = spec.reconciliation();
-                    let summary =
-                        indexing::run_catalog_sync(spec, &databases.assets, job.as_ref())?;
-                    Ok(summary.cancelled
-                        || (summary.scan_complete
-                            && prune_jobs::reconcile(
-                                reconciliation,
-                                &databases,
-                                image_embedder.dimensions(),
-                                &thumbnails,
-                                job.as_ref(),
-                            )?))
-                }
-                JobSpec::ThumbnailGenerate(spec) => {
-                    thumbnails::job::run(spec, &databases.assets, &thumbnails, job.as_ref())
-                }
-                JobSpec::TextEmbed(spec) => text_embeddings::job::run(
-                    spec,
-                    &databases.ocr,
-                    embedder.prepare()?.as_ref(),
-                    job.as_ref(),
-                ),
-                JobSpec::ImageEmbed(spec) => image_embeddings::run(
-                    spec,
-                    &databases.assets,
-                    &databases.images,
-                    image_embedder.prepare()?.as_ref(),
-                    job.as_ref(),
-                ),
-                JobSpec::PruneMissing(spec) => prune_jobs::run(
-                    spec,
-                    &databases.assets,
-                    &databases.ocr,
-                    &databases.images,
-                    image_embedder.dimensions(),
-                    &thumbnails,
-                    job.as_ref(),
-                ),
-                JobSpec::LibraryPurge(spec) => prune_jobs::run_library_purge(
-                    spec,
-                    &databases.assets,
-                    &databases.ocr,
-                    &databases.images,
-                    image_embedder.dimensions(),
-                    &thumbnails,
-                    job.as_ref(),
-                ),
-                JobSpec::OcrModelLoad(_) => {
-                    unreachable!("handled before the blocking job boundary")
-                }
-            }
+            })();
+            manager.maintain_databases();
+            result
         })
         .await
         .map_err(|error| anyhow::anyhow!("job worker failed: {error}"))?
+    }
+
+    /// Jobs are already globally serialized, making their common epilogue the safe place to
+    /// reconcile independently stored derived rows and perform bounded SQLite maintenance.
+    fn maintain_databases(&self) {
+        let result = (|| -> anyhow::Result<(usize, usize, usize)> {
+            let assets = nicegal_core::assets::AssetCatalog::new(&self.databases.assets)?;
+            let mut ocr = nicegal_core::db::DB::new(&self.databases.ocr)?;
+            let mut images = nicegal_core::image_index::ImageIndexDb::new(
+                &self.databases.images,
+                self.image_embedder.dimensions(),
+            )?;
+            let ocr_deleted = ocr.prune_orphans(&self.databases.assets)?;
+            let image_deleted = images.prune_orphans(&self.databases.assets)?;
+            let thumbnail_deleted = self
+                .thumbnails
+                .prune_orphans_and_maintain(self.databases.assets.clone())?;
+            ocr.maintain()?;
+            images.maintain()?;
+            assets.maintain()?;
+            Ok((ocr_deleted, image_deleted, thumbnail_deleted))
+        })();
+        match result {
+            Ok((ocr, images, thumbnails)) => tracing::debug!(
+                orphaned_ocr = ocr,
+                orphaned_images = images,
+                orphaned_thumbnails = thumbnails,
+                "job database maintenance completed"
+            ),
+            Err(error) => tracing::warn!(
+                error = %format_args!("{error:#}"),
+                "job database maintenance failed"
+            ),
+        }
+    }
+
+    fn prepare_job_models(&self, spec: &JobSpec, job: &Job) -> anyhow::Result<()> {
+        let needs_text = matches!(spec, JobSpec::TextEmbed(_) | JobSpec::ModelPrepare)
+            || matches!(spec, JobSpec::LibraryIndex(spec) if spec.embeds_text());
+        let needs_image = matches!(spec, JobSpec::ImageEmbed(_) | JobSpec::ModelPrepare)
+            || matches!(spec, JobSpec::LibraryIndex(spec) if spec.embeds_images());
+        if !needs_text && !needs_image {
+            return Ok(());
+        }
+        let needs_image_text = needs_image && self.image_embedder.model().supports_text_queries();
+        job.preparing_models(
+            u64::from(needs_text) + u64::from(needs_image) + u64::from(needs_image_text),
+        );
+        if needs_text {
+            self.embedder.prepare_with_progress(job)?;
+            job.models_loaded(1);
+        }
+        job.check_cancelled()?;
+        if needs_image {
+            self.image_embedder.prepare_with_progress(job)?;
+            job.models_loaded(1);
+            job.check_cancelled()?;
+            if needs_image_text {
+                self.image_query_embedder.prepare_with_progress(job)?;
+                job.models_loaded(1);
+            }
+        }
+        job.check_cancelled()
+    }
+
+    fn run_index_pipeline(
+        &self,
+        spec: indexing::Spec,
+        ocr_models: Option<&Arc<Mutex<nicegal_core::ocr::PaddleOcrPool>>>,
+        job: &Job,
+    ) -> anyhow::Result<()> {
+        let embed_text = spec.embeds_text();
+        let embed_image = spec.embeds_images();
+        let root = spec.root().clone();
+        let retry_failed = spec.retry_failed();
+        let debug_limit = spec.debug_limit();
+        let reconciliation = spec.reconciliation();
+        let mut scanned = Vec::new();
+        let summary = indexing::run(
+            spec,
+            &self.databases.assets,
+            &self.databases.ocr,
+            ocr_models,
+            job,
+            |catalog| {
+                scanned.extend_from_slice(catalog);
+                if !embed_image {
+                    return Ok(());
+                }
+                image_embeddings::run(
+                    image_embeddings::Spec::pending_for(root.clone(), retry_failed, debug_limit),
+                    &self.databases.assets,
+                    &self.databases.images,
+                    self.image_embedder.prepare()?.as_ref(),
+                    job,
+                    Some(catalog),
+                )
+            },
+        )?;
+        reconcile_after_discovery(summary.cancelled, summary.scan_complete, || {
+            prune_jobs::reconcile(
+                reconciliation,
+                &self.databases,
+                self.image_embedder.dimensions(),
+                &self.thumbnails,
+                &scanned,
+                job,
+            )
+        })?;
+        if !embed_text {
+            return Ok(());
+        }
+        text_embeddings::job::run(
+            text_embeddings::job::Spec::pending_for(root, debug_limit),
+            &self.databases.ocr,
+            self.embedder.prepare()?.as_ref(),
+            job,
+        )
     }
 
     fn get(&self, id: u64) -> Option<Arc<Job>> {
@@ -848,7 +934,11 @@ impl JobManager {
     }
 
     pub(super) fn has_active_job(&self) -> bool {
-        self.list().active_job_id.is_some()
+        let registry = self.registry();
+        registry
+            .active
+            .and_then(|id| registry.jobs.get(&id))
+            .is_some_and(|job| !job.data().status.is_terminal())
     }
 
     pub(crate) fn cancel_all(&self) {
@@ -995,6 +1085,22 @@ mod tests {
     use tokio_stream::StreamExt as _;
 
     #[test]
+    fn reconciliation_only_runs_after_complete_uncancelled_discovery() {
+        for (cancelled, complete) in [(true, true), (true, false)] {
+            let error = reconcile_after_discovery(cancelled, complete, || panic!("must not prune"))
+                .unwrap_err();
+            assert!(is_cancelled(&error));
+        }
+        reconcile_after_discovery(false, false, || panic!("must not prune")).unwrap();
+        let error = reconcile_after_discovery(false, true, || cancel_if(true)).unwrap_err();
+        assert!(is_cancelled(&error));
+        reconcile_after_discovery(false, true, || Ok(())).unwrap();
+        assert!(
+            reconcile_after_discovery(false, true, || anyhow::bail!("store unavailable")).is_err()
+        );
+    }
+
+    #[test]
     fn model_preparation_wire_contract_and_progress() {
         let request: JobRequest = serde_json::from_value(serde_json::json!({
             "type": "modelPrepare", "params": {}
@@ -1094,7 +1200,7 @@ mod tests {
 
     #[test]
     fn phase_progress_is_scoped_to_the_current_phase() {
-        let job = Job::new(8, JobKind::OcrIndex);
+        let job = Job::new(8, JobKind::LibraryIndex);
         assert!(job.begin());
         job.on_event(IndexEvent::PhaseChanged(IndexPhase::Scanning));
         job.on_event(IndexEvent::Discovered { count: 5 });
@@ -1122,7 +1228,7 @@ mod tests {
 
     #[test]
     fn throughput_resets_when_indexing_phase_changes() {
-        let job = Job::new(8, JobKind::OcrIndex);
+        let job = Job::new(8, JobKind::LibraryIndex);
         assert!(job.begin());
 
         for phase in [
@@ -1153,7 +1259,7 @@ mod tests {
 
     #[test]
     fn resumed_ocr_throughput_excludes_skips_but_preserves_progress() {
-        let job = Job::new(10, JobKind::OcrIndex);
+        let job = Job::new(10, JobKind::LibraryIndex);
         assert!(job.begin());
         job.on_event(IndexEvent::PhaseChanged(IndexPhase::Cataloging));
         job.on_event(IndexEvent::Progress(IndexProgressDelta {
@@ -1264,27 +1370,27 @@ mod tests {
         let root = std::env::current_dir().unwrap();
         for (ocr, image) in [(true, true), (true, false), (false, true)] {
             let request: JobRequest = serde_json::from_value(serde_json::json!({
-                "type": "ocrIndex", "params": { "root": root, "ocr": ocr, "image": image }
+                "type": "libraryIndex", "params": { "root": root, "ocr": ocr, "image": image }
             }))
             .unwrap();
             let spec = request.prepare().unwrap();
             assert_eq!(spec.requires_loaded_ocr_models(), ocr);
-            let JobSpec::OcrIndex(spec) = spec else {
+            let JobSpec::LibraryIndex(spec) = spec else {
                 panic!("wrong job type")
             };
             assert_eq!(spec.embeds_text(), ocr);
             assert_eq!(spec.embeds_images(), image);
         }
         let request: JobRequest = serde_json::from_value(serde_json::json!({
-            "type": "ocrIndex", "params": { "root": root, "ocr": false, "image": false }
+            "type": "libraryIndex", "params": { "root": root, "ocr": false, "image": false }
         }))
         .unwrap();
         assert!(request.prepare().is_err());
         let request: JobRequest = serde_json::from_value(serde_json::json!({
-            "type": "ocrIndex", "params": { "root": root, "embed": false }
+            "type": "libraryIndex", "params": { "root": root, "embed": false }
         }))
         .unwrap();
-        let JobSpec::OcrIndex(spec) = request.prepare().unwrap() else {
+        let JobSpec::LibraryIndex(spec) = request.prepare().unwrap() else {
             panic!("wrong job type")
         };
         assert!(spec.recognizes_text());
@@ -1319,7 +1425,8 @@ mod tests {
     #[tokio::test]
     async fn manager_rejects_concurrent_jobs_and_cancels_queued_work() {
         crate::api::tests::initialize_test_runtime();
-        let current_dir = PathBuf::try_from(std::env::current_dir().unwrap()).unwrap();
+        let runtime_config_dir = tempfile::TempDir::new().unwrap();
+        let current_dir = PathBuf::try_from(runtime_config_dir.path().to_path_buf()).unwrap();
         let request: JobRequest = serde_json::from_value(serde_json::json!({
             "type": "ocrModelLoad",
             "params": {
@@ -1329,7 +1436,6 @@ mod tests {
         }))
         .unwrap();
         let thumbnail_path = current_dir.join("unused-thumbnails.db");
-        let runtime_config_dir = tempfile::TempDir::new().unwrap();
         let runtime = Arc::new(
             crate::api::RuntimeSettings::load(
                 PathBuf::try_from(runtime_config_dir.path().join("runtime.json")).unwrap(),

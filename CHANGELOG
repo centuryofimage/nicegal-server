@@ -1,4 +1,4 @@
-- Fix dragging images out of the gallery
-- Fix selection
-- Add year to date indicator
-- Change app icon
+- Major cleanups
+- Speed up database, add maintainence runs
+- Improve speed and fix ui bugs
+- Added diagnostics to about panel

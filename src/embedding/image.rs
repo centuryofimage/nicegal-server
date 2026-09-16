@@ -15,8 +15,8 @@ use super::fastembed::FastEmbedBackend;
 
 /// An image embedding model supported by this build.
 ///
-/// The identifier names the shared image/text coordinate space rather than FastEmbed's
-/// encoder-specific repositories. A future text-query encoder must use this same identifier.
+/// The identifier names the shared image/text coordinate space used by both the image encoder and
+/// its paired text-query encoder.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum ImageEmbeddingModel {
     /// OpenAI CLIP ViT-B/32, served by FastEmbed's Qdrant ONNX exports.
@@ -32,36 +32,140 @@ pub enum ImageEmbeddingModel {
     DinoV3B16,
 }
 
+struct ModelSpec {
+    id: &'static str,
+    name: &'static str,
+    dimensions: usize,
+    license: &'static str,
+    context_length: usize,
+    published_export: Option<(&'static str, &'static str)>,
+    required_files: &'static [&'static str],
+}
+
+const PAIRED_MODEL_FILES: &[&str] = &[
+    "image.onnx",
+    "text.onnx",
+    "manifest.json",
+    "preprocessor_config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "config.json",
+];
+const IMAGE_ONLY_MODEL_FILES: &[&str] = &[
+    "image.onnx",
+    "model.onnx_data",
+    "manifest.json",
+    "preprocessor_config.json",
+];
+
 impl ImageEmbeddingModel {
+    const fn spec(self) -> ModelSpec {
+        match self {
+            Self::ClipVitB32 => ModelSpec {
+                id: "Qdrant/clip-ViT-B-32",
+                name: "OpenAI CLIP B/32 224",
+                dimensions: 512,
+                license: "MIT",
+                context_length: 77,
+                published_export: None,
+                required_files: PAIRED_MODEL_FILES,
+            },
+            Self::MetaClip2B32 => ModelSpec {
+                id: "facebook/metaclip-2-worldwide-b32",
+                name: "MetaCLIP2 B/32 224",
+                dimensions: 512,
+                license: "CC-BY-NC-4.0",
+                context_length: 77,
+                published_export: Some((
+                    "bep256/metaclip-2-worldwide-b32-ONNX",
+                    "a70ddb6e8ac8a2be823ce11f2d296684e150802d",
+                )),
+                required_files: PAIRED_MODEL_FILES,
+            },
+            Self::MetaClip2B16 => ModelSpec {
+                id: "facebook/metaclip-2-worldwide-b16",
+                name: "MetaCLIP2 B/16 224",
+                dimensions: 512,
+                license: "CC-BY-NC-4.0",
+                context_length: 77,
+                published_export: Some((
+                    "bep256/metaclip-2-worldwide-b16-ONNX",
+                    "33cd628449b4e87dfc3f348d9843b32d32713860",
+                )),
+                required_files: PAIRED_MODEL_FILES,
+            },
+            Self::SigLip2Base256 => ModelSpec {
+                id: "google/siglip2-base-patch16-256",
+                name: "SigLIP2 Base B/16 256",
+                dimensions: 768,
+                license: "Apache-2.0",
+                context_length: 64,
+                published_export: Some((
+                    "bep256/siglip2-base-patch16-256-ONNX",
+                    "9b5bf05e40e88b58d8076b2508cc7495e75b3224",
+                )),
+                required_files: PAIRED_MODEL_FILES,
+            },
+            Self::LaionClipB32 => ModelSpec {
+                id: "laion/CLIP-ViT-B-32-laion2B-s34B-b79K",
+                name: "LAION ViT-B/32 (laion2b_s34b_b79k)",
+                dimensions: 512,
+                license: "MIT",
+                context_length: 77,
+                published_export: None,
+                required_files: PAIRED_MODEL_FILES,
+            },
+            Self::SigLipBetaSwinV2Frozen => ModelSpec {
+                id: "deepghs/siglip_beta/smilingwolf/siglip_swinv2_base_2025_02_22_18h56m54s",
+                name: "SigLIP beta SwinV2 Base (experimental)",
+                dimensions: 1024,
+                license: "Apache-2.0",
+                context_length: 128,
+                published_export: None,
+                required_files: PAIRED_MODEL_FILES,
+            },
+            Self::SigLipBetaSwinV2 => ModelSpec {
+                id: "deepghs/siglip_beta/smilingwolf/siglip_swinv2_base_2025_05_02_22h02m36s",
+                name: "SigLIP beta SwinV2 Base (unfrozen image encoder)",
+                dimensions: 1024,
+                license: "Apache-2.0",
+                context_length: 128,
+                published_export: None,
+                required_files: PAIRED_MODEL_FILES,
+            },
+            Self::SigLipBetaEva02 => ModelSpec {
+                id: "deepghs/siglip_beta/smilingwolf/siglip_eva02_base_2025_05_02_21h53m54s",
+                name: "SigLIP beta EVA02 Base",
+                dimensions: 768,
+                license: "Apache-2.0",
+                context_length: 128,
+                published_export: None,
+                required_files: PAIRED_MODEL_FILES,
+            },
+            Self::DinoV3B16 => ModelSpec {
+                id: "facebook/dinov3-vitb16-pretrain-lvd1689m",
+                name: "DINOv3 B/16 224 (experimental)",
+                dimensions: 768,
+                license: "DINOv3 License",
+                context_length: 0,
+                published_export: Some((
+                    "bep256/dinov3-vitb16-pretrain-lvd1689m-ONNX",
+                    "05f9d720e2169b6b7ffa499db098d08dd374bd9d",
+                )),
+                required_files: IMAGE_ONLY_MODEL_FILES,
+            },
+        }
+    }
+
     /// Stable identifier for the compatible image/text embedding pair.
     pub const fn id(self) -> &'static str {
-        match self {
-            Self::ClipVitB32 => "Qdrant/clip-ViT-B-32",
-            Self::MetaClip2B32 => "facebook/metaclip-2-worldwide-b32",
-            Self::MetaClip2B16 => "facebook/metaclip-2-worldwide-b16",
-            Self::SigLip2Base256 => "google/siglip2-base-patch16-256",
-            Self::LaionClipB32 => "laion/CLIP-ViT-B-32-laion2B-s34B-b79K",
-            Self::DinoV3B16 => "facebook/dinov3-vitb16-pretrain-lvd1689m",
-            Self::SigLipBetaSwinV2Frozen => {
-                "deepghs/siglip_beta/smilingwolf/siglip_swinv2_base_2025_02_22_18h56m54s"
-            }
-            Self::SigLipBetaSwinV2 => {
-                "deepghs/siglip_beta/smilingwolf/siglip_swinv2_base_2025_05_02_22h02m36s"
-            }
-            Self::SigLipBetaEva02 => {
-                "deepghs/siglip_beta/smilingwolf/siglip_eva02_base_2025_05_02_21h53m54s"
-            }
-        }
+        self.spec().id
     }
 
     /// Width of every vector produced by this model.
     pub const fn dimensions(self) -> usize {
-        match self {
-            Self::SigLip2Base256 => 768,
-            Self::SigLipBetaSwinV2Frozen | Self::SigLipBetaSwinV2 => 1024,
-            Self::SigLipBetaEva02 | Self::DinoV3B16 => 768,
-            _ => 512,
-        }
+        self.spec().dimensions
     }
 
     pub const ALL: [Self; 9] = [
@@ -87,43 +191,18 @@ impl ImageEmbeddingModel {
     ];
 
     pub const fn name(self) -> &'static str {
-        match self {
-            Self::ClipVitB32 => "OpenAI CLIP B/32 224",
-            Self::MetaClip2B32 => "MetaCLIP2 B/32 224",
-            Self::MetaClip2B16 => "MetaCLIP2 B/16 224",
-            Self::SigLip2Base256 => "SigLIP2 Base B/16 256",
-            Self::LaionClipB32 => "LAION ViT-B/32 (laion2b_s34b_b79k)",
-            Self::SigLipBetaSwinV2Frozen => "SigLIP beta SwinV2 Base (experimental)",
-            Self::SigLipBetaSwinV2 => "SigLIP beta SwinV2 Base (unfrozen image encoder)",
-            Self::SigLipBetaEva02 => "SigLIP beta EVA02 Base",
-            Self::DinoV3B16 => "DINOv3 B/16 224 (experimental)",
-        }
+        self.spec().name
     }
-
     pub const fn license(self) -> &'static str {
-        match self {
-            Self::MetaClip2B32 | Self::MetaClip2B16 => "CC-BY-NC-4.0",
-            Self::SigLip2Base256 => "Apache-2.0",
-            Self::DinoV3B16 => "DINOv3 License",
-            Self::SigLipBetaSwinV2Frozen | Self::SigLipBetaSwinV2 | Self::SigLipBetaEva02 => {
-                "Apache-2.0"
-            }
-            _ => "MIT",
-        }
+        self.spec().license
     }
-
     pub const fn context_length(self) -> usize {
-        match self {
-            Self::DinoV3B16 => 0,
-            Self::SigLip2Base256 => 64,
-            Self::SigLipBetaSwinV2Frozen | Self::SigLipBetaSwinV2 | Self::SigLipBetaEva02 => 128,
-            _ => 77,
-        }
+        self.spec().context_length
     }
 
     /// Image-only encoders cannot resolve descriptions in their vector space.
     pub const fn supports_text_queries(self) -> bool {
-        !matches!(self, Self::DinoV3B16)
+        self.context_length() > 0
     }
 
     pub const fn is_deepghs(self) -> bool {
@@ -189,7 +268,29 @@ impl ImageEmbeddingModel {
         Ok(())
     }
 
-    /// Local export override for development and benchmark comparisons.
+    fn deepghs_image_files(
+        self,
+        cached_only: bool,
+        progress: &dyn crate::hub::DownloadObserver,
+    ) -> Result<Option<(std::path::PathBuf, Vec<u8>)>> {
+        let image = self.deepghs_file("image_encode.onnx", cached_only, progress)?;
+        let preprocessor = self.deepghs_file("preprocessor.json", cached_only, progress)?;
+        let meta = self.deepghs_file("meta.json", cached_only, progress)?;
+        let (Some(image), Some(preprocessor), Some(meta)) = (image, preprocessor, meta) else {
+            return Ok(None);
+        };
+        self.validate_deepghs_meta(&meta)?;
+        Ok(Some((image, std::fs::read(preprocessor)?)))
+    }
+
+    fn image_preprocessor_config(self, directory: &std::path::Path) -> Result<Vec<u8>> {
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(directory.join("preprocessor_config.json"))?)?;
+        config["nicegal_center_crop_round"] = (self == Self::LaionClipB32).into();
+        serde_json::to_vec(&config).context("serializing image preprocessor configuration")
+    }
+
+    /// Local export override for development and validation.
     pub fn local_directory(self) -> Option<std::path::PathBuf> {
         if self == Self::ClipVitB32 || self.is_deepghs() {
             return None;
@@ -200,25 +301,7 @@ impl ImageEmbeddingModel {
     }
 
     fn published_source(self, filename: &str) -> Option<crate::hub::ModelSource> {
-        let (model_id, revision) = match self {
-            Self::MetaClip2B32 => (
-                "bep256/metaclip-2-worldwide-b32-ONNX",
-                "a70ddb6e8ac8a2be823ce11f2d296684e150802d",
-            ),
-            Self::MetaClip2B16 => (
-                "bep256/metaclip-2-worldwide-b16-ONNX",
-                "33cd628449b4e87dfc3f348d9843b32d32713860",
-            ),
-            Self::SigLip2Base256 => (
-                "bep256/siglip2-base-patch16-256-ONNX",
-                "9b5bf05e40e88b58d8076b2508cc7495e75b3224",
-            ),
-            Self::DinoV3B16 => (
-                "bep256/dinov3-vitb16-pretrain-lvd1689m-ONNX",
-                "05f9d720e2169b6b7ffa499db098d08dd374bd9d",
-            ),
-            _ => return None,
-        };
+        let (model_id, revision) = self.spec().published_export?;
         Some(crate::hub::ModelSource {
             model_id: model_id.to_owned(),
             revision: Some(revision.to_owned()),
@@ -227,25 +310,7 @@ impl ImageEmbeddingModel {
     }
 
     fn required_files(self) -> &'static [&'static str] {
-        if self == Self::DinoV3B16 {
-            &[
-                "image.onnx",
-                "model.onnx_data",
-                "manifest.json",
-                "preprocessor_config.json",
-            ]
-        } else {
-            &[
-                "image.onnx",
-                "text.onnx",
-                "manifest.json",
-                "preprocessor_config.json",
-                "tokenizer.json",
-                "tokenizer_config.json",
-                "special_tokens_map.json",
-                "config.json",
-            ]
-        }
+        self.spec().required_files
     }
 
     pub fn available(self) -> bool {
@@ -405,90 +470,66 @@ impl ImageEmbedder {
         if options.max_batch_size == 0 {
             bail!("image embedding batch size must be greater than zero");
         }
-        let local =
-            if options.model != ImageEmbeddingModel::ClipVitB32 && !options.model.is_deepghs() {
-                let Some(path) = options
-                    .model
-                    .validated_model_directory(cached_only, progress)?
-                else {
-                    return Ok(None);
-                };
-                Some(path)
-            } else {
-                None
-            };
         let cache_dir = crate::hub::cache_dir();
-        let intra_threads = options.runtime.intra_threads;
-        let (backend, execution_provider) = runtime::with_fallback(options.runtime, |provider| {
-            let configured = runtime::configure_provider(provider, intra_threads)?;
-            if options.model.is_deepghs() {
-                let image =
-                    options
-                        .model
-                        .deepghs_file("image_encode.onnx", cached_only, progress)?;
-                let preprocessor =
-                    options
-                        .model
-                        .deepghs_file("preprocessor.json", cached_only, progress)?;
-                let meta = options
-                    .model
-                    .deepghs_file("meta.json", cached_only, progress)?;
-                let (Some(image), Some(preprocessor), Some(meta)) = (image, preprocessor, meta)
-                else {
-                    return Ok(None);
-                };
-                options.model.validate_deepghs_meta(&meta)?;
-                let init = fastembed::ImageInitOptionsUserDefined::new()
-                    .with_execution_providers(vec![configured.dispatch])
-                    .with_intra_threads(configured.intra_threads.get());
-                return ImageEmbedding::try_new_from_deepghs_path(
-                    image,
-                    &std::fs::read(preprocessor)?,
-                    init,
-                )
-                .map(Some)
-                .context("loading DeepGHS image ONNX encoder");
-            }
-            if let Some(path) = &local {
-                let init = fastembed::ImageInitOptionsUserDefined::new()
-                    .with_execution_providers(vec![configured.dispatch])
-                    .with_intra_threads(configured.intra_threads.get());
-                let mut config: serde_json::Value =
-                    serde_json::from_slice(&std::fs::read(path.join("preprocessor_config.json"))?)?;
-                config["nicegal_center_crop_round"] =
-                    (options.model == ImageEmbeddingModel::LaionClipB32).into();
-                return ImageEmbedding::try_new_from_path(
-                    path.join("image.onnx"),
-                    &serde_json::to_vec(&config)?,
-                    init,
-                )
-                .map(|backend| {
-                    Some(if options.model == ImageEmbeddingModel::DinoV3B16 {
-                        backend.with_output_key("pooler_output")
-                    } else {
-                        backend
-                    })
-                })
-                .context("loading local image ONNX encoder");
-            }
-            if !cached_only {
-                let info = ImageEmbedding::get_model_info(&FastEmbedImageModel::ClipVitB32);
-                for filename in [info.model_file.as_str(), "preprocessor_config.json"] {
-                    crate::hub::ModelSource {
-                        model_id: info.model_code.clone(),
-                        revision: None,
-                        filename: filename.to_owned(),
-                    }
-                    .get_sync_with_progress(progress)?;
+        // Resolve and validate files once; only session construction belongs in provider retries.
+        let deepghs = if options.model.is_deepghs() {
+            let Some(files) = options.model.deepghs_image_files(cached_only, progress)? else {
+                return Ok(None);
+            };
+            Some(files)
+        } else {
+            None
+        };
+        let local = if options.model != ImageEmbeddingModel::ClipVitB32 && deepghs.is_none() {
+            let Some(path) = options
+                .model
+                .validated_model_directory(cached_only, progress)?
+            else {
+                return Ok(None);
+            };
+            Some((
+                path.join("image.onnx"),
+                options.model.image_preprocessor_config(&path)?,
+            ))
+        } else {
+            None
+        };
+        if options.model == ImageEmbeddingModel::ClipVitB32 && !cached_only {
+            let info = ImageEmbedding::get_model_info(&FastEmbedImageModel::ClipVitB32);
+            for filename in [info.model_file.as_str(), "preprocessor_config.json"] {
+                crate::hub::ModelSource {
+                    model_id: info.model_code.clone(),
+                    revision: None,
+                    filename: filename.to_owned(),
                 }
+                .get_sync_with_progress(progress)?;
+            }
+        }
+        let (backend, execution_provider) = runtime::with_fallback(options.runtime, |provider| {
+            let configured = runtime::configure_provider(provider, options.runtime.intra_threads)?;
+            if let Some((image, preprocessor)) = deepghs.as_ref().or(local.as_ref()) {
+                let init = fastembed::ImageInitOptionsUserDefined::new()
+                    .with_execution_providers(vec![configured.dispatch])
+                    .with_intra_threads(configured.intra_threads.get());
+                let backend = if deepghs.is_some() {
+                    ImageEmbedding::try_new_from_deepghs_path(image, preprocessor, init)
+                        .context("loading DeepGHS image ONNX encoder")?
+                } else {
+                    ImageEmbedding::try_new_from_path(image, preprocessor, init)
+                        .context("loading local image ONNX encoder")?
+                };
+                return Ok(Some(if options.model == ImageEmbeddingModel::DinoV3B16 {
+                    backend.with_output_key("pooler_output")
+                } else {
+                    backend
+                }));
             }
             let init = ImageInitOptions::new(FastEmbedImageModel::ClipVitB32)
                 .with_cache_dir(cache_dir.clone())
                 .with_show_download_progress(true)
                 .with_execution_providers(vec![configured.dispatch])
                 .with_intra_threads(configured.intra_threads.get());
-            let loaded = ImageEmbedding::try_new_cached(init);
-            loaded.with_context(|| {
+            ImageEmbedding::try_new_cached(init).with_context(|| {
                 format!(
                     "loading {} from {} on the {provider} execution provider",
                     options.model,
@@ -627,18 +668,12 @@ impl ImageEmbedder {
 /// How an [`ImageQueryEmbedder`] is built.
 #[derive(Debug, Clone)]
 pub struct ImageQueryEmbedderOptions {
-    /// The image embedding model whose coordinate space query vectors must land in. The text
-    /// encoder is the paired half of that model, so it is selected with it and only changes
-    /// through a restart, exactly like the image encoder.
+    /// Image model whose coordinate space query vectors must use.
     pub model: ImageEmbeddingModel,
     /// Longest input embedded, in bytes of UTF-8. Longer text is truncated on a character
     /// boundary first; the backend's tokenizer then truncates to the model's own context window.
     pub max_input_bytes: usize,
-    /// The execution provider to compile the ONNX session for, with the same
-    /// request/fallback/thread-budget contract [`crate::runtime::load_sessions`] gives OCR.
-    ///
-    /// CPU by default and in practice: one short forward pass per search, where a GPU upload
-    /// costs more than the pass itself, and the accelerator is wanted by indexing and OCR.
+    /// Runtime settings for the paired text encoder.
     pub runtime: RuntimeOptions,
 }
 
@@ -657,11 +692,7 @@ impl Default for ImageQueryEmbedderOptions {
 /// The text half of an image embedding pair: embeds search queries into the image model's
 /// coordinate space.
 ///
-/// CLIP-style models are two encoders trained to share one space, so this carries the same
-/// [`ImageEmbeddingModel`] as the [`ImageEmbedder`] it answers. It is deliberately not a
-/// [`super::TextEmbedder`]: the OCR engine's model catalog and the image engine's model catalog
-/// are separate selections with separate databases, and only the image engine's queries may land
-/// in its space.
+/// It uses the same [`ImageEmbeddingModel`] coordinate space as its paired [`ImageEmbedder`].
 pub struct ImageQueryEmbedder {
     backend: FastEmbedBackend,
     model: ImageEmbeddingModel,
@@ -761,8 +792,7 @@ impl ImageQueryEmbedder {
         self.execution_provider
     }
 
-    /// Embed one search query. Queries are the only input this encoder ever sees, so this is its
-    /// whole interface; document embedding belongs to the OCR engine's [`super::TextEmbedder`].
+    /// Embed one search query in the paired image model's coordinate space.
     #[instrument(name = "embed_image_query", level = "debug", skip_all, fields(bytes = text.len()))]
     pub fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
         if text.trim().is_empty() {

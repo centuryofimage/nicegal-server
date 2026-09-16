@@ -5,5 +5,5 @@ CREATE TABLE image_embedding_state(
     source_modified_ns INTEGER NOT NULL,
     source_size INTEGER NOT NULL CHECK(source_size >= 0)
 );
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;
 COMMIT;

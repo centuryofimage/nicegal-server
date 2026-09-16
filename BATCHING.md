@@ -15,10 +15,9 @@ arena allocator and graph optimization level 3.
 
 ## Benchmark controls
 
-Use the `ocr_index` benchmark from the backend workspace, with caller-supplied
-images and detector/recognizer model files. See the [README](README.md#index-benchmark)
-for a complete command. The harness exposes `--recognition-batch-size`,
-`--detection-max-side`, `--threads`, `--replicas`, `--runs`, and `--trace-jsonl`.
+The Rust `ocr_index` harness used for the measurements below has been removed.
+A replacement harness is deferred. The measurements remain useful as historical
+context for the pipeline defaults.
 
 Recognition batch sweeps commonly use 1, 4, 8, 16, and 32 crops. Compare the OCR
 content digest as well as throughput: changing a tensor shape must not silently

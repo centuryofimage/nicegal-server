@@ -1,23 +1,21 @@
 use std::collections::HashMap;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, Weak, mpsc};
 use std::thread;
-use std::time::{Duration, Instant};
+#[cfg(test)]
+use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use camino::Utf8Path as Path;
 use rayon::prelude::*;
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
-use tracing::{Span, debug_span, field, trace_span};
+use tracing::{Span, debug_span};
 
 use crate::assets::{Asset, MediaKind, SourceFingerprint};
 use crate::imaging;
 use crate::poster;
-use crate::schema::{check_schema_read_only, open_schema};
 
-const SCHEMA_VERSION: i32 = 3;
-const SCHEMA_LABEL: &str = "thumbnail database";
 pub const SIZE_BUCKETS: [u16; 4] = [128, 256, 512, 1024];
 pub const EAGER_SIZE_BUCKETS: [u16; 3] = [128, 256, 512];
 pub const GENERATOR_VERSION: u32 = 2;
@@ -59,9 +57,7 @@ pub struct Thumbnail {
     pub data: Vec<u8>,
 }
 
-/// An owned, validated-on-write thumbnail awaiting durable persistence. Decoding creates these
-/// values without borrowing either an image decoder or a SQLite connection, so callers can run
-/// expensive source work independently from the one thumbnail writer.
+/// An owned thumbnail awaiting validation and durable persistence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedThumbnail {
     pub asset_id: i64,
@@ -74,312 +70,10 @@ pub struct DecodedThumbnail {
     pub data: Vec<u8>,
 }
 
-pub struct ThumbnailDb {
-    conn: Connection,
-}
+mod storage;
+pub use storage::ThumbnailDb;
 
-impl ThumbnailDb {
-    pub fn new(path: &Path) -> Result<Self> {
-        let span = debug_span!("thumbnail_db_open", path = %path, read_only = false);
-        let _entered = span.enter();
-        let conn = Connection::open(path)
-            .with_context(|| format!("opening thumbnail database: {path}"))?;
-        conn.busy_timeout(Duration::from_secs(5))?;
-        conn.pragma_update(None, "auto_vacuum", "FULL")?;
-        conn.pragma_update(None, "journal_mode", "wal")?;
-        conn.pragma_update(None, "synchronous", "normal")?;
-        open_schema(
-            &conn,
-            SCHEMA_LABEL,
-            SCHEMA_VERSION,
-            include_str!("thumbs_create.sql"),
-        )?;
-        Ok(Self { conn })
-    }
-
-    /// Open a query-only connection for serving stored variants. Unlike [`ThumbnailDb::new`] this
-    /// never creates the schema, so a reader cannot bring an empty database into existence.
-    pub fn new_read_only(path: &Path) -> Result<Self> {
-        let span = debug_span!("thumbnail_db_open", path = %path, read_only = true);
-        let _entered = span.enter();
-        let conn = Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .with_context(|| format!("opening thumbnail database read-only: {path}"))?;
-        conn.busy_timeout(Duration::from_secs(5))?;
-        check_schema_read_only(&conn, SCHEMA_LABEL, SCHEMA_VERSION)?;
-        Ok(Self { conn })
-    }
-
-    /// Store or replace exactly one size and generator variant.
-    #[allow(clippy::too_many_arguments)]
-    pub fn put(
-        &self,
-        asset_id: i64,
-        size_bucket: u16,
-        generator_version: u32,
-        fingerprint: SourceFingerprint,
-        width: u32,
-        height: u32,
-        encoding: ThumbnailEncoding,
-        data: &[u8],
-    ) -> Result<()> {
-        self.store_batch(&[DecodedThumbnail {
-            asset_id,
-            size_bucket,
-            generator_version,
-            fingerprint,
-            width,
-            height,
-            encoding,
-            data: data.to_vec(),
-        }])
-    }
-
-    /// Persist a bounded decoded batch atomically. Every row is validated before the transaction
-    /// begins, so malformed input cannot leave an earlier row from the same batch committed.
-    pub fn store_batch(&self, thumbnails: &[DecodedThumbnail]) -> Result<()> {
-        for thumbnail in thumbnails {
-            validate_key(
-                thumbnail.asset_id,
-                thumbnail.size_bucket,
-                thumbnail.generator_version,
-            )?;
-            validate_static_thumbnail(
-                thumbnail.size_bucket,
-                thumbnail.width,
-                thumbnail.height,
-                thumbnail.encoding,
-                &thumbnail.data,
-            )?;
-            i64::try_from(thumbnail.fingerprint.size)
-                .context("source byte size exceeds SQLite's integer range")?;
-        }
-        if thumbnails.is_empty() {
-            return Ok(());
-        }
-
-        let span = debug_span!(
-            "thumbnail_store_batch",
-            variants = thumbnails.len(),
-            data_bytes = thumbnails
-                .iter()
-                .map(|thumbnail| thumbnail.data.len())
-                .sum::<usize>(),
-        );
-        let _entered = span.enter();
-        let transaction = self.conn.unchecked_transaction()?;
-        let mut statement = transaction.prepare_cached(
-            "INSERT INTO thumbnails (asset_id, size_bucket, generator_version, source_modified_ns, source_size, width, height, encoding, data) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
-             ON CONFLICT(asset_id, size_bucket, generator_version) DO UPDATE SET source_modified_ns=excluded.source_modified_ns, source_size=excluded.source_size, width=excluded.width, height=excluded.height, encoding=excluded.encoding, data=excluded.data",
-        )?;
-        for thumbnail in thumbnails {
-            statement.execute((
-                thumbnail.asset_id,
-                thumbnail.size_bucket,
-                thumbnail.generator_version,
-                thumbnail.fingerprint.modified_ns,
-                i64::try_from(thumbnail.fingerprint.size)?,
-                thumbnail.width,
-                thumbnail.height,
-                thumbnail.encoding.content_type(),
-                &thumbnail.data,
-            ))?;
-        }
-        drop(statement);
-        transaction.commit().context("committing thumbnail batch")?;
-        Ok(())
-    }
-
-    pub fn has_current(
-        &self,
-        asset_id: i64,
-        size_bucket: u16,
-        generator_version: u32,
-        fingerprint: SourceFingerprint,
-    ) -> Result<bool> {
-        validate_key(asset_id, size_bucket, generator_version)?;
-        let span = trace_span!(
-            "thumbnail_cache_lookup",
-            asset_id,
-            size_bucket,
-            generator_version,
-            current = field::Empty,
-        );
-        let _entered = span.enter();
-        let source_size = i64::try_from(fingerprint.size)
-            .context("source byte size exceeds SQLite's integer range")?;
-        let current = self.conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM thumbnails WHERE asset_id = ?1 AND size_bucket = ?2 AND generator_version = ?3 AND source_modified_ns = ?4 AND source_size = ?5)",
-                (
-                    asset_id,
-                    size_bucket,
-                    generator_version,
-                    fingerprint.modified_ns,
-                    source_size,
-                ),
-                |row| row.get(0),
-            )
-            .context("checking current thumbnail variant")?;
-        span.record("current", current);
-        Ok(current)
-    }
-
-    /// Remove variants from older generators after the current generator has been backfilled.
-    pub fn sweep_old_generators(&self, generator_version: u32) -> Result<usize> {
-        if generator_version == 0 {
-            bail!("generator version must be greater than zero");
-        }
-        self.conn
-            .execute(
-                "DELETE FROM thumbnails WHERE generator_version <> ?1",
-                [generator_version],
-            )
-            .context("sweeping stale thumbnail generator versions")
-    }
-
-    /// Remove variants from older generators for the specified catalog assets only.
-    pub fn sweep_old_generators_for_assets(
-        &self,
-        generator_version: u32,
-        asset_ids: impl IntoIterator<Item = i64>,
-    ) -> Result<usize> {
-        if generator_version == 0 {
-            bail!("generator version must be greater than zero");
-        }
-        let transaction = self.conn.unchecked_transaction()?;
-        let mut statement = transaction.prepare_cached(
-            "DELETE FROM thumbnails WHERE asset_id = ?1 AND generator_version <> ?2",
-        )?;
-        let mut deleted = 0;
-        for asset_id in asset_ids {
-            if asset_id <= 0 {
-                bail!("asset identifier must be greater than zero");
-            }
-            deleted += statement.execute((asset_id, generator_version))?;
-        }
-        drop(statement);
-        transaction
-            .commit()
-            .context("sweeping scoped stale thumbnail generators")?;
-        Ok(deleted)
-    }
-
-    /// Select the smallest current bucket that satisfies the requested physical size.
-    /// If none is large enough, return the largest current smaller bucket.
-    pub fn get(
-        &self,
-        asset_id: i64,
-        requested_physical_size: u32,
-        generator_version: u32,
-        fingerprint: SourceFingerprint,
-    ) -> Result<Option<Thumbnail>> {
-        if asset_id <= 0 {
-            bail!("asset identifier must be greater than zero");
-        }
-        if requested_physical_size == 0 {
-            bail!("requested physical size must be greater than zero");
-        }
-        if generator_version == 0 {
-            bail!("generator version must be greater than zero");
-        }
-        let span = trace_span!(
-            "thumbnail_cache_get",
-            asset_id,
-            requested_physical_size,
-            generator_version,
-            hit = field::Empty,
-            size_bucket = field::Empty,
-            data_bytes = field::Empty,
-        );
-        let _entered = span.enter();
-        let requested = i64::from(requested_physical_size);
-        let source_size = i64::try_from(fingerprint.size)
-            .context("source byte size exceeds SQLite's integer range")?;
-        let thumbnail = self.conn
-            .query_row(
-                "SELECT size_bucket, generator_version, width, height, encoding, data \
-                 FROM thumbnails \
-                 WHERE asset_id = ?1 AND generator_version = ?2 AND source_modified_ns = ?3 AND source_size = ?4 \
-                 ORDER BY CASE WHEN size_bucket >= ?5 THEN 0 ELSE 1 END, \
-                          CASE WHEN size_bucket >= ?5 THEN size_bucket END ASC, \
-                          CASE WHEN size_bucket < ?5 THEN size_bucket END DESC \
-                 LIMIT 1",
-                (
-                    asset_id,
-                    generator_version,
-                    fingerprint.modified_ns,
-                    source_size,
-                    requested,
-                ),
-                |row| {
-                    let encoding: String = row.get(4)?;
-                    Ok((
-                        row.get::<_, u16>(0)?,
-                        row.get::<_, u32>(1)?,
-                        row.get::<_, u32>(2)?,
-                        row.get::<_, u32>(3)?,
-                        encoding,
-                        row.get::<_, Vec<u8>>(5)?,
-                    ))
-                },
-            )
-            .optional()?
-            .map(|(size_bucket, generator_version, width, height, encoding, data)| -> Result<Thumbnail> {
-                Ok(Thumbnail {
-                    size_bucket,
-                    generator_version,
-                    width,
-                    height,
-                    encoding: ThumbnailEncoding::parse(&encoding)?,
-                    data,
-                })
-            })
-            .transpose()
-            .context("loading thumbnail variant")?;
-        if let Some(thumbnail) = &thumbnail {
-            span.record("hit", true);
-            span.record("size_bucket", thumbnail.size_bucket);
-            span.record("data_bytes", thumbnail.data.len());
-        } else {
-            span.record("hit", false);
-        }
-        Ok(thumbnail)
-    }
-
-    /// Delete every size and generator variant belonging to an asset.
-    pub fn delete_asset(&self, asset_id: i64) -> Result<usize> {
-        self.delete_assets(&[asset_id])
-    }
-
-    pub fn delete_assets(&self, asset_ids: &[i64]) -> Result<usize> {
-        if asset_ids.iter().any(|asset_id| *asset_id <= 0) {
-            bail!("asset identifiers must be greater than zero");
-        }
-        if asset_ids.is_empty() {
-            return Ok(0);
-        }
-        let transaction = self.conn.unchecked_transaction()?;
-        let deleted = {
-            let mut statement =
-                transaction.prepare("DELETE FROM thumbnails WHERE asset_id = ?1")?;
-            asset_ids.iter().try_fold(0usize, |deleted, asset_id| {
-                statement.execute([asset_id]).map(|count| deleted + count)
-            })?
-        };
-        transaction
-            .commit()
-            .context("committing asset thumbnail deletions")?;
-        Ok(deleted)
-    }
-}
-
-/// Decode all requested variants for one image in one source pass. Persistence is deliberately a
-/// separate stage: callers must hand the returned values to [`ThumbnailDb::store_batch`] before
-/// treating the variants as complete.
+/// Decode all requested variants for one image in one source pass. The caller persists them.
 pub fn decode_asset_variants(
     asset: &Asset,
     buckets: &[u16],
@@ -505,8 +199,7 @@ pub struct AssetGeneration {
     pub result: Result<GenerateSummary>,
 }
 
-/// Identifies one decoded thumbnail variant: the unit that single-flight dedup and the writer
-/// actor both key on.
+/// Key used by single-flight deduplication and persistence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct VariantKey {
     asset_id: i64,
@@ -570,8 +263,6 @@ impl Flight {
     }
 }
 
-/// `flights` is the single-flight registry; `writer`/`writer_thread` front the one thread allowed
-/// to touch the writable SQLite connection; `pool` runs decodes off that thread.
 struct ServiceInner {
     flights: Mutex<HashMap<VariantKey, Arc<Flight>>>,
     writer: mpsc::SyncSender<WriterCommand>,
@@ -581,15 +272,13 @@ struct ServiceInner {
     decode_count: AtomicUsize,
 }
 
-/// The process-wide thumbnail coordinator. It owns a bounded decode pool, a short-held
-/// single-flight registry, and the sole writable thumbnail database connection.
+/// Coordinates a bounded decode pool, single-flight registry, and one database writer.
 #[derive(Clone)]
 pub struct ThumbnailService {
     inner: Arc<ServiceInner>,
 }
 
-/// One request for the writer thread. Each variant carries its own reply channel so a caller
-/// blocks only on its own response, never on the rest of the queue.
+/// One request for the writer thread, with a command-specific reply channel.
 enum WriterCommand {
     Current {
         keys: Vec<VariantKey>,
@@ -612,6 +301,10 @@ enum WriterCommand {
         asset_ids: Vec<i64>,
         reply: mpsc::Sender<Result<usize, Arc<str>>>,
     },
+    Maintain {
+        catalog: camino::Utf8PathBuf,
+        reply: mpsc::Sender<Result<usize, Arc<str>>>,
+    },
     Shutdown {
         reply: mpsc::Sender<()>,
     },
@@ -630,11 +323,52 @@ struct Waiter {
 /// check, decode, and persist its missing buckets.
 struct Claimed {
     asset: Asset,
-    keys: Vec<VariantKey>,
-    flights: Vec<Arc<Flight>>,
-    /// Parallel to `keys`: whether the stored variant is already current. Filled in by
-    /// [`ThumbnailService::mark_current`].
-    current: Vec<bool>,
+    variants: Vec<ClaimedVariant>,
+}
+
+/// Ownership travels with each variant through decode and persistence. Unwinding anywhere in
+/// that pipeline must wake joiners and release the key for a later retry.
+struct ClaimedVariant {
+    key: VariantKey,
+    flight: Arc<Flight>,
+    service: Weak<ServiceInner>,
+    current: bool,
+    completed: bool,
+}
+
+impl ClaimedVariant {
+    fn complete(mut self, result: FlightResult) {
+        self.resolve(result);
+    }
+
+    fn resolve(&mut self, result: FlightResult) {
+        if let Some(service) = self.service.upgrade() {
+            let mut registry = service
+                .flights
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            self.flight.finish(result);
+            if registry
+                .get(&self.key)
+                .is_some_and(|registered| Arc::ptr_eq(registered, &self.flight))
+            {
+                registry.remove(&self.key);
+            }
+        } else {
+            self.flight.finish(result);
+        }
+        self.completed = true;
+    }
+}
+
+impl Drop for ClaimedVariant {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.resolve(FlightResult::Failed(
+                "thumbnail generation was interrupted".into(),
+            ));
+        }
+    }
 }
 
 impl Drop for ServiceInner {
@@ -684,13 +418,7 @@ impl ThumbnailService {
         })
     }
 
-    /// Durably ensure requested variants. An owner is elected before cache lookup; this closes
-    /// the lookup/claim race while registry synchronization remains limited to map operations.
-    ///
-    /// Each chunk moves through four stages: [`Self::claim_chunk`] elects an owner per variant,
-    /// [`Self::mark_current`] asks the writer which owned variants are already up to date,
-    /// [`Self::decode_claimed`] decodes only the stale ones, and [`Self::persist_decoded`] writes
-    /// and completes their flights. Every waiter — owner or joiner — then blocks on its flights.
+    /// Durably ensure requested variants. Claiming before cache lookup prevents duplicate owners.
     pub fn generate<F>(
         &self,
         assets: &[Asset],
@@ -738,11 +466,7 @@ impl ThumbnailService {
                 // call owns must still be woken, or its joiners would block forever.
                 Err(error) => {
                     for work in claimed {
-                        self.fail_all(
-                            work.keys,
-                            work.flights,
-                            anyhow::Error::msg(error.to_string()),
-                        );
+                        Self::fail_all(work.variants, Arc::clone(&error));
                     }
                 }
                 Ok(()) => {
@@ -755,9 +479,7 @@ impl ThumbnailService {
         generations
     }
 
-    /// Elect an owner for each requested `(asset, bucket)` pair. Electing before any cache lookup
-    /// closes the lookup/claim race: whoever wins `claim` is guaranteed to be the one who checks
-    /// and, if needed, decodes that variant.
+    /// Elect one owner for each requested `(asset, bucket)` pair before cache lookup.
     fn claim_chunk(
         &self,
         chunk: &[Asset],
@@ -777,8 +499,7 @@ impl ThumbnailService {
                 continue;
             }
             let mut flights = Vec::with_capacity(buckets.len());
-            let mut owner_keys = Vec::new();
-            let mut owner_flights = Vec::new();
+            let mut variants = Vec::new();
             for &size_bucket in buckets {
                 let key = VariantKey {
                     asset_id: asset.asset_id,
@@ -786,11 +507,10 @@ impl ThumbnailService {
                     generator_version,
                     fingerprint: asset.fingerprint,
                 };
-                let (flight, is_owner) = self.claim(key);
-                flights.push(Arc::clone(&flight));
-                if is_owner {
-                    owner_keys.push(key);
-                    owner_flights.push(flight);
+                let (flight, owner) = self.claim(key);
+                flights.push(flight);
+                if let Some(owner) = owner {
+                    variants.push(owner);
                 } else {
                     tracing::debug!(
                         asset_id = asset.asset_id,
@@ -799,12 +519,10 @@ impl ThumbnailService {
                     );
                 }
             }
-            if !owner_keys.is_empty() {
+            if !variants.is_empty() {
                 claimed.push(Claimed {
                     asset: asset.clone(),
-                    keys: owner_keys,
-                    flights: owner_flights,
-                    current: Vec::new(),
+                    variants,
                 });
             }
             waiters.push(Waiter {
@@ -816,14 +534,14 @@ impl ThumbnailService {
         (waiters, claimed)
     }
 
-    /// Ask the writer which claimed variants are already current, and fill in `claimed[_].current`
+    /// Ask the writer which claimed variants are already current, and record each result
     /// so [`Self::decode_claimed`] only decodes what actually changed. `force` skips the query.
     fn mark_current(&self, claimed: &mut [Claimed], force: bool) -> Result<(), Arc<str>> {
         // One flat request covers every owned key across the whole chunk in a single round trip
-        // to the writer thread; the offsets below split the flat reply back out per asset.
+        // to the writer thread; both traversals preserve asset and bucket order.
         let keys: Vec<_> = claimed
             .iter()
-            .flat_map(|work| work.keys.iter().copied())
+            .flat_map(|work| work.variants.iter().map(|variant| variant.key))
             .collect();
         let current: Vec<bool> = if force {
             vec![false; keys.len()]
@@ -832,11 +550,12 @@ impl ThumbnailService {
                 .context("checking thumbnail cache")
                 .map_err(|error| Arc::<str>::from(format!("{error:#}")))?
         };
-        let mut offset = 0;
-        for work in claimed.iter_mut() {
-            let end = offset + work.keys.len();
-            work.current = current[offset..end].to_vec();
-            offset = end;
+        for (variant, current) in claimed
+            .iter_mut()
+            .flat_map(|work| &mut work.variants)
+            .zip(current)
+        {
+            variant.current = current;
         }
         Ok(())
     }
@@ -858,10 +577,9 @@ impl ThumbnailService {
                 .map(|work| {
                     let _entered = parent.enter();
                     let buckets: Vec<_> = work
-                        .keys
+                        .variants
                         .iter()
-                        .zip(&work.current)
-                        .filter_map(|(key, current)| (!*current).then_some(key.size_bucket))
+                        .filter_map(|variant| (!variant.current).then_some(variant.key.size_bucket))
                         .collect();
                     let variants = if buckets.is_empty() {
                         Ok(Vec::new())
@@ -877,7 +595,7 @@ impl ThumbnailService {
                         let result = decode_asset_variants(
                             &work.asset,
                             &buckets,
-                            work.keys[0].generator_version,
+                            work.variants[0].key.generator_version,
                         );
                         active(&work.asset, false);
                         result
@@ -900,7 +618,7 @@ impl ThumbnailService {
                     variants.extend(decoded);
                     persisted.push(work);
                 }
-                Err(error) => self.fail_all(work.keys, work.flights, error),
+                Err(error) => Self::fail_all(work.variants, format!("{error:#}").into()),
             }
         }
         let stored: Result<(), Arc<str>> = if variants.is_empty() {
@@ -912,15 +630,13 @@ impl ThumbnailService {
         // A variant that was already current is `Cached` regardless of whether this batch write
         // succeeded; only the newly-decoded variants share the batch's outcome.
         for work in persisted {
-            for ((key, flight), current) in
-                work.keys.into_iter().zip(work.flights).zip(work.current)
-            {
-                let result = match (&stored, current) {
+            for variant in work.variants {
+                let result = match (&stored, variant.current) {
                     (_, true) => FlightResult::Cached,
                     (Ok(()), false) => FlightResult::Stored,
                     (Err(error), false) => FlightResult::Failed(Arc::clone(error)),
                 };
-                self.complete(key, flight, result);
+                variant.complete(result);
             }
         }
     }
@@ -972,55 +688,48 @@ impl ThumbnailService {
         })
     }
 
+    /// Serialize orphan pruning and SQLite maintenance with all other thumbnail mutations.
+    pub fn prune_orphans_and_maintain(&self, catalog: camino::Utf8PathBuf) -> Result<usize> {
+        self.request(|reply| WriterCommand::Maintain { catalog, reply })
+    }
+
     /// Join the flight for `key`, creating and registering it as the owner if none exists yet.
-    /// The bool reports ownership: `true` means the caller must drive this variant to completion.
-    fn claim(&self, key: VariantKey) -> (Arc<Flight>, bool) {
+    /// A new flight returns an ownership guard; a joined flight has no guard.
+    fn claim(&self, key: VariantKey) -> (Arc<Flight>, Option<ClaimedVariant>) {
         let mut registry = self
             .inner
             .flights
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         if let Some(flight) = registry.get(&key) {
-            return (Arc::clone(flight), false);
+            return (Arc::clone(flight), None);
         }
         let flight = Arc::new(Flight::new());
         registry.insert(key, Arc::clone(&flight));
+        let owner = ClaimedVariant {
+            key,
+            flight: Arc::clone(&flight),
+            service: Arc::downgrade(&self.inner),
+            current: false,
+            completed: false,
+        };
+        drop(registry);
         tracing::debug!(
             asset_id = key.asset_id,
             size_bucket = key.size_bucket,
             "thumbnail flight owner"
         );
-        (flight, true)
-    }
-
-    /// Wake every waiter on `flight` and, if it is still the registered owner for `key`, evict it
-    /// so a future request starts a fresh flight instead of joining a finished one.
-    fn complete(&self, key: VariantKey, flight: Arc<Flight>, result: FlightResult) {
-        flight.finish(result);
-        let mut registry = self
-            .inner
-            .flights
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if registry
-            .get(&key)
-            .is_some_and(|registered| Arc::ptr_eq(registered, &flight))
-        {
-            registry.remove(&key);
-        }
+        (flight, Some(owner))
     }
 
     /// Complete every listed flight as `Failed` with the same shared error message.
-    fn fail_all(&self, keys: Vec<VariantKey>, flights: Vec<Arc<Flight>>, error: anyhow::Error) {
-        let error: Arc<str> = format!("{error:#}").into();
-        for (key, flight) in keys.into_iter().zip(flights) {
-            self.complete(key, flight, FlightResult::Failed(Arc::clone(&error)));
+    fn fail_all(variants: Vec<ClaimedVariant>, error: Arc<str>) {
+        for variant in variants {
+            variant.complete(FlightResult::Failed(Arc::clone(&error)));
         }
     }
 
-    /// Send one command to the writer thread and block for its reply. Every public mutation and
-    /// lookup on [`ThumbnailService`] funnels through here, which is what keeps SQLite access
-    /// confined to the single writer thread.
+    /// Send one command to the writer thread and block for its reply.
     fn request<T>(
         &self,
         command: impl FnOnce(mpsc::Sender<Result<T, Arc<str>>>) -> WriterCommand,
@@ -1042,8 +751,7 @@ impl ThumbnailService {
     }
 }
 
-/// The single writer actor. It owns the only writable connection and drains `receiver` until
-/// `Shutdown`, so every database mutation in the process is serialized through this one thread.
+/// Own the writable connection and serialize database mutations until shutdown.
 fn thumbnail_writer(path: camino::Utf8PathBuf, receiver: mpsc::Receiver<WriterCommand>) {
     // The connection opens lazily and retries on every command until it succeeds. A one-shot
     // open here would otherwise wedge the service for the rest of the process's life if it lost
@@ -1090,6 +798,13 @@ fn thumbnail_writer(path: camino::Utf8PathBuf, receiver: mpsc::Receiver<WriterCo
                     database.sweep_old_generators_for_assets(generator_version, asset_ids)
                 }));
             }
+            WriterCommand::Maintain { catalog, reply } => {
+                let _ = reply.send(respond(&mut database, &path, |database| {
+                    let deleted = database.prune_orphans(&catalog)?;
+                    database.maintain()?;
+                    Ok(deleted)
+                }));
+            }
             WriterCommand::Shutdown { reply } => {
                 let _ = reply.send(());
                 break;
@@ -1098,10 +813,7 @@ fn thumbnail_writer(path: camino::Utf8PathBuf, receiver: mpsc::Receiver<WriterCo
     }
 }
 
-/// Ensure the writer's connection is open — retrying a previously failed open, since whatever
-/// caused it (e.g. an unmounted drive) may have cleared by the time the next command arrives —
-/// then run one database operation against it, collapsing either error into the `Arc<str>` every
-/// reply channel expects.
+/// Open or reuse the writer connection, retrying a failed open on each command.
 fn respond<T>(
     database: &mut Option<ThumbnailDb>,
     path: &Path,
@@ -1145,16 +857,16 @@ mod tests {
         fingerprint: SourceFingerprint,
     ) -> Result<()> {
         let data = png()?;
-        db.put(
-            42,
-            bucket,
-            version,
+        db.put(DecodedThumbnail {
+            asset_id: 42,
+            size_bucket: bucket,
+            generator_version: version,
             fingerprint,
-            1,
-            1,
-            ThumbnailEncoding::Png,
-            &data,
-        )
+            width: 1,
+            height: 1,
+            encoding: ThumbnailEncoding::Png,
+            data: data.to_vec(),
+        })
     }
 
     #[test]
@@ -1230,8 +942,26 @@ mod tests {
         let temp = TempDir::new()?;
         let db = test_db(&temp)?;
         put(&db, 256, 1, CURRENT)?;
-        db.put(7, 256, 1, CURRENT, 1, 1, ThumbnailEncoding::Png, &png()?)?;
-        db.put(7, 256, 2, CURRENT, 1, 1, ThumbnailEncoding::Png, &png()?)?;
+        db.put(DecodedThumbnail {
+            asset_id: 7,
+            size_bucket: 256,
+            generator_version: 1,
+            fingerprint: CURRENT,
+            width: 1,
+            height: 1,
+            encoding: ThumbnailEncoding::Png,
+            data: png()?,
+        })?;
+        db.put(DecodedThumbnail {
+            asset_id: 7,
+            size_bucket: 256,
+            generator_version: 2,
+            fingerprint: CURRENT,
+            width: 1,
+            height: 1,
+            encoding: ThumbnailEncoding::Png,
+            data: png()?,
+        })?;
 
         assert_eq!(db.sweep_old_generators_for_assets(2, [7])?, 1);
         assert_eq!(db.get(7, 256, 1, CURRENT)?, None);
@@ -1247,7 +977,16 @@ mod tests {
         put(&db, 128, 1, CURRENT)?;
         put(&db, 256, 1, CURRENT)?;
         put(&db, 256, 2, CURRENT)?;
-        db.put(7, 128, 1, CURRENT, 1, 1, ThumbnailEncoding::Png, &png()?)?;
+        db.put(DecodedThumbnail {
+            asset_id: 7,
+            size_bucket: 128,
+            generator_version: 1,
+            fingerprint: CURRENT,
+            width: 1,
+            height: 1,
+            encoding: ThumbnailEncoding::Png,
+            data: png()?,
+        })?;
 
         assert_eq!(db.delete_assets(&[42, 7])?, 4);
         assert_eq!(db.get(42, 128, 1, CURRENT)?, None);
@@ -1263,12 +1002,30 @@ mod tests {
         let data = png()?;
 
         let error = db
-            .put(42, 128, 1, CURRENT, 2, 1, ThumbnailEncoding::Png, &data)
+            .put(DecodedThumbnail {
+                asset_id: 42,
+                size_bucket: 128,
+                generator_version: 1,
+                fingerprint: CURRENT,
+                width: 2,
+                height: 1,
+                encoding: ThumbnailEncoding::Png,
+                data: data.to_vec(),
+            })
             .unwrap_err();
         assert!(error.to_string().contains("not the declared 2x1"));
 
         let error = db
-            .put(42, 128, 1, CURRENT, 1, 1, ThumbnailEncoding::Jpeg, &data)
+            .put(DecodedThumbnail {
+                asset_id: 42,
+                size_bucket: 128,
+                generator_version: 1,
+                fingerprint: CURRENT,
+                width: 1,
+                height: 1,
+                encoding: ThumbnailEncoding::Jpeg,
+                data: data.to_vec(),
+            })
             .unwrap_err();
         assert!(
             error
@@ -1277,16 +1034,16 @@ mod tests {
         );
 
         let error = db
-            .put(
-                42,
-                128,
-                1,
-                CURRENT,
-                1,
-                1,
-                ThumbnailEncoding::Png,
-                &data[..16],
-            )
+            .put(DecodedThumbnail {
+                asset_id: 42,
+                size_bucket: 128,
+                generator_version: 1,
+                fingerprint: CURRENT,
+                width: 1,
+                height: 1,
+                encoding: ThumbnailEncoding::Png,
+                data: data[..16].to_vec(),
+            })
             .unwrap_err();
         assert!(
             error
@@ -1438,14 +1195,86 @@ mod tests {
             generator_version: GENERATOR_VERSION,
             fingerprint: asset.fingerprint,
         };
-        let (owner, owner_claimed) = service.claim(key);
+        let (_, owner_claimed) = service.claim(key);
         let (waiter, waiter_claimed) = service.claim(key);
-        assert!(owner_claimed);
-        assert!(!waiter_claimed);
-        service.fail_all(vec![key], vec![owner], anyhow::anyhow!("decode failed"));
+        assert!(waiter_claimed.is_none());
+        ThumbnailService::fail_all(vec![owner_claimed.unwrap()], "decode failed".into());
         assert!(matches!(waiter.wait(), FlightResult::Failed(_)));
         let (_, retry_claimed) = service.claim(key);
-        assert!(retry_claimed);
+        assert!(retry_claimed.is_some());
         Ok(())
+    }
+
+    fn callback_panic_releases_owned_variants(panic_on_active: bool) -> Result<()> {
+        let temp = TempDir::new()?;
+        let service = service(&temp)?;
+        let asset = service_asset(&temp, "source.png")?;
+        let (entered, callback_entered) = mpsc::channel();
+        let (release, callback_release) = mpsc::channel();
+        let callback_release = Mutex::new(callback_release);
+        let owner = {
+            let service = service.clone();
+            let asset = asset.clone();
+            thread::spawn(move || {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    service.generate_observed(
+                        &[asset],
+                        &[128, 256],
+                        GENERATOR_VERSION,
+                        false,
+                        || false,
+                        |_, active| {
+                            if active == panic_on_active {
+                                entered.send(()).unwrap();
+                                callback_release.lock().unwrap().recv().unwrap();
+                                panic!("observer failed");
+                            }
+                        },
+                    )
+                }))
+                .is_err()
+            })
+        };
+        callback_entered.recv_timeout(Duration::from_secs(10))?;
+        // Join while the owner is inside the callback, before allowing it to unwind.
+        let (waiters, claimed) =
+            service.claim_chunk(std::slice::from_ref(&asset), &[128, 256], GENERATOR_VERSION);
+        assert!(claimed.is_empty());
+        let (finished, results) = mpsc::channel();
+        let waiter = thread::spawn(move || {
+            let failures: Vec<_> = waiters
+                .into_iter()
+                .flat_map(|waiter| waiter.flights)
+                .map(|flight| matches!(flight.wait(), FlightResult::Failed(_)))
+                .collect();
+            let _ = finished.send(failures);
+        });
+        release.send(())?;
+        assert!(owner.join().expect("panic was caught in owner"));
+        assert_eq!(results.recv_timeout(Duration::from_secs(10))?, [true, true]);
+        waiter.join().expect("waiter should not panic");
+        assert!(service.inner.flights.lock().unwrap().is_empty());
+
+        let retry = service.generate(
+            std::slice::from_ref(&asset),
+            &[128, 256],
+            GENERATOR_VERSION,
+            false,
+            || false,
+        );
+        assert_eq!(retry[0].result.as_ref().unwrap().generated, 2);
+        let cached = service.generate(&[asset], &[128, 256], GENERATOR_VERSION, false, || false);
+        assert_eq!(cached[0].result.as_ref().unwrap().skipped, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn callback_panic_before_decode_wakes_joiners_and_allows_retry() -> Result<()> {
+        callback_panic_releases_owned_variants(true)
+    }
+
+    #[test]
+    fn callback_panic_after_decode_wakes_joiners_and_allows_retry() -> Result<()> {
+        callback_panic_releases_owned_variants(false)
     }
 }

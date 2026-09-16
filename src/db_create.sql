@@ -32,7 +32,9 @@ CREATE TRIGGER ocr_results_delete AFTER DELETE ON ocr_results BEGIN
     INSERT INTO ocr_results_fts(ocr_results_fts, rowid, content) VALUES ('delete', old.asset_id, old.content);
     INSERT INTO ocr_results_words_fts(ocr_results_words_fts, rowid, content) VALUES ('delete', old.asset_id, old.content);
 END;
-CREATE TRIGGER ocr_results_update AFTER UPDATE ON ocr_results BEGIN
+-- Bookkeeping and unchanged OCR writes must not rebuild either text index.
+CREATE TRIGGER ocr_results_update AFTER UPDATE OF asset_id, content ON ocr_results
+WHEN old.asset_id IS NOT new.asset_id OR old.content IS NOT new.content BEGIN
     INSERT INTO ocr_results_fts(ocr_results_fts, rowid, content) VALUES ('delete', old.asset_id, old.content);
     INSERT INTO ocr_results_fts(rowid, content) VALUES (new.asset_id, new.content);
     INSERT INTO ocr_results_words_fts(ocr_results_words_fts, rowid, content) VALUES ('delete', old.asset_id, old.content);
@@ -56,5 +58,5 @@ CREATE TABLE ocr_embedding_state(
     source_size INTEGER NOT NULL CHECK(source_size >= 0),
     PRIMARY KEY(space, asset_id)
 );
-PRAGMA user_version = 8;
+PRAGMA user_version = 10;
 COMMIT;

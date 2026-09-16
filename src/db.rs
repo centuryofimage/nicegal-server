@@ -1,20 +1,27 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Once;
-use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use camino::{Utf8Path as Path, Utf8PathBuf as PathBuf};
 use rusqlite::types::Value;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, ToSql, params_from_iter};
+use rusqlite::{Connection, OptionalExtension, ToSql, params_from_iter};
 use sqlite_vec::sqlite3_vec_init;
 use tracing::{Span, field, info, instrument};
 
 use crate::assets::{SourceFingerprint, Timeline};
-use crate::schema::{check_schema_read_only, open_schema};
+use crate::schema::{check_schema_read_only, open_schema_with_migrations};
+use crate::storage::{
+    READ_ONLY_FLAGS, configure_reader, configure_writer, maintain, path_prefix_like,
+    validate_asset_ids,
+};
 
-const SCHEMA_VERSION: i32 = 8;
+const SCHEMA_VERSION: i32 = 10;
 const SCHEMA_LABEL: &str = "OCR database";
+const MIGRATIONS: &[(i32, &str)] = &[
+    (8, include_str!("migrations/ocr_8_to_9.sql")),
+    (9, "VACUUM;"),
+];
 
 /// Whether OCR data exists for an asset and still matches its catalog fingerprint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,13 +84,6 @@ fn execution_error(error: rusqlite::Error) -> anyhow::Error {
 /// Callers render these inline, so fold the runs of whitespace into single spaces.
 fn collapse_whitespace(message: &str) -> String {
     message.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn validate_asset_ids(asset_ids: &[i64]) -> Result<()> {
-    if asset_ids.iter().any(|asset_id| *asset_id <= 0) {
-        bail!("asset identifiers must be greater than zero");
-    }
-    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -177,7 +177,7 @@ impl<'a> SearchFilters<'a> {
             "\n               AND {} LIKE :root ESCAPE '#'",
             scope.path_column
         ));
-        params.push((":root", Value::Text(path_to_like(self.root))));
+        params.push((":root", Value::Text(path_prefix_like(self.root))));
 
         if let Some(exclude) = self.exclude_glob {
             sql.push_str(&format!(
@@ -334,11 +334,8 @@ impl DB {
         }
         register_vector_extension();
         let conn = Connection::open(path)?;
-        conn.busy_timeout(Duration::from_secs(5))?;
-        conn.pragma_update(None, "auto_vacuum", "FULL")?;
+        configure_writer(&conn)?;
         configure_vector_reads(&conn)?;
-        conn.pragma_update(None, "journal_mode", "wal")?;
-        conn.pragma_update(None, "synchronous", "normal")?;
         // `ocr_embedding_state` cascades from `ocr_results`, which SQLite only honours with
         // enforcement switched on. It is per-connection, so writers must set it every open.
         conn.pragma_update(None, "foreign_keys", true)?;
@@ -347,11 +344,12 @@ impl DB {
         register_glob(&conn)?;
         register_word_glob(&conn)?;
 
-        open_schema(
+        open_schema_with_migrations(
             &conn,
             SCHEMA_LABEL,
             SCHEMA_VERSION,
             include_str!("db_create.sql"),
+            MIGRATIONS,
         )?;
         Ok(Self { conn })
     }
@@ -359,11 +357,8 @@ impl DB {
     /// Open a query-only connection suitable for concurrent HTTP search while an index job writes.
     pub fn new_read_only(path: &Path) -> Result<Self> {
         register_vector_extension();
-        let conn = Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-        conn.busy_timeout(Duration::from_secs(5))?;
+        let conn = Connection::open_with_flags(path, READ_ONLY_FLAGS)?;
+        configure_reader(&conn)?;
         configure_vector_reads(&conn)?;
         #[cfg(feature = "regex")]
         register_regex(&conn)?;
@@ -371,6 +366,39 @@ impl DB {
         register_word_glob(&conn)?;
         check_schema_read_only(&conn, SCHEMA_LABEL, SCHEMA_VERSION)?;
         Ok(Self { conn })
+    }
+
+    /// Remove OCR rows and vectors whose owning catalog asset no longer exists.
+    pub fn prune_orphans(&mut self, catalog: &Path) -> Result<usize> {
+        self.conn
+            .execute(
+                "ATTACH DATABASE ?1 AS maintenance_catalog",
+                [catalog.as_str()],
+            )
+            .with_context(|| format!("attaching asset catalog for OCR pruning: {catalog}"))?;
+        let result = (|| {
+            let deleted = self
+                .conn
+                .execute(
+                    "DELETE FROM ocr_results
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM maintenance_catalog.assets
+                     WHERE assets.asset_id = ocr_results.asset_id
+                 )",
+                    [],
+                )
+                .context("pruning orphaned OCR rows")?;
+            self.sweep_text_embeddings()?;
+            Ok(deleted)
+        })();
+        self.conn
+            .execute_batch("DETACH DATABASE maintenance_catalog")
+            .context("detaching asset catalog after OCR pruning")?;
+        result
+    }
+
+    pub fn maintain(&self) -> Result<()> {
+        maintain(&self.conn).context("maintaining OCR database")
     }
 
     /// Current OCR text's embedding status: None means no current OCR row, the pair is
@@ -512,9 +540,19 @@ impl DB {
         let tx = self.conn.transaction()?;
         let rowchanges = {
             let mut statement = tx.prepare_cached(
-                "INSERT INTO ocr_results (asset_id, source_path, source_modified_ns, exif_taken_ns, source_size, width, height, content) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
-                 ON CONFLICT(asset_id) DO UPDATE SET source_path=excluded.source_path, source_modified_ns=excluded.source_modified_ns, exif_taken_ns=excluded.exif_taken_ns, source_size=excluded.source_size, width=excluded.width, height=excluded.height, content=excluded.content, mark_delete=FALSE",
+                "INSERT INTO ocr_results (
+                     asset_id, source_path, source_modified_ns, exif_taken_ns,
+                     source_size, width, height, content
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(asset_id) DO UPDATE SET
+                     source_path = excluded.source_path,
+                     source_modified_ns = excluded.source_modified_ns,
+                     exif_taken_ns = excluded.exif_taken_ns,
+                     source_size = excluded.source_size,
+                     width = excluded.width,
+                     height = excluded.height,
+                     content = excluded.content,
+                     mark_delete = FALSE",
             )?;
             let mut changed = 0;
             for result in results {
@@ -547,7 +585,7 @@ impl DB {
         )?;
         self.conn.execute(
             "UPDATE ocr_results SET mark_delete = TRUE WHERE source_path LIKE ?1 ESCAPE '#'",
-            [path_to_like(path)],
+            [path_prefix_like(path)],
         )?;
         Ok(())
     }
@@ -652,14 +690,11 @@ impl DB {
                    snippet(ocr_results_fts, -1, '{open}', '{close}', '..', 64),
                    ocr_results.source_path, ocr_results.source_modified_ns,
                    ocr_results.width, ocr_results.height, bm25(ocr_results_fts)
-              FROM ocr_results_fts
-              INNER JOIN ocr_results ON ocr_results_fts.rowid = ocr_results.asset_id
-             WHERE ocr_results_fts.content {operator} :query{filters}
+              {source}
              ORDER BY RANK, ocr_results.source_modified_ns DESC
              LIMIT :limit;
             "#,
-            operator = search_operator(kind),
-            filters = bound.sql,
+            source = ocr_search_source(kind, &bound.sql),
             open = SNIPPET_OPEN,
             close = SNIPPET_CLOSE,
         ))?;
@@ -715,12 +750,9 @@ impl DB {
         let mut statement = self.conn.prepare_cached(&format!(
             r#"
             SELECT count(*)
-              FROM ocr_results_fts
-              INNER JOIN ocr_results ON ocr_results_fts.rowid = ocr_results.asset_id
-             WHERE ocr_results_fts.content {operator} :query{filters};
+              {source};
             "#,
-            operator = search_operator(kind),
-            filters = bound.sql,
+            source = ocr_search_source(kind, &bound.sql),
         ))?;
         let params = bound.extend([(":query", Value::Text(search_query(&queries, kind)))]);
         let count: i64 = statement
@@ -743,11 +775,7 @@ impl DB {
         let bound = filters.bind(FilterScope::OCR_ROWS)?;
         let mut statement = self.conn.prepare_cached(&format!(
             r#"
-            WITH matching_terms AS (
-                SELECT term
-                  FROM ocr_results_words_vocab
-                 WHERE rust_word_glob(:query, term)
-            ),
+            {matching_terms},
             matching_documents AS (
                 SELECT vocabulary.doc, count(*) AS matching_words
                   FROM ocr_results_words_vocab_instance AS vocabulary
@@ -758,13 +786,12 @@ impl DB {
             SELECT ocr_results.asset_id, substr(ocr_results.content, 1, 512),
                    ocr_results.source_path, ocr_results.source_modified_ns,
                    ocr_results.width, ocr_results.height, matching_documents.matching_words
-              FROM matching_documents
-              INNER JOIN ocr_results ON matching_documents.doc = ocr_results.asset_id
-             WHERE 1 = 1{filters}
+              {source}
              ORDER BY matching_documents.matching_words DESC, ocr_results.source_modified_ns DESC
              LIMIT :limit;
             "#,
-            filters = bound.sql,
+            matching_terms = GLOB_MATCHING_TERMS,
+            source = glob_search_source(&bound.sql),
         ))?;
         let params = bound.extend([
             (
@@ -811,11 +838,7 @@ impl DB {
         let bound = filters.bind(FilterScope::OCR_ROWS)?;
         let mut statement = self.conn.prepare_cached(&format!(
             r#"
-            WITH matching_terms AS (
-                SELECT term
-                  FROM ocr_results_words_vocab
-                 WHERE rust_word_glob(:query, term)
-            ),
+            {matching_terms},
             matching_documents AS (
                 SELECT DISTINCT vocabulary.doc
                   FROM ocr_results_words_vocab_instance AS vocabulary
@@ -823,11 +846,10 @@ impl DB {
                  WHERE vocabulary.col = 'content'
             )
             SELECT count(*)
-              FROM matching_documents
-              INNER JOIN ocr_results ON matching_documents.doc = ocr_results.asset_id
-             WHERE 1 = 1{filters};
+              {source};
             "#,
-            filters = bound.sql,
+            matching_terms = GLOB_MATCHING_TERMS,
+            source = glob_search_source(&bound.sql),
         ))?;
         let params = bound.extend([(
             ":query",
@@ -849,46 +871,21 @@ impl DB {
         limit: usize,
         kind: SearchType,
     ) -> Result<(usize, Vec<SearchResult>)> {
-        self.conn
-            .execute_batch("BEGIN DEFERRED")
-            .context("starting OCR search snapshot")?;
-        let result = (|| {
-            let total = self.search_count(queries.clone(), filters, kind)?;
-            let results = self.search(queries, filters, limit, kind)?;
+        self.read_snapshot(|db| {
+            let total = db.search_count(queries.clone(), filters, kind)?;
+            let results = db.search(queries, filters, limit, kind)?;
             Ok((total, results))
-        })();
-        match result {
-            Ok(value) => {
-                self.conn
-                    .execute_batch("COMMIT")
-                    .context("committing OCR search snapshot")?;
-                Ok(value)
-            }
-            Err(error) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(error)
-            }
-        }
+        })
     }
 
     /// Run several queries against one WAL snapshot so a client combining search modes cannot see
     /// an index job commit between them and rank two inconsistent result sets together.
     pub fn read_snapshot<T>(&mut self, queries: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
-        self.conn
-            .execute_batch("BEGIN DEFERRED")
+        let mut snapshot = crate::storage::ReadSnapshot::begin(self, |db| &db.conn)
             .context("starting OCR read snapshot")?;
-        match queries(self) {
-            Ok(value) => {
-                self.conn
-                    .execute_batch("COMMIT")
-                    .context("committing OCR read snapshot")?;
-                Ok(value)
-            }
-            Err(error) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(error)
-            }
-        }
+        let value = queries(snapshot.target)?;
+        snapshot.commit().context("committing OCR read snapshot")?;
+        Ok(value)
     }
 
     /// The model a space's stored vectors were produced by, or `None` when nothing has been
@@ -1365,6 +1362,29 @@ fn search_query(queries: &[&str], kind: SearchType) -> String {
     }
 }
 
+const GLOB_MATCHING_TERMS: &str = "WITH matching_terms AS (
+    SELECT term FROM ocr_results_words_vocab WHERE rust_word_glob(:query, term)
+)";
+
+fn glob_search_source(filters: &str) -> String {
+    format!(
+        "FROM matching_documents \
+        INNER JOIN ocr_results ON matching_documents.doc = ocr_results.asset_id \
+        WHERE 1 = 1{filters}"
+    )
+}
+
+/// Keep result and count queries on identical joins and predicates.
+fn ocr_search_source(kind: SearchType, filters: &str) -> String {
+    format!(
+        "FROM ocr_results_fts \
+        INNER JOIN ocr_results ON ocr_results_fts.rowid = ocr_results.asset_id \
+        WHERE ocr_results_fts.content {} :query{}",
+        search_operator(kind),
+        filters
+    )
+}
+
 fn search_operator(kind: SearchType) -> &'static str {
     match kind {
         SearchType::Simple | SearchType::Match => "MATCH",
@@ -1524,20 +1544,6 @@ pub struct SearchResult {
     pub score: f64,
 }
 
-fn path_to_like(path: &Path) -> String {
-    let mut prefix = path.as_str().to_owned();
-    if !prefix.ends_with(['/', '\\']) {
-        prefix.push(std::path::MAIN_SEPARATOR);
-    }
-    format!(
-        "{}%",
-        prefix
-            .replace('#', "##")
-            .replace('%', "#%")
-            .replace('_', "#_")
-    )
-}
-
 #[cfg(feature = "regex")]
 fn register_regex(db: &Connection) -> Result<()> {
     use regex::Regex;
@@ -1618,6 +1624,113 @@ mod tests {
     use tempfile::TempDir;
 
     const SPACE: TextEmbeddingSpace = TextEmbeddingSpace::OcrText;
+
+    #[test]
+    fn fresh_and_migrated_ocr_indexes_ignore_bookkeeping_updates() -> Result<()> {
+        for migrate in [false, true] {
+            let temp = TempDir::new()?;
+            let path = PathBuf::try_from(temp.path().join("ocr.db"))?;
+            if migrate {
+                let conn = Connection::open(&path)?;
+                let version_eight = include_str!("db_create.sql")
+                    .replace("\r\n", "\n")
+                    .replace(
+                        "AFTER UPDATE OF asset_id, content ON ocr_results\nWHEN old.asset_id IS NOT new.asset_id OR old.content IS NOT new.content BEGIN",
+                        "AFTER UPDATE ON ocr_results BEGIN",
+                    )
+                    .replace("PRAGMA user_version = 10;", "PRAGMA user_version = 8;");
+                conn.execute_batch(&version_eight)?;
+                conn.execute("INSERT INTO ocr_results(asset_id, source_path, source_modified_ns, source_size, width, height, content) VALUES (1, 'retained.png', 1, 1, 1, 1, 'original')", [])?;
+                let before = conn.total_changes();
+                conn.execute(
+                    "UPDATE ocr_results SET mark_delete = FALSE WHERE asset_id = 1",
+                    [],
+                )?;
+                assert!(
+                    conn.total_changes() - before > 1,
+                    "fixture must reproduce the old trigger's FTS churn"
+                );
+            }
+            let mut db = DB::new(&path)?;
+            if migrate {
+                let content: String = db.conn.query_row(
+                    "SELECT content FROM ocr_results WHERE asset_id = 1",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(content, "original");
+            } else {
+                db.save_results(vec![result(&temp, 1, "original")?])?;
+            }
+            check_schema_read_only(&db.conn, SCHEMA_LABEL, SCHEMA_VERSION)?;
+            for sql in [
+                "UPDATE ocr_results SET mark_delete = TRUE WHERE asset_id = 1",
+                "UPDATE ocr_results SET mark_delete = FALSE WHERE asset_id = 1",
+                "UPDATE ocr_results SET source_modified_ns = 2 WHERE asset_id = 1",
+                "UPDATE ocr_results SET content = content WHERE asset_id = 1",
+            ] {
+                let before = db.conn.total_changes();
+                db.conn.execute(sql, [])?;
+                assert_eq!(
+                    db.conn.total_changes() - before,
+                    1,
+                    "FTS churn for {sql}, migrated={migrate}"
+                );
+            }
+            db.conn.execute(
+                "UPDATE ocr_results SET content = 'replacement', asset_id = 2 WHERE asset_id = 1",
+                [],
+            )?;
+            for table in ["ocr_results_fts", "ocr_results_words_fts"] {
+                let rows: i64 = db.conn.query_row(
+                    &format!("SELECT count(*) FROM {table} WHERE {table} MATCH 'original'"),
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(rows, 0);
+                let id: i64 = db.conn.query_row(
+                    &format!("SELECT rowid FROM {table} WHERE {table} MATCH 'replacement'"),
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(id, 2);
+            }
+            db.conn
+                .execute("DELETE FROM ocr_results WHERE asset_id = 2", [])?;
+            for table in ["ocr_results_fts", "ocr_results_words_fts"] {
+                let rows: i64 = db.conn.query_row(
+                    &format!("SELECT count(*) FROM {table} WHERE {table} MATCH 'replacement'"),
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(rows, 0);
+            }
+            drop(db);
+            // Reopening an already upgraded database must be a no-op.
+            DB::new(&path)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn read_snapshot_releases_transaction_after_errors_and_panics() -> Result<()> {
+        let temp = TempDir::new()?;
+        let mut db = test_db(&temp)?;
+        let failure = db.read_snapshot::<()>(|_| anyhow::bail!("query failed"));
+        assert!(failure.is_err());
+        assert!(db.conn.is_autocommit());
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = db.read_snapshot::<()>(|_| panic!("query panicked"));
+        }));
+        assert!(panic.is_err());
+        assert!(db.conn.is_autocommit());
+        db.read_snapshot(|db| {
+            assert!(!db.conn.is_autocommit());
+            Ok(())
+        })?;
+        assert!(db.conn.is_autocommit());
+        Ok(())
+    }
 
     fn test_db(temp: &TempDir) -> Result<DB> {
         DB::new(&PathBuf::try_from(temp.path().join("ocr.db"))?)

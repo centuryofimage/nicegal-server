@@ -47,22 +47,15 @@ struct Args {
     #[arg(long, env = "NICEGAL_IMAGE_MODEL", value_name = "MODEL")]
     image_model: Option<ImageEmbeddingModel>,
 
-    /// ONNX Runtime execution provider every `ocrModelLoad` job requests. Falls back on its own
-    /// through `runtime::fallback_chain` (DirectML tries OpenVINO before CPU; anything else goes
-    /// straight to CPU) if this one is unavailable or fails to compile. This overrides the
-    /// provider saved through `PUT /v1/runtime` for this launch only.
+    /// Preferred ONNX Runtime execution provider for this launch.
     #[arg(long, env = "NICEGAL_EXECUTION_PROVIDER", value_name = "PROVIDER")]
     execution_provider: Option<ExecutionProvider>,
 
-    /// Persisted ONNX Runtime provider selection. It defaults to `runtime.json` in the app's
-    /// local data directory, and can be changed through `PUT /v1/runtime`.
+    /// Location of the persisted runtime and image-model settings.
     #[arg(long, env = "NICEGAL_RUNTIME_CONFIG", value_name = "FILE")]
     runtime_config: Option<PathBuf>,
 
-    /// `tracing-subscriber` filter directives for the JSON log file, e.g. `debug` or
-    /// `nicegal_core=trace,tower_http=info`. `RUST_LOG` takes precedence when set, so this is only
-    /// the default for a launch that sets neither. Does not affect the console: that stream is
-    /// always the same fixed, human-readable default, on purpose — see `nicegal_core::logging`.
+    /// Filter directives for the JSON log file. `RUST_LOG` takes precedence; the console is fixed.
     #[arg(long, env = "NICEGAL_LOG", value_name = "DIRECTIVES")]
     log: Option<String>,
 }
@@ -94,10 +87,14 @@ async fn main() -> Result<()> {
         Some(path) => path,
         None => default_database("runtime.json")?,
     };
-    let image_model_settings = Arc::new(api::ImageModelSettings::load(
-        runtime_config.with_file_name("image-model.json"),
-        args.image_model,
+    let runtime = Arc::new(api::RuntimeSettings::load(
+        runtime_config.clone(),
+        args.execution_provider,
     )?);
+    let image_model_settings = Arc::new(api::ImageModelSettings::new(
+        Arc::clone(&runtime),
+        args.image_model,
+    ));
     let image_model = image_model_settings.active();
     let image_database = asset_database
         .parent()
@@ -123,10 +120,6 @@ async fn main() -> Result<()> {
     if args.token.is_empty() {
         bail!("NICEGAL_RPC_TOKEN must not be empty");
     }
-    let runtime = Arc::new(api::RuntimeSettings::load(
-        runtime_config,
-        args.execution_provider,
-    )?);
     nicegal_core::runtime::initialize_bundled_runtime(runtime.active_execution_provider())?;
     runtime.set_onnx_runtime_build_info(nicegal_core::runtime::onnxruntime_build_info().to_owned());
 
@@ -137,13 +130,13 @@ async fn main() -> Result<()> {
     drop(DB::new(&ocr_database)?);
     drop(AssetCatalog::new(&asset_database)?);
 
-    // User-approved lifecycle: prepare models when indexing is requested.
+    // Models are loaded lazily when a job or request first needs them.
     let mut embedder_options = TextEmbedderOptions::default();
     if let Some(model) = args.embed_model {
         embedder_options.model = model;
     }
-    // The dynamic library selected by `initialize_onnxruntime` above is process-global, so the
-    // embedder requests the same execution provider OCR does rather than choosing its own.
+    // The bundled runtime distribution selected above is process-global, so text and image
+    // embedders request the same execution provider as OCR.
     embedder_options.runtime = RuntimeOptions {
         execution_provider: runtime.active_execution_provider(),
         ..RuntimeOptions::default()

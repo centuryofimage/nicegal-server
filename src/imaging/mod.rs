@@ -45,7 +45,7 @@ pub fn decode(data: &[u8]) -> Result<Raster> {
         Format::Png => png::decode(data),
         Format::Gif => gif::decode_first_frame(data),
         Format::Webp => webp::decode(data),
-        Format::Bmp => legacy::decode(data, Format::Bmp),
+        Format::Bmp => legacy::decode_bmp(data),
     }?;
     let orientation = match format {
         Format::Jpeg => orientation_from_jpeg(data),

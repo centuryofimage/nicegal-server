@@ -1,12 +1,7 @@
 //! ONNX Runtime session construction, shared by every model family in this crate.
 //!
-//! Provider selection is the same question for every family, so it lives here once.
-//! [`RuntimeOptions`] is passed per load rather than held for the process, because the budget —
-//! thread count above all — is not.
-//!
-//! The runtime library itself *is* process-wide: under `load-dynamic` the first session fixes
-//! which `onnxruntime` every later session uses, so a provider missing from that build is missing
-//! everywhere. Hence the availability check before a provider is registered.
+//! [`RuntimeOptions`] is per model load, but the dynamically loaded runtime library is
+//! process-wide. Provider availability is checked against that library before registration.
 
 use std::fmt;
 use std::num::NonZeroUsize;
@@ -101,10 +96,7 @@ impl RuntimeOptions {
     }
 }
 
-/// Retry `attempt` across [`fallback_chain`], starting from `options.execution_provider`, and
-/// report which provider actually succeeded. Shared by every model family that wants the same
-/// "prefer the requested provider, fall back to CPU on failure" behavior as [`load_sessions`],
-/// even when — like FastEmbed — it does not build its session through [`compile_session`].
+/// Try the requested provider and its allowed fallbacks, returning the provider that succeeded.
 pub(crate) fn with_fallback<T>(
     options: RuntimeOptions,
     mut attempt: impl FnMut(ExecutionProvider) -> Result<T>,
@@ -285,9 +277,9 @@ pub fn load_sessions<const N: usize>(
     })
 }
 
-/// Providers to retry, in order, after `execution_provider` fails to compile. Always ends in CPU,
-/// which cannot itself fail, so every chain terminates. DirectML gets an OpenVINO rung first since
-/// it is the deliberate first-choice provider on Windows; anything else falls straight to CPU.
+/// Providers to retry, in order, after `execution_provider` fails to compile. CPU is the final
+/// attempt; its failure is returned without another fallback. DirectML tries OpenVINO first, while
+/// other non-CPU providers fall straight to CPU.
 pub(crate) fn fallback_chain(
     execution_provider: ExecutionProvider,
 ) -> &'static [ExecutionProvider] {
@@ -329,10 +321,7 @@ pub(crate) struct ConfiguredProvider {
     pub(crate) intra_threads: NonZeroUsize,
 }
 
-/// Build the execution provider dispatch for `execution_provider`, checking availability against
-/// the process-wide ONNX Runtime library already loaded. Shared by every model family: OCR
-/// compiles a [`Session`] with it directly through [`compile_session`], while FastEmbed threads it
-/// into its own session builder via `TextInitOptions::with_execution_providers`.
+/// Build a provider dispatch after checking the process-wide runtime library.
 pub(crate) fn configure_provider(
     execution_provider: ExecutionProvider,
     intra_threads: NonZeroUsize,

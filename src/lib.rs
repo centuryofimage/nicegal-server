@@ -14,4 +14,5 @@ pub mod ocr;
 pub mod poster;
 pub mod runtime;
 mod schema;
+mod storage;
 pub mod thumbs;

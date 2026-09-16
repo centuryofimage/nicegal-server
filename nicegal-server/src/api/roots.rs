@@ -1,8 +1,4 @@
-//! Shared validation for the caller-supplied root directories that search, indexing, and pruning
-//! all take.
-//!
-//! A root the caller can correct is never a server error: an unplugged drive, a typo, or a
-//! relative path all answer `400 invalid_root` with a cause the UI can show.
+//! Validation for caller-supplied search, indexing, and pruning roots.
 
 use std::fs;
 

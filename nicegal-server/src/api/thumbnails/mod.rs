@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 
@@ -8,7 +9,7 @@ use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodRouter, get as get_route, post};
-use nicegal_core::assets::{AssetCatalog, MediaKind, SourceFingerprint};
+use nicegal_core::assets::{AssetCatalog, SourceFingerprint};
 use nicegal_core::thumbs::{
     DecodedThumbnail, GENERATOR_VERSION, SIZE_BUCKETS, Thumbnail, ThumbnailEncoding,
     validate_static_thumbnail,
@@ -19,9 +20,11 @@ use tracing::{Instrument, debug_span, field};
 use super::error::ApiError;
 use super::extract::{ApiBytes, ApiJson, ApiQuery};
 use super::jobs::{JobResponse, JobSpec};
-use super::{AppState, Databases, run_blocking};
+use super::{AppState, Databases, run_blocking, run_cancellable};
 
 pub(super) mod job;
+
+const MAX_ENSURE_ASSETS: usize = 512;
 
 const WIDTH_HEADER: HeaderName = HeaderName::from_static("x-nicegal-server-thumbnail-width");
 const HEIGHT_HEADER: HeaderName = HeaderName::from_static("x-nicegal-server-thumbnail-height");
@@ -108,6 +111,11 @@ async fn ensure(
             "at least one asset identifier is required",
         ));
     }
+    if request.asset_ids.len() > MAX_ENSURE_ASSETS {
+        return Err(ApiError::bad_request(format!(
+            "at most {MAX_ENSURE_ASSETS} asset IDs may be requested at once"
+        )));
+    }
     let requested_assets = request.asset_ids.len();
     let size_bucket = bucket_for_required_size(request.required_size)?;
     request.asset_ids.sort_unstable();
@@ -126,7 +134,7 @@ async fn ensure(
         size_bucket,
         generator_version = GENERATOR_VERSION,
     );
-    run_blocking(move || {
+    run_cancellable(move |cancellation| {
         let assets = {
             let span = debug_span!(
                 "thumbnail_asset_load",
@@ -135,18 +143,18 @@ async fn ensure(
             );
             let _entered = span.enter();
             let catalog = databases.open_assets_read_only()?;
+            let mut found: HashMap<_, _> = catalog
+                .get_many(&asset_ids)?
+                .into_iter()
+                .map(|asset| (asset.asset_id, asset))
+                .collect();
             let mut assets = Vec::with_capacity(asset_ids.len());
             let mut source_bytes = 0u64;
             for asset_id in &asset_ids {
-                let mut asset = catalog
-                    .get(*asset_id)
-                    .context("looking up asset for thumbnail generation")?
+                cancellation.check()?;
+                let mut asset = found
+                    .remove(asset_id)
                     .ok_or_else(|| ApiError::asset_id_not_found(*asset_id))?;
-                if asset.media_kind != MediaKind::Image {
-                    return Err(ApiError::bad_request(format!(
-                        "asset {asset_id} is not an image"
-                    )));
-                }
                 let metadata = fs::metadata(&asset.path).map_err(|error| {
                     if error.kind() == io::ErrorKind::NotFound {
                         ApiError::asset_id_not_found(*asset_id)
@@ -165,12 +173,15 @@ async fn ensure(
             assets
         };
         for outcome in
-            thumbnails.generate(&assets, &[size_bucket], GENERATOR_VERSION, false, || false)
+            thumbnails.generate(&assets, &[size_bucket], GENERATOR_VERSION, false, || {
+                cancellation.check().is_err()
+            })
         {
             outcome.result.with_context(|| {
                 format!("generating thumbnail for asset {}", outcome.asset.asset_id)
             })?;
         }
+        cancellation.check()?;
         Ok(())
     })
     .instrument(span)

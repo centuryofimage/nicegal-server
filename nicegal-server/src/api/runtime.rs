@@ -9,6 +9,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::{MethodRouter, get};
 use camino::Utf8PathBuf as PathBuf;
+use nicegal_core::embedding::ImageEmbeddingModel;
 use nicegal_core::runtime::ExecutionProvider;
 use serde::{Deserialize, Serialize};
 
@@ -23,7 +24,7 @@ pub(crate) struct RuntimeSettings {
     path: PathBuf,
     active_execution_provider: ExecutionProvider,
     onnx_runtime_build_info: Mutex<String>,
-    configured_execution_provider: Mutex<ExecutionProvider>,
+    configured: Mutex<ConfiguredSettings>,
 }
 
 impl RuntimeSettings {
@@ -37,13 +38,13 @@ impl RuntimeSettings {
                 "the {provider} execution provider is not compiled for this platform"
             );
         }
-        let configured_execution_provider = read_provider(&path)?;
+        let configured = read_settings(&path)?;
         Ok(Self {
             path,
             active_execution_provider: command_line_provider
-                .unwrap_or(configured_execution_provider),
+                .unwrap_or(configured.execution_provider),
             onnx_runtime_build_info: Mutex::new(String::new()),
-            configured_execution_provider: Mutex::new(configured_execution_provider),
+            configured: Mutex::new(configured),
         })
     }
 
@@ -59,8 +60,8 @@ impl RuntimeSettings {
     }
 
     fn status(&self) -> RuntimeStatusResponse {
-        let configured_execution_provider = *self
-            .configured_execution_provider
+        let configured = self
+            .configured
             .lock()
             .expect("runtime settings mutex poisoned");
         RuntimeStatusResponse {
@@ -72,10 +73,13 @@ impl RuntimeSettings {
                 .lock()
                 .expect("runtime settings mutex poisoned")
                 .clone(),
-            configured_execution_provider: configured_execution_provider.to_string(),
-            restart_required: self.active_execution_provider != configured_execution_provider,
+            configured_execution_provider: configured.execution_provider.to_string(),
+            restart_required: self.active_execution_provider != configured.execution_provider,
             image_model: None,
-            available_execution_providers: available_execution_providers(),
+            available_execution_providers: available_execution_providers()
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
         }
     }
 
@@ -83,16 +87,49 @@ impl RuntimeSettings {
         &self,
         execution_provider: ExecutionProvider,
     ) -> Result<RuntimeStatusResponse> {
-        anyhow::ensure!(
-            provider_available(execution_provider),
-            "the {execution_provider} execution provider is not compiled for this platform"
-        );
-        write_provider(&self.path, execution_provider)?;
-        *self
-            .configured_execution_provider
-            .lock()
-            .expect("runtime settings mutex poisoned") = execution_provider;
+        self.update(Some(execution_provider), None)?;
         Ok(self.status())
+    }
+
+    pub(super) fn image_model(&self) -> ImageEmbeddingModel {
+        self.configured
+            .lock()
+            .expect("runtime settings mutex poisoned")
+            .image_model
+    }
+
+    /// Publish both selections only after their shared record has been atomically replaced.
+    pub(super) fn update(
+        &self,
+        provider: Option<ExecutionProvider>,
+        model: Option<ImageEmbeddingModel>,
+    ) -> Result<()> {
+        if let Some(provider) = provider {
+            anyhow::ensure!(
+                provider_available(provider),
+                "the {provider} execution provider is not compiled for this platform"
+            );
+        }
+        if let Some(model) = model {
+            anyhow::ensure!(
+                ImageEmbeddingModel::SELECTABLE.contains(&model) && model.available(),
+                "image model is unavailable or retired"
+            );
+        }
+        let mut configured = self
+            .configured
+            .lock()
+            .expect("runtime settings mutex poisoned");
+        let mut next = configured.clone();
+        if let Some(provider) = provider {
+            next.execution_provider = provider;
+        }
+        if let Some(model) = model {
+            next.image_model = model;
+        }
+        write_settings(&self.path, &RuntimeSettingsFile::from(&next))?;
+        *configured = next;
+        Ok(())
     }
 }
 
@@ -106,7 +143,7 @@ pub(super) struct RuntimeStatusResponse {
     restart_required: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     image_model: Option<super::image_model::ModelStatus>,
-    available_execution_providers: &'static [&'static str],
+    available_execution_providers: Vec<String>,
 }
 
 /// CPU models can execute against either accelerated distribution. The Windows server uses the
@@ -129,36 +166,34 @@ fn runtime_distribution(execution_provider: ExecutionProvider) -> &'static str {
     }
 }
 
-fn available_execution_providers() -> &'static [&'static str] {
+fn available_execution_providers() -> &'static [ExecutionProvider] {
     if cfg!(target_os = "linux") {
         &[
             #[cfg(feature = "ort-webgpu")]
-            "webgpu",
+            ExecutionProvider::Webgpu,
             #[cfg(feature = "ort-openvino")]
-            "openvino",
-            "cpu",
+            ExecutionProvider::OpenVino,
+            ExecutionProvider::Cpu,
         ]
     } else if cfg!(windows) {
         &[
             #[cfg(feature = "ort-directml")]
-            "directml",
+            ExecutionProvider::Directml,
             #[cfg(feature = "ort-openvino")]
-            "openvino",
-            "cpu",
+            ExecutionProvider::OpenVino,
+            ExecutionProvider::Cpu,
         ]
     } else {
-        &["cpu"]
+        &[ExecutionProvider::Cpu]
     }
 }
 
 fn provider_available(provider: ExecutionProvider) -> bool {
-    available_execution_providers().contains(&provider.to_string().as_str())
+    available_execution_providers().contains(&provider)
 }
 
 fn default_provider() -> ExecutionProvider {
     available_execution_providers()[0]
-        .parse()
-        .expect("compiled provider name is valid")
 }
 
 #[derive(Debug, Deserialize)]
@@ -168,16 +203,12 @@ struct RuntimeUpdateRequest {
     image_model: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RuntimeSettingsFile {
     execution_provider: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct RuntimeSettingsFileRef {
-    execution_provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    image_model: Option<String>,
 }
 
 pub(super) fn route() -> MethodRouter<AppState> {
@@ -238,15 +269,8 @@ async fn update(
         }
     }
     let runtime = Arc::clone(&state.runtime);
-    let settings = Arc::clone(&state.image_model_settings);
     tokio::task::spawn_blocking(move || -> Result<()> {
-        if let Some(provider) = execution_provider {
-            runtime.set(provider)?;
-        }
-        if let Some(model) = model {
-            settings.set(model)?;
-        }
-        Ok(())
+        runtime.update(execution_provider, model)
     })
     .await
     .map_err(|error| ApiError::internal(anyhow!("runtime settings task failed: {error}")))?
@@ -254,48 +278,83 @@ async fn update(
     Ok((StatusCode::OK, Json(status_response(&state))))
 }
 
-fn read_provider(path: &PathBuf) -> Result<ExecutionProvider> {
-    let contents = match fs::read(path) {
-        Ok(contents) => contents,
-        // Prefer each platform's bundled accelerator, with CPU fallback when unavailable.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(default_provider());
+#[derive(Clone)]
+struct ConfiguredSettings {
+    execution_provider: ExecutionProvider,
+    image_model: ImageEmbeddingModel,
+}
+
+impl From<&ConfiguredSettings> for RuntimeSettingsFile {
+    fn from(settings: &ConfiguredSettings) -> Self {
+        Self {
+            execution_provider: settings.execution_provider.to_string(),
+            image_model: Some(settings.image_model.id().to_owned()),
         }
+    }
+}
+
+fn read_settings(path: &PathBuf) -> Result<ConfiguredSettings> {
+    let file: Option<RuntimeSettingsFile> = match fs::read(path) {
+        Ok(contents) => Some(
+            serde_json::from_slice(&contents)
+                .with_context(|| format!("parsing runtime settings: {path}"))?,
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => {
             return Err(error).with_context(|| format!("reading runtime settings: {path}"));
         }
     };
-    let settings: RuntimeSettingsFile = serde_json::from_slice(&contents)
-        .with_context(|| format!("parsing runtime settings: {path}"))?;
-    let saved = match ExecutionProvider::from_str(&settings.execution_provider) {
-        Ok(provider) => Some(provider),
-        Err(_) if matches!(settings.execution_provider.as_str(), "cuda" | "migraphx") => None,
-        Err(error) => {
-            return Err(anyhow!(
-                "invalid execution provider in runtime settings {path}: {error}"
-            ));
+    let saved = file.as_ref().map(|file| file.execution_provider.as_str());
+    let provider =
+        match saved {
+            None | Some("cuda" | "migraphx") => None,
+            Some(value) => Some(value.parse::<ExecutionProvider>().with_context(|| {
+                format!("invalid execution provider in runtime settings {path}")
+            })?),
         }
+        .filter(|provider| provider_available(*provider));
+    let settings = ConfiguredSettings {
+        execution_provider: provider.unwrap_or_else(default_provider),
+        image_model: match file.as_ref().and_then(|file| file.image_model.as_deref()) {
+            Some(model) => model.parse()?,
+            None => read_legacy_image_model(path)?,
+        },
     };
-    if let Some(provider) = saved.filter(|provider| provider_available(*provider)) {
-        return Ok(provider);
+    if saved.is_some() && provider.is_none() {
+        write_settings(path, &RuntimeSettingsFile::from(&settings))?;
+        tracing::warn!(previous = saved, provider = %settings.execution_provider, "saved execution provider is absent from this build; selected bundled default");
     }
-    let provider = default_provider();
-    write_provider(path, provider)?;
-    tracing::warn!(previous = settings.execution_provider, %provider, "saved execution provider is absent from this build; selected bundled default");
-    Ok(provider)
+    Ok(settings)
 }
 
-fn write_provider(path: &PathBuf, execution_provider: ExecutionProvider) -> Result<()> {
+fn read_legacy_image_model(path: &PathBuf) -> Result<ImageEmbeddingModel> {
+    // Read legacy selection until the first successful write migrates it into runtime.json.
+    #[derive(Deserialize)]
+    struct LegacySelection {
+        model: String,
+    }
+    let legacy_path = path.with_file_name("image-model.json");
+    match fs::read(&legacy_path) {
+        Ok(contents) => serde_json::from_slice::<LegacySelection>(&contents)?
+            .model
+            .parse(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(ImageEmbeddingModel::default())
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("reading image model settings: {legacy_path}"))
+        }
+    }
+}
+
+fn write_settings(path: &PathBuf, settings: &RuntimeSettingsFile) -> Result<()> {
     let parent = path
         .parent()
         .context("runtime settings path has no parent directory")?;
     fs::create_dir_all(parent)
         .with_context(|| format!("creating runtime settings directory: {parent}"))?;
 
-    let contents = serde_json::to_vec_pretty(&RuntimeSettingsFileRef {
-        execution_provider: execution_provider.to_string(),
-    })
-    .context("serializing runtime settings")?;
+    let contents = serde_json::to_vec_pretty(settings).context("serializing runtime settings")?;
     let temporary = path.with_extension("json.tmp");
     let mut file = fs::File::create(&temporary)
         .with_context(|| format!("creating temporary runtime settings: {temporary}"))?;
@@ -303,6 +362,7 @@ fn write_provider(path: &PathBuf, execution_provider: ExecutionProvider) -> Resu
         .with_context(|| format!("writing temporary runtime settings: {temporary}"))?;
     file.sync_all()
         .with_context(|| format!("syncing temporary runtime settings: {temporary}"))?;
+    drop(file);
     fs::rename(&temporary, path)
         .with_context(|| format!("replacing runtime settings {path} with {temporary}"))
 }
@@ -314,12 +374,117 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_image_selection_migrates_and_combined_updates_survive_restart() -> Result<()> {
+        let temp = TempDir::new()?;
+        let path = PathBuf::try_from(temp.path().join("runtime.json"))?;
+        fs::write(
+            path.with_file_name("image-model.json"),
+            serde_json::to_vec(
+                &serde_json::json!({"model": ImageEmbeddingModel::SigLip2Base256.id()}),
+            )?,
+        )?;
+        let settings = RuntimeSettings::load(path.clone(), None)?;
+        assert_eq!(settings.image_model(), ImageEmbeddingModel::SigLip2Base256);
+        settings.update(
+            Some(ExecutionProvider::Cpu),
+            Some(ImageEmbeddingModel::MetaClip2B16),
+        )?;
+        let restarted = RuntimeSettings::load(path, None)?;
+        assert_eq!(
+            restarted.active_execution_provider(),
+            ExecutionProvider::Cpu
+        );
+        assert_eq!(restarted.image_model(), ImageEmbeddingModel::MetaClip2B16);
+        Ok(())
+    }
+
+    #[test]
+    fn provider_migration_preserves_model_and_rejects_invalid_models_before_writing() -> Result<()>
+    {
+        let temp = TempDir::new()?;
+        let path = PathBuf::try_from(temp.path().join("runtime.json"))?;
+        let selected = ImageEmbeddingModel::SigLip2Base256;
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "executionProvider": "cuda", "imageModel": selected.id()
+            }))?,
+        )?;
+        let settings = RuntimeSettings::load(path.clone(), None)?;
+        assert_eq!(settings.image_model(), selected);
+        assert_eq!(
+            RuntimeSettings::load(path.clone(), None)?.image_model(),
+            selected
+        );
+
+        let invalid = br#"{"executionProvider":"cuda","imageModel":"invalid-model"}"#;
+        fs::write(&path, invalid)?;
+        assert!(RuntimeSettings::load(path.clone(), None).is_err());
+        assert_eq!(fs::read(path)?, invalid);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_combined_write_preserves_both_selections() -> Result<()> {
+        let temp = TempDir::new()?;
+        let path = PathBuf::try_from(temp.path().join("runtime.json"))?;
+        let settings = RuntimeSettings::load(path.clone(), None)?;
+        settings.set(default_provider())?;
+        let before = fs::read(&path)?;
+        let selected = settings.image_model();
+        fs::create_dir(path.with_extension("json.tmp"))?;
+        assert!(
+            settings
+                .update(
+                    Some(ExecutionProvider::Cpu),
+                    Some(ImageEmbeddingModel::SigLip2Base256)
+                )
+                .is_err()
+        );
+        assert_eq!(fs::read(&path)?, before);
+        assert_eq!(settings.image_model(), selected);
+        assert_eq!(
+            settings.status().configured_execution_provider,
+            default_provider().to_string()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_updates_preserve_independent_selections() -> Result<()> {
+        let temp = TempDir::new()?;
+        let path = PathBuf::try_from(temp.path().join("runtime.json"))?;
+        let settings = Arc::new(RuntimeSettings::load(path.clone(), None)?);
+        std::thread::scope(|scope| {
+            for index in 0..16 {
+                let settings = Arc::clone(&settings);
+                scope.spawn(move || {
+                    if index % 2 == 0 {
+                        settings.update(Some(ExecutionProvider::Cpu), None).unwrap();
+                    } else {
+                        settings
+                            .update(None, Some(ImageEmbeddingModel::SigLip2Base256))
+                            .unwrap();
+                    }
+                });
+            }
+        });
+        let restarted = RuntimeSettings::load(path, None)?;
+        assert_eq!(
+            restarted.active_execution_provider(),
+            ExecutionProvider::Cpu
+        );
+        assert_eq!(restarted.image_model(), ImageEmbeddingModel::SigLip2Base256);
+        Ok(())
+    }
+
+    #[test]
     fn missing_settings_use_platform_default_and_persist_updates() {
         let temp = TempDir::new().unwrap();
         let path = PathBuf::try_from(temp.path().join("runtime.json")).unwrap();
         let settings = RuntimeSettings::load(path.clone(), None).unwrap();
         settings.set_onnx_runtime_build_info("test build".to_owned());
-        let expected = available_execution_providers()[0];
+        let expected = default_provider().to_string();
         assert_eq!(settings.status().active_execution_provider, expected);
         assert_eq!(settings.status().configured_execution_provider, expected);
         if cfg!(target_os = "linux") {
@@ -347,7 +512,10 @@ mod tests {
     fn command_line_provider_overrides_saved_setting_for_this_launch() {
         let temp = TempDir::new().unwrap();
         let path = PathBuf::try_from(temp.path().join("runtime.json")).unwrap();
-        write_provider(&path, default_provider()).unwrap();
+        RuntimeSettings::load(path.clone(), None)
+            .unwrap()
+            .set(default_provider())
+            .unwrap();
 
         let settings = RuntimeSettings::load(path, Some(ExecutionProvider::Cpu)).unwrap();
         let status = settings.status();
@@ -367,7 +535,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let path = PathBuf::try_from(temp.path().join("runtime.json")).unwrap();
         for saved in ["cuda", "migraphx", "webgpu", "openvino", "directml"] {
-            if available_execution_providers().contains(&saved) {
+            if saved.parse().is_ok_and(provider_available) {
                 continue;
             }
             fs::write(&path, format!(r#"{{"executionProvider":"{saved}"}}"#)).unwrap();

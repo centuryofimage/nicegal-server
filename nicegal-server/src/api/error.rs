@@ -1,10 +1,3 @@
-//! The single error envelope every route answers with.
-//!
-//! The contract is deliberately narrow: `4xx` means the caller can fix the request, `5xx` means
-//! the server or its databases are broken. `code` carries the machine-readable distinction and
-//! `message` is the displayable string the desktop UI shows nearly verbatim, so it never contains
-//! a stack trace or a path the caller did not supply.
-
 use axum::Json;
 use axum::extract::rejection::{BytesRejection, JsonRejection, QueryRejection};
 use axum::http::StatusCode;
@@ -109,8 +102,7 @@ impl ApiError {
         Self::new(StatusCode::BAD_REQUEST, ErrorCode::InvalidRoot, message)
     }
 
-    /// SQLite's own text for a query it could not parse. Cryptic but honest, and the only way the
-    /// UI can tell the user which part of their query is wrong.
+    /// Error from sqlite
     pub(crate) fn query_syntax(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, ErrorCode::QuerySyntax, message)
     }
@@ -195,8 +187,7 @@ impl ApiError {
         )
     }
 
-    /// The only path that produces a `5xx`. The cause is logged in full and deliberately does not
-    /// reach the client.
+    /// Log the internal cause without exposing it to the client.
     pub(crate) fn internal(error: anyhow::Error) -> Self {
         if nicegal_core::cancellation::is_cancellation(&error) {
             // The abandoned search has no client waiting for this response.

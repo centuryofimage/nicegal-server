@@ -1,3 +1,4 @@
+use crate::api::jobs::cancel_if;
 use camino::Utf8PathBuf as PathBuf;
 use nicegal_core::assets::{Asset, AssetCatalog, Timeline};
 use nicegal_core::index::{IndexEvent, IndexObserver, IndexPhase, IndexProgressDelta};
@@ -118,7 +119,7 @@ pub(crate) fn run(
     asset_database: &PathBuf,
     thumbnails: &ThumbnailService,
     observer: &dyn IndexObserver,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<()> {
     let assets = selected_assets(&AssetCatalog::new(asset_database)?, &spec)?;
     observer.on_event(IndexEvent::PhaseChanged(IndexPhase::Thumbnails));
     observer.on_event(IndexEvent::Discovered {
@@ -141,9 +142,7 @@ pub(crate) fn run(
             });
         },
     ) {
-        if observer.is_cancelled() {
-            return Ok(true);
-        }
+        cancel_if(observer.is_cancelled())?;
         let asset = outcome.asset;
         match outcome.result {
             Ok(summary) => observer.on_event(IndexEvent::Progress(IndexProgressDelta {
@@ -167,9 +166,7 @@ pub(crate) fn run(
             }
         }
     }
-    if observer.is_cancelled() {
-        return Ok(true);
-    }
+    cancel_if(observer.is_cancelled())?;
     if spec.sweep_stale {
         if failures > 0 {
             anyhow::bail!(
@@ -181,7 +178,7 @@ pub(crate) fn run(
             assets.iter().map(|asset| asset.asset_id).collect(),
         )?;
     }
-    Ok(false)
+    Ok(())
 }
 
 fn selected_assets(catalog: &AssetCatalog, spec: &Spec) -> anyhow::Result<Vec<Asset>> {

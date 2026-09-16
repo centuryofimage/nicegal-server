@@ -113,7 +113,7 @@ Choose the smallest batch whose throughput is close to the plateau. Larger batch
 
 ## GPU acceleration
 
-`src/runtime.rs`'s DirectML/OpenVINO/CPU provider selection also applies to the embedder, since `fastembed` 6.0.0 pins the exact `ort` version this crate does and accepts the same `ExecutionProviderDispatch`. `benches/text_embed_index.rs` (`dev.cmd bench --bench text_embed_index -- --provider <cpu|directml|openvino>`) measures `TextEmbedder::embed_documents` in isolation on a synthetic OCR-shaped corpus (mostly short lines, one row in 32 padded out near the 8192-byte cap), independent of the server/HTTP path this document otherwise benchmarks.
+`src/runtime.rs`'s DirectML/OpenVINO/CPU provider selection also applies to the embedder, since `fastembed` 6.0.0 pins the exact `ort` version this crate does and accepts the same `ExecutionProviderDispatch`. The retired Rust text-embedding harness measured `TextEmbedder::embed_documents` on a synthetic OCR-shaped corpus, independently of the HTTP path. The results below are historical; a replacement harness is deferred.
 
 One reference run (BGE-small-en-v1.5, Windows, DirectML vs. CPU, 2 runs per batch after 1 warmup run):
 

@@ -188,17 +188,10 @@ mutable ONNX session continues the prior batch on the GPU.
 | Runtime cache | warm Hugging Face cache |
 | Failures | 0 in every completed run |
 
-The benchmark command has the following form:
+The Rust `image_index` harness used for these measurements has been removed;
+a replacement is deferred.
 
-```console
-set RUST_LOG=warn,nicegal_core::image_index=debug,nicegal_core::embedding::image=debug
-dev.cmd bench --bench image_index -- ^
-  --corpus C:/gallery ^
-  --provider directml --batch-size 16 ^
-  --trace-jsonl clip-camera-dml-b16.jsonl
-```
-
-The benchmark's JSONL traces contain:
+The recorded JSONL traces contain:
 
 - model-load and provider-selection events;
 - one `decode_image` span per decoded source;

@@ -1,16 +1,19 @@
-//! CLIP image embedding jobs.
+//! Image embedding jobs.
 
 use super::{AppState, extract::ApiQuery, run_blocking};
+use crate::api::jobs::cancel_if;
 use axum::{
     Json,
     extract::State,
     routing::{MethodRouter, get},
 };
 use camino::Utf8PathBuf as PathBuf;
-use nicegal_core::assets::AssetCatalog;
+use nicegal_core::assets::{Asset, AssetCatalog};
 use nicegal_core::db::SearchFilters;
 use nicegal_core::embedding::ImageEmbedder;
-use nicegal_core::image_index::{ImageIndexDb, ImageIndexOptions, index_images_observed};
+use nicegal_core::image_index::{
+    ImageIndexDb, ImageIndexOptions, index_catalog_images_observed, index_images_observed,
+};
 use nicegal_core::index::IndexObserver;
 use serde::{Deserialize, Serialize};
 
@@ -99,21 +102,35 @@ pub(crate) fn run(
     image_database: &PathBuf,
     embedder: &ImageEmbedder,
     observer: &dyn IndexObserver,
-) -> anyhow::Result<bool> {
+    catalog: Option<&[Asset]>,
+) -> anyhow::Result<()> {
     let assets = AssetCatalog::new(asset_database)?;
     let mut images = ImageIndexDb::new(image_database, embedder.dimensions())?;
-    index_images_observed(
-        &assets,
-        &mut images,
-        embedder,
-        &spec.root,
-        ImageIndexOptions {
-            force: spec.force,
-            retry_failed: spec.retry_failed,
-            limit: spec.debug_limit,
-        },
-        observer,
-    )
+    let options = ImageIndexOptions {
+        force: spec.force,
+        retry_failed: spec.retry_failed,
+        limit: spec.debug_limit,
+    };
+    match catalog {
+        Some(catalog) => index_catalog_images_observed(
+            &assets,
+            &mut images,
+            embedder,
+            &spec.root,
+            catalog,
+            options,
+            observer,
+        ),
+        None => index_images_observed(
+            &assets,
+            &mut images,
+            embedder,
+            &spec.root,
+            options,
+            observer,
+        ),
+    }
+    .and_then(cancel_if)
 }
 
 #[cfg(test)]

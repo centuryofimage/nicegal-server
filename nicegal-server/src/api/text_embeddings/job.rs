@@ -1,8 +1,8 @@
 //! The backfill job that gives indexed OCR text its vectors.
 //!
-//! The standalone backfill can also be the final phase of an OCR index job. A model swap can still
-//! run this job on its own without re-scanning images.
+//! Runs independently or after OCR indexing without rescanning images.
 
+use crate::api::jobs::cancel_if;
 use camino::Utf8PathBuf as PathBuf;
 use nicegal_core::db::{DB, SearchFilters, TextEmbedding, TextEmbeddingSpace};
 use nicegal_core::embedding::TextEmbedder;
@@ -12,12 +12,9 @@ use serde::Deserialize;
 use super::super::error::ApiError;
 use super::super::roots;
 
-/// The upper bound the *request* may ask for. The effective batch is additionally clamped to
-/// [`TextEmbedder::max_batch_size`], which is where the real limit lives: the backend sizes its
-/// buffers from it, and a batch is the unit it parallelises across its own threads.
+/// Request-level bound; the embedder's own batch limit may be smaller.
 const MAX_BATCH_SIZE: usize = 512;
-/// OCR text past this point is almost always repeated page furniture, and every model truncates
-/// far below it anyway. Capping here keeps a pathological scan from dominating a batch.
+/// Maximum OCR text bytes considered for one embedding input.
 const MAX_CONTENT_BYTES: usize = 8192;
 /// This job fills the OCR-text space. CLIP image vectors live in the separate image index, not in
 /// this space.
@@ -31,8 +28,7 @@ pub(crate) struct Request {
     /// same identifier, which the store cannot detect on its own.
     #[serde(default)]
     force: bool,
-    /// Rows handed to the embedder at once. Omit to use whatever the backend prefers, which is the
-    /// right answer unless you are deliberately trading throughput for cancellation latency.
+    /// Rows per embedder call. Omit to use the backend limit.
     batch_size: Option<usize>,
 }
 
@@ -45,7 +41,7 @@ pub(crate) struct Spec {
 }
 
 impl Spec {
-    /// Build the incremental default used after an OCR index run. The root was already resolved
+    /// Build the incremental default used after a library index run. The root was already resolved
     /// when its index-job request was accepted.
     pub(crate) fn pending_for(root: PathBuf, debug_limit: Option<usize>) -> Self {
         Self {
@@ -81,7 +77,7 @@ pub(crate) fn run(
     ocr_database: &PathBuf,
     embedder: &TextEmbedder,
     observer: &dyn IndexObserver,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<()> {
     // The write connection is opened up front but takes no write lock by doing so: in WAL mode
     // SQLite acquires it at the first statement of a write transaction and releases it at commit.
     // The only transactions here are the two short ones below and one per saved batch, so the
@@ -109,17 +105,15 @@ pub(crate) fn run(
 
     let mut remaining = spec.debug_limit;
     loop {
-        if observer.is_cancelled() {
-            return Ok(true);
-        }
+        cancel_if(observer.is_cancelled())?;
         let next_batch_size = remaining.map_or(batch_size, |limit| batch_size.min(limit));
         if next_batch_size == 0 {
-            return Ok(false);
+            return Ok(());
         }
         let pending =
             ocr.pending_text_embeddings(SPACE, &filters, next_batch_size, MAX_CONTENT_BYTES)?;
         if pending.is_empty() {
-            return Ok(false);
+            return Ok(());
         }
 
         let texts: Vec<&str> = pending.iter().map(|row| row.content.as_str()).collect();
@@ -141,7 +135,7 @@ pub(crate) fn run(
                     failed: pending.len(),
                     ..IndexProgressDelta::default()
                 }));
-                return Ok(false);
+                return Ok(());
             }
         };
 
@@ -168,7 +162,7 @@ pub(crate) fn run(
         if stored == 0 {
             // Every row in the batch lost its OCR row to a concurrent prune. Re-querying would
             // return the same empty-handed batch forever.
-            return Ok(false);
+            return Ok(());
         }
     }
 }

@@ -2,39 +2,10 @@
 use anyhow::{Context, Result, ensure};
 use nicegal_core::embedding::{ImageEmbedder, ImageEmbedderOptions, ImageEmbeddingModel};
 use nicegal_core::runtime::{self, ExecutionProvider};
-use serde_json::Value;
+mod support;
 use std::{fs, path::Path};
+use support::{ImageCase, TextCase, compare, read_cases};
 
-fn vector(value: &Value) -> Result<Vec<f32>> {
-    value
-        .as_array()
-        .context("fixture vector missing")?
-        .iter()
-        .map(|value| {
-            value
-                .as_f64()
-                .map(|value| value as f32)
-                .context("invalid vector value")
-        })
-        .collect()
-}
-fn compare(actual: &[f32], expected: &[f32]) -> Result<(f32, f32)> {
-    ensure!(actual.len() == expected.len(), "vector dimensions differ");
-    ensure!(
-        actual.iter().all(|x| x.is_finite()),
-        "nonfinite native vector"
-    );
-    let max_error = actual
-        .iter()
-        .zip(expected)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0_f32, f32::max);
-    let dot: f32 = actual.iter().zip(expected).map(|(a, b)| a * b).sum();
-    Ok((max_error, dot))
-}
-fn read_json(path: impl AsRef<Path>) -> Result<Value> {
-    Ok(serde_json::from_slice(&fs::read(path)?)?)
-}
 fn main() -> Result<()> {
     let id = std::env::args()
         .nth(1)
@@ -46,7 +17,7 @@ fn main() -> Result<()> {
     } else {
         runtime::initialize_bundled_runtime(ExecutionProvider::Cpu)?;
     }
-    let text_cases = read_json(root.join("tokenizer-tests.json"))?;
+    let text_cases = read_cases::<TextCase>(root.join("tokenizer-tests.json"))?;
     let files = fastembed::TokenizerFiles {
         tokenizer_file: fs::read(root.join("tokenizer.json"))?,
         tokenizer_config_file: fs::read(root.join("tokenizer_config.json"))?,
@@ -62,24 +33,18 @@ fn main() -> Result<()> {
     )?;
     let mut text_max_error = 0.0_f32;
     let mut text_count = 0;
-    for case in text_cases.as_array().context("text cases missing")? {
-        let prompt = case["text"].as_str().context("text missing")?;
+    for case in &text_cases {
+        let prompt = case.text.as_str();
         let encoding = text
             .tokenizer
             .encode(prompt, true)
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        let ids: Vec<u32> = case["ids"]
-            .as_array()
-            .context("ids missing")?
-            .iter()
-            .map(|id| id.as_u64().unwrap() as u32)
-            .collect();
         ensure!(
-            encoding.get_ids() == ids,
+            encoding.get_ids() == case.ids,
             "token IDs differ in case {text_count}"
         );
         let actual = text.embed([prompt], Some(1))?.remove(0);
-        let (error, similarity) = compare(&actual, &vector(&case["embedding"])?)?;
+        let (error, similarity) = compare(&actual, &case.embedding)?;
         ensure!(
             error < 0.0005 && similarity > 0.9999,
             "text vector differs in case {text_count}: {error}, {similarity}"
@@ -92,12 +57,12 @@ fn main() -> Result<()> {
         model,
         ..Default::default()
     })?;
-    let image_cases = read_json(root.join("image-tests.json"))?;
+    let image_cases = read_cases::<ImageCase>(root.join("image-tests.json"))?;
     let mut minimum_cosine = 1.0_f32;
     let mut image_max_error = 0.0_f32;
     let mut image_count = 0;
-    for case in image_cases.as_array().context("image cases missing")? {
-        let path = Path::new(case["path"].as_str().context("image path missing")?);
+    for case in &image_cases {
+        let path = case.path.as_path();
         // Fixtures are deliberately limited to the non-private test corpus.
         ensure!(
             path.components().any(|part| part.as_os_str() == "catcopy"),
@@ -120,7 +85,7 @@ fn main() -> Result<()> {
             )?;
         }
         let actual = image.embed_preprocessed_images(vec![pixels])?.remove(0);
-        let (error, similarity) = compare(&actual, &vector(&case["embedding"])?)?;
+        let (error, similarity) = compare(&actual, &case.embedding)?;
         // Pillow and Rust bicubic filters are not bit-identical; compare semantic vectors.
         ensure!(
             similarity > 0.9999,

@@ -1,8 +1,6 @@
 //! Extractors that reject with the API's error envelope.
 //!
-//! Axum's own `Query`, `Json`, and `Bytes` rejections answer with a plain-text body, which the
-//! desktop client cannot parse and which previously leaked out of the JSON contract for any
-//! malformed request. These wrappers are the only extractors the routes use.
+//! These wrappers map Axum extractor failures to the API's JSON error contract.
 
 use axum::body::Bytes;
 use axum::extract::{FromRequest, FromRequestParts, Json, Query, Request};

@@ -29,5 +29,5 @@ CREATE TABLE catalog_meta(
     revision INTEGER NOT NULL CHECK(revision >= 0)
 );
 INSERT INTO catalog_meta(singleton, revision) VALUES (1, 0);
-PRAGMA user_version = 5;
+PRAGMA user_version = 6;
 COMMIT;

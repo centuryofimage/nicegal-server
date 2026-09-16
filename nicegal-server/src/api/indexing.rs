@@ -1,8 +1,9 @@
+use super::jobs::is_cancelled;
 use std::sync::{Arc, Mutex};
 
 use camino::Utf8PathBuf as PathBuf;
 use glob::Pattern;
-use nicegal_core::assets::AssetCatalog;
+use nicegal_core::assets::{Asset, AssetCatalog};
 use nicegal_core::db::DB;
 use nicegal_core::index::{self, IndexObserver, IndexOptions};
 use nicegal_core::ocr::PaddleOcrPool;
@@ -71,7 +72,7 @@ struct CatalogScanOptions {
     recursive: bool,
     #[serde(default = "default_excludes")]
     exclude: Vec<String>,
-    /// Benchmark/debug guardrail. Production callers should omit this and catalog the whole root.
+    /// Debug guardrail. Production callers should omit this and catalog the whole root.
     debug_limit: Option<usize>,
 }
 
@@ -139,15 +140,18 @@ pub(crate) fn run(
     ocr_database: &PathBuf,
     models: Option<&Arc<Mutex<PaddleOcrPool>>>,
     observer: &dyn IndexObserver,
-    catalog_step: impl FnOnce() -> anyhow::Result<bool>,
+    catalog_step: impl FnOnce(&[Asset]) -> anyhow::Result<()>,
 ) -> anyhow::Result<index::IndexSummary> {
     let mut assets = AssetCatalog::new(asset_database)?;
     if !spec.ocr {
-        let summary = index::catalog_dir_observed(&assets, &spec.root, spec.options, observer)?;
+        let summary =
+            index::catalog_dir_with_step(&assets, &spec.root, spec.options, observer, |catalog| {
+                cancellation_result(catalog_step(catalog))
+            })?;
         return Ok(index::IndexSummary {
             indexed: 0,
             deleted: 0,
-            cancelled: summary.cancelled || catalog_step()?,
+            cancelled: summary.cancelled,
             scan_complete: summary.scan_complete,
         });
     }
@@ -163,19 +167,32 @@ pub(crate) fn run(
         &spec.root,
         spec.options,
         observer,
-        catalog_step,
+        |catalog| cancellation_result(catalog_step(catalog)),
     )?;
     Ok(summary)
+}
+
+fn cancellation_result(result: anyhow::Result<()>) -> anyhow::Result<bool> {
+    match result {
+        Ok(()) => Ok(false),
+        Err(error) if is_cancelled(&error) => Ok(true),
+        Err(error) => Err(error),
+    }
 }
 
 pub(crate) fn run_catalog_sync(
     spec: CatalogSyncSpec,
     asset_database: &PathBuf,
     observer: &dyn IndexObserver,
-) -> anyhow::Result<index::CatalogSummary> {
+) -> anyhow::Result<(index::CatalogSummary, Vec<Asset>)> {
     let assets = AssetCatalog::new(asset_database)?;
-    let summary = index::catalog_dir_observed(&assets, &spec.root, spec.options, observer)?;
-    Ok(summary)
+    let mut scanned = Vec::new();
+    let summary =
+        index::catalog_dir_with_step(&assets, &spec.root, spec.options, observer, |catalog| {
+            scanned.extend_from_slice(catalog);
+            Ok(false)
+        })?;
+    Ok((summary, scanned))
 }
 
 impl CatalogSyncSpec {
@@ -299,11 +316,12 @@ mod tests {
             &directory.join("ocr.db"),
             None,
             &Observer,
-            || {
+            |catalog| {
+                assert!(catalog.is_empty());
                 called = true;
                 assert!(directory.join("assets.db").exists());
                 assert!(!directory.join("ocr.db").exists());
-                Ok(true)
+                crate::api::jobs::cancel_if(true)
             },
         )
         .unwrap();

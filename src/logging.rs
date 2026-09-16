@@ -1,14 +1,10 @@
 //! Two independent layers are installed on one subscriber:
 //!
-//! - A **console** layer on stderr: compact, coloured, human text, always filtered by
-//!   [`DEFAULT_DIRECTIVES`] regardless of `RUST_LOG`. This is the stream a parent process (the
-//!   desktop app's dev console, a terminal) forwards to a person, so it never carries span
-//!   open/close noise and never grows louder just because someone turned up diagnostics.
-//! - A **file** layer, JSON, in the caller's log directory: filtered by `RUST_LOG`/`--log` the
+//! - A **console** layer on stderr: compact human text filtered by [`DEFAULT_DIRECTIVES`].
+//! - A **file** layer, JSON, in the caller's log directory: filtered by `RUST_LOG` or `--log`,
+//!   with the default directives used when neither is set.
 //!
-//! Both writers are non-blocking (`tracing_appender`): formatting and disk I/O happen on a
-//! background thread, off the request/job path. The returned [`LoggingGuards`] must be kept
-//! alive for the rest of the process, or buffered lines never reach disk.
+//! Both writers use background I/O. Keep [`LoggingGuards`] alive to flush buffered lines.
 
 use std::fs::{self, OpenOptions};
 

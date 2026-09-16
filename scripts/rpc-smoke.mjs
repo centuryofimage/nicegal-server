@@ -1,10 +1,9 @@
+import { spawnServer, createAndWaitForJob, waitForJob, readReadyMessage, stopChild, withTimeout } from './server-harness.mjs'
 import assert from 'node:assert/strict'
 import { randomBytes } from 'node:crypto'
 import { once } from 'node:events'
-import { copyFile, mkdir, mkdtemp, realpath, rm, unlink } from 'node:fs/promises'
+import { copyFile, mkdir, mkdtemp, realpath, readFile, rm, unlink } from 'node:fs/promises'
 import { DatabaseSync } from 'node:sqlite'
-import { createInterface } from 'node:readline'
-import { spawn } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -20,8 +19,6 @@ const textSourcePath = await realpath(
   join(repository, '..', 'testdata', 'pink', 'SmartSelect_20201224-134223_Firefox Beta.jpg')
 )
 const temporaryDirectory = await mkdtemp(join(tmpdir(), `nicegal-server-rpc-smoke-${process.pid}-`))
-const assetDatabasePath = join(temporaryDirectory, 'assets.db')
-const thumbnailDatabasePath = join(temporaryDirectory, 'thumbnails.db')
 const ocrDatabasePath = join(temporaryDirectory, 'index.db')
 const indexRoot = join(temporaryDirectory, 'images')
 const textIndexRoot = join(temporaryDirectory, 'ocr-text')
@@ -38,26 +35,7 @@ await mkdir(textIndexRoot)
 await copyFile(sourcePath, indexedSourcePath)
 await copyFile(textSourcePath, indexedTextPath)
 
-const child = spawn(
-  executable,
-  [
-    '--asset-database',
-    assetDatabasePath,
-    '--ocr-database',
-    ocrDatabasePath,
-    '--thumbnail-database',
-    thumbnailDatabasePath
-  ],
-  {
-    cwd: repository,
-    env: {
-      ...process.env,
-      NICEGAL_RPC_TOKEN: token
-    },
-    stdio: ['pipe', 'pipe', 'pipe'],
-    windowsHide: true
-  }
-)
+const child = spawnServer({ executable, repository, stateDirectory: temporaryDirectory, token })
 let stderr = ''
 child.stderr.setEncoding('utf8')
 child.stderr.on('data', (chunk) => {
@@ -65,27 +43,49 @@ child.stderr.on('data', (chunk) => {
 })
 
 try {
-  const ready = await withTimeout(readReadyMessage(child), 10_000, 'server readiness')
+  const ready = await withTimeout(readReadyMessage(child, () => stderr), 10_000, 'server readiness')
   assert.equal(ready.apiVersion, 1)
   assert.match(ready.endpoint, /^http:\/\/127\.0\.0\.1:\d+$/)
 
-  const unauthorized = await fetch(`${ready.endpoint}/v1/health`)
+  await verifyHealth(ready.endpoint)
+  const jobs = await loadModelsAndIndex(ready.endpoint)
+  prepareSearchFixture()
+  await verifyJobs(ready.endpoint, jobs)
+  const asset = await loadAsset(ready.endpoint)
+  await verifyOnDemandThumbnail(ready.endpoint, asset.assetId)
+  await verifyTextSearchAndEmbeddings(ready.endpoint, asset.assetId)
+  await verifyCombinedSearch(ready.endpoint, asset.assetId)
+  await verifyTimeFilters(ready.endpoint, asset)
+  await verifySearchErrorsAndDistance(ready.endpoint)
+  await verifyHttpErrors(ready.endpoint)
+  await verifyThumbnailRoundTrip(ready.endpoint, asset)
+  await verifyPrune(ready.endpoint)
+  await verifyShutdown()
+} finally {
+  await stopChild(child)
+  await rm(temporaryDirectory, { force: true, recursive: true, maxRetries: 10, retryDelay: 50 })
+}
+
+async function verifyHealth(endpoint) {
+  const unauthorized = await fetch(`${endpoint}/v1/health`)
   assert.equal(unauthorized.status, 401)
 
-  const health = await fetch(`${ready.endpoint}/v1/health`, {
+  const health = await fetch(`${endpoint}/v1/health`, {
     headers: { authorization: `Bearer ${token}` }
   })
   assert.equal(health.status, 200)
   assert.deepEqual(await health.json(), { apiVersion: 1 })
+}
 
-  const unloadedIndex = await fetch(`${ready.endpoint}/v1/jobs`, {
+async function loadModelsAndIndex(endpoint) {
+  const unloadedIndex = await fetch(`${endpoint}/v1/jobs`, {
     method: 'POST',
     headers: {
       authorization: `Bearer ${token}`,
       'content-type': 'application/json'
     },
     body: JSON.stringify({
-      type: 'ocrIndex',
+      type: 'libraryIndex',
       params: { root: indexRoot }
     })
   })
@@ -96,7 +96,7 @@ try {
     detection: { modelId: 'PaddlePaddle/PP-OCRv6_small_det_onnx' },
     recognition: { modelId: 'PaddlePaddle/PP-OCRv6_small_rec_onnx' }
   }
-  const modelLoaded = await runTypedJob(ready.endpoint, token, 'ocrModelLoad', modelRequest)
+  const modelLoaded = await createAndWaitForJob(endpoint, token, 'ocrModelLoad', modelRequest)
   assert.equal(modelLoaded.type, 'ocrModelLoad')
   assert.equal(modelLoaded.status, 'completed')
   assert.equal(modelLoaded.phase, 'finished')
@@ -105,7 +105,7 @@ try {
   assert.ok(modelLoaded.progress.downloadedBytes <= modelLoaded.progress.downloadTotalBytes)
   assert.deepEqual(modelLoaded.errors, [])
 
-  const cached = await runTypedJob(ready.endpoint, token, 'ocrModelLoad', modelRequest)
+  const cached = await createAndWaitForJob(endpoint, token, 'ocrModelLoad', modelRequest)
   assert.equal(cached.status, 'completed')
   assert.equal(cached.progress.processed, 2)
   assert.equal(cached.progress.downloadedBytes, 0)
@@ -113,7 +113,7 @@ try {
   assert.equal(cached.progress.modelsLoaded, 2)
   assert.deepEqual(cached.errors, [])
 
-  const modelStatus = await fetch(`${ready.endpoint}/v1/ocr/models`, {
+  const modelStatus = await fetch(`${endpoint}/v1/ocr/models`, {
     headers: { authorization: `Bearer ${token}` }
   })
   await assertStatus(modelStatus, 200)
@@ -131,10 +131,10 @@ try {
     }
   })
 
-  const recognized = await runTypedJob(ready.endpoint, token, 'ocrIndex', {
+  const recognized = await createAndWaitForJob(endpoint, token, 'libraryIndex', {
     root: textIndexRoot
   })
-  assert.equal(recognized.type, 'ocrIndex')
+  assert.equal(recognized.type, 'libraryIndex')
   assert.equal(recognized.status, 'completed')
   assert.equal(recognized.phase, 'finished')
   assert.equal(recognized.progress.discovered, 1)
@@ -145,10 +145,10 @@ try {
   assert.equal(recognized.progress.failed, 0)
   assert.deepEqual(recognized.errors, [])
 
-  const indexed = await runTypedJob(ready.endpoint, token, 'ocrIndex', {
+  const indexed = await createAndWaitForJob(endpoint, token, 'libraryIndex', {
     root: indexRoot
   })
-  assert.equal(indexed.type, 'ocrIndex')
+  assert.equal(indexed.type, 'libraryIndex')
   assert.equal(indexed.status, 'completed')
   assert.equal(indexed.progress.discovered, 1)
   assert.equal(indexed.progress.cataloged, 1)
@@ -156,7 +156,10 @@ try {
   assert.equal(indexed.progress.indexed, 1)
   assert.equal(indexed.progress.failed, 0)
   assert.deepEqual(indexed.errors, [])
+  return { indexed, cached }
+}
 
+function prepareSearchFixture() {
   // The remainder of this smoke test exercises deterministic search text. The row itself must
   // come from the real scan/catalog/decode/detect/recognize pipeline before its content is fixed.
   const ocr = new DatabaseSync(ocrDatabasePath)
@@ -180,8 +183,10 @@ try {
     indexedRow.asset_id
   )
   ocr.close()
+}
 
-  const jobs = await fetch(`${ready.endpoint}/v1/jobs`, {
+async function verifyJobs(endpoint, { indexed, cached }) {
+  const jobs = await fetch(`${endpoint}/v1/jobs`, {
     headers: { authorization: `Bearer ${token}` }
   })
   await assertStatus(jobs, 200)
@@ -191,7 +196,7 @@ try {
   assert.equal(jobList.jobs[0].jobId, indexed.jobId)
 
   const cancelledCompletedJob = await fetch(
-    `${ready.endpoint}/v1/jobs/${cached.jobId}`,
+    `${endpoint}/v1/jobs/${cached.jobId}`,
     {
       method: 'DELETE',
       headers: { authorization: `Bearer ${token}` }
@@ -200,12 +205,15 @@ try {
   await assertStatus(cancelledCompletedJob, 200)
   assert.equal((await cancelledCompletedJob.json()).status, 'completed')
 
-  const missingJob = await fetch(`${ready.endpoint}/v1/jobs/999999`, {
+  const missingJob = await fetch(`${endpoint}/v1/jobs/999999`, {
     headers: { authorization: `Bearer ${token}` }
   })
   await assertStatus(missingJob, 404)
   assert.equal((await missingJob.json()).error.code, 'job_not_found')
-  const assetUrl = new URL('/v1/assets', ready.endpoint)
+}
+
+async function loadAsset(endpoint) {
+  const assetUrl = new URL('/v1/assets', endpoint)
   assetUrl.searchParams.set('path', indexedSourcePath)
   const assetResponse = await fetch(assetUrl, {
     headers: { authorization: `Bearer ${token}` }
@@ -221,8 +229,11 @@ try {
   assert.ok(asset.sourceSize > 0)
   const assetId = asset.assetId
   assert.ok(Number.isSafeInteger(assetId) && assetId > 0)
+  return asset
+}
 
-  const ensuredResponse = await fetch(`${ready.endpoint}/v1/thumbnails`, {
+async function verifyOnDemandThumbnail(endpoint, assetId) {
+  const ensuredResponse = await fetch(`${endpoint}/v1/thumbnails`, {
     method: 'POST',
     headers: {
       authorization: `Bearer ${token}`,
@@ -237,7 +248,7 @@ try {
     sizeBucket: 128,
     generatorVersion: 1
   })
-  const ensuredLookup = new URL('/v1/thumbnails', ready.endpoint)
+  const ensuredLookup = new URL('/v1/thumbnails', endpoint)
   ensuredLookup.searchParams.set('assetId', assetId.toString())
   ensuredLookup.searchParams.set('requestedSize', '100')
   ensuredLookup.searchParams.set('generatorVersion', '1')
@@ -246,8 +257,10 @@ try {
   })
   await assertStatus(ensuredThumbnail, 200)
   assert.equal(ensuredThumbnail.headers.get('x-nicegal-server-size-bucket'), '128')
+}
 
-  const searchUrl = new URL('/v1/search', ready.endpoint)
+async function verifyTextSearchAndEmbeddings(endpoint, assetId) {
+  const searchUrl = new URL('/v1/search', endpoint)
   searchUrl.searchParams.set('q', '*')
   searchUrl.searchParams.set('type', 'glob')
   searchUrl.searchParams.set('root', indexRoot)
@@ -262,7 +275,7 @@ try {
 
   // Vector search: coverage is visible before anything is embedded, the backfill fills it, and
   // the default search mode then answers from the stored vectors.
-  const coverageUrl = new URL('/v1/text-embeddings', ready.endpoint)
+  const coverageUrl = new URL('/v1/text-embeddings', endpoint)
   coverageUrl.searchParams.set('root', indexRoot)
   const beforeResponse = await fetch(coverageUrl, {
     headers: { authorization: `Bearer ${token}` }
@@ -275,19 +288,19 @@ try {
   assert.ok(before.embedder.dimensions > 0, JSON.stringify(before))
 
   // The default mode is vector, and an unembedded library is empty rather than an error.
-  const unembedded = await fetch(searchRequestUrl(ready.endpoint, { q: 'pink', root: indexRoot }), {
+  const unembedded = await fetch(searchRequestUrl(endpoint, { q: 'pink', root: indexRoot }), {
     headers: { authorization: `Bearer ${token}` }
   })
   await assertStatus(unembedded, 200)
   assert.equal((await unembedded.json()).total, 0)
 
-  const embedCreated = await fetch(`${ready.endpoint}/v1/text-embeddings/generate`, {
+  const embedCreated = await fetch(`${endpoint}/v1/text-embeddings/generate`, {
     method: 'POST',
     headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
     body: JSON.stringify({ root: indexRoot })
   })
   await assertStatus(embedCreated, 202)
-  const embedJob = await waitForJob(ready.endpoint, token, await embedCreated.json())
+  const embedJob = await waitForJob(endpoint, token, await embedCreated.json())
   assert.equal(embedJob.type, 'embed')
   assert.equal(embedJob.status, 'completed')
   assert.equal(embedJob.progress.embedded, 1)
@@ -302,7 +315,7 @@ try {
   assert.equal(after.pending, 0)
   assert.equal(after.stored.model, after.embedder.model)
 
-  const vectorResponse = await fetch(searchRequestUrl(ready.endpoint, { q: 'pink', root: indexRoot }), {
+  const vectorResponse = await fetch(searchRequestUrl(endpoint, { q: 'pink', root: indexRoot }), {
     headers: { authorization: `Bearer ${token}` }
   })
   await assertStatus(vectorResponse, 200)
@@ -311,9 +324,11 @@ try {
   assert.deepEqual(vector.results.map((result) => result.assetId), [assetId])
   assert.equal(vector.results[0].rank, 1)
   assert.equal(typeof vector.results[0].distance, 'number')
+}
 
+async function verifyCombinedSearch(endpoint, assetId) {
   // Combined search: every mode answers from one snapshot, and the fused list names its sources.
-  const combinedResponse = await fetch(`${ready.endpoint}/v1/search`, {
+  const combinedResponse = await fetch(`${endpoint}/v1/search`, {
     method: 'POST',
     headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
     body: JSON.stringify({
@@ -335,7 +350,7 @@ try {
   assert.equal(combined.fused.results[0].assetId, assetId)
 
   // A query SQLite cannot parse fails the whole combined request rather than half-ranking it.
-  const combinedSyntax = await fetch(`${ready.endpoint}/v1/search`, {
+  const combinedSyntax = await fetch(`${endpoint}/v1/search`, {
     method: 'POST',
     headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
     body: JSON.stringify({
@@ -345,7 +360,9 @@ try {
   })
   await assertStatus(combinedSyntax, 400)
   assert.equal((await combinedSyntax.json()).error.code, 'query_syntax')
+}
 
+async function verifyTimeFilters(endpoint, asset) {
   // Time filtering applies to every mode, and the timeline is never chosen for the caller.
   const modifiedNs = asset.sourceModifiedNs
   const justBefore = (BigInt(modifiedNs) - 1n).toString()
@@ -356,7 +373,7 @@ try {
   // matrix, `simple` and `match` included, is covered by the db unit tests against fixed text.
   for (const [type, q] of [['vector', 'pink'], ['glob', '*']]) {
     const inside = await fetch(
-      searchRequestUrl(ready.endpoint, {
+      searchRequestUrl(endpoint, {
         q, type, root: indexRoot, timeline: 'modified', after: modifiedNs, before: justAfter
       }),
       { headers: { authorization: `Bearer ${token}` } }
@@ -365,7 +382,7 @@ try {
     assert.equal((await inside.json()).total, 1, `${type} lost the row inside its own range`)
 
     const outside = await fetch(
-      searchRequestUrl(ready.endpoint, {
+      searchRequestUrl(endpoint, {
         q, type, root: indexRoot, timeline: 'modified', after: justAfter
       }),
       { headers: { authorization: `Bearer ${token}` } }
@@ -376,7 +393,7 @@ try {
 
   // `after` is inclusive and `before` is exclusive, so adjacent ranges tile exactly once.
   const atUpperBound = await fetch(
-    searchRequestUrl(ready.endpoint, {
+    searchRequestUrl(endpoint, {
       q: '*', type: 'glob', root: indexRoot, timeline: 'modified', before: modifiedNs
     }),
     { headers: { authorization: `Bearer ${token}` } }
@@ -385,7 +402,7 @@ try {
   assert.equal((await atUpperBound.json()).total, 0, 'before is exclusive')
 
   const atLowerBound = await fetch(
-    searchRequestUrl(ready.endpoint, {
+    searchRequestUrl(endpoint, {
       q: '*', type: 'glob', root: indexRoot, timeline: 'modified', after: justBefore
     }),
     { headers: { authorization: `Bearer ${token}` } }
@@ -394,7 +411,7 @@ try {
   assert.equal((await atLowerBound.json()).total, 1, 'after is inclusive')
 
   // A bound without a timeline is refused rather than guessed at.
-  const missingTimeline = await searchError(ready.endpoint, token, {
+  const missingTimeline = await searchError(endpoint, token, {
     q: 'pink',
     type: 'simple',
     root: indexRoot,
@@ -404,7 +421,7 @@ try {
   assert.equal(missingTimeline.body.error.code, 'invalid_request')
   assert.match(missingTimeline.body.error.message, /timeline is required/)
 
-  const reversedRange = await searchError(ready.endpoint, token, {
+  const reversedRange = await searchError(endpoint, token, {
     q: 'pink',
     type: 'simple',
     root: indexRoot,
@@ -416,7 +433,7 @@ try {
   assert.equal(reversedRange.body.error.code, 'invalid_request')
 
   // The combined form takes a request-level range that each query can replace outright.
-  const combinedRange = await fetch(`${ready.endpoint}/v1/search`, {
+  const combinedRange = await fetch(`${endpoint}/v1/search`, {
     method: 'POST',
     headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
     body: JSON.stringify({
@@ -433,10 +450,12 @@ try {
   const ranged = await combinedRange.json()
   assert.equal(ranged.queries[0].total, 0)
   assert.equal(ranged.queries[1].total, 1)
+}
 
+async function verifySearchErrorsAndDistance(endpoint) {
   // Error contract: a failure the user can fix must be a 4xx carrying a displayable cause,
   // never the generic 500 the renderer used to have to guess at.
-  const syntaxError = await searchError(ready.endpoint, token, {
+  const syntaxError = await searchError(endpoint, token, {
     q: 'ocr:"unterminated',
     type: 'simple',
     root: indexRoot
@@ -445,7 +464,7 @@ try {
   assert.equal(syntaxError.body.error.code, 'query_syntax')
   assert.match(syntaxError.body.error.message, /unterminated string/)
 
-  const ftsError = await searchError(ready.endpoint, token, {
+  const ftsError = await searchError(endpoint, token, {
     q: 'AND',
     type: 'match',
     root: indexRoot
@@ -454,18 +473,18 @@ try {
   assert.equal(ftsError.body.error.code, 'query_syntax')
   assert.match(ftsError.body.error.message, /fts5: syntax error/)
 
-  const missingRoot = await searchError(ready.endpoint, token, {
+  const missingRoot = await searchError(endpoint, token, {
     q: 'pink',
     root: join(indexRoot, 'definitely-missing')
   })
   assert.equal(missingRoot.status, 400)
   assert.equal(missingRoot.body.error.code, 'invalid_root')
 
-  const relativeRoot = await searchError(ready.endpoint, token, { q: 'pink', root: 'relative' })
+  const relativeRoot = await searchError(endpoint, token, { q: 'pink', root: 'relative' })
   assert.equal(relativeRoot.status, 400)
   assert.equal(relativeRoot.body.error.code, 'invalid_root')
 
-  const missingParameter = await searchError(ready.endpoint, token, { q: 'pink' })
+  const missingParameter = await searchError(endpoint, token, { q: 'pink' })
   assert.equal(missingParameter.status, 400)
   assert.equal(missingParameter.body.error.code, 'invalid_request')
 
@@ -473,14 +492,14 @@ try {
   // the text modes: vector search ranks neighbours by distance and has no notion of "no match", so
   // it answers with the nearest rows until `maxDistance` says otherwise.
   const noMatches = await fetch(
-    searchRequestUrl(ready.endpoint, { q: 'zzzznotpresent', type: 'simple', root: indexRoot }),
+    searchRequestUrl(endpoint, { q: 'zzzznotpresent', type: 'simple', root: indexRoot }),
     { headers: { authorization: `Bearer ${token}` } }
   )
   await assertStatus(noMatches, 200)
   assert.equal((await noMatches.json()).total, 0)
 
   const looseNeighbours = await fetch(
-    searchRequestUrl(ready.endpoint, { q: 'zzzznotpresent', root: indexRoot }),
+    searchRequestUrl(endpoint, { q: 'zzzznotpresent', root: indexRoot }),
     { headers: { authorization: `Bearer ${token}` } }
   )
   await assertStatus(looseNeighbours, 200)
@@ -488,13 +507,13 @@ try {
 
   // A distance ceiling is how a caller asks for "close enough" rather than "closest".
   const tightNeighbours = await fetch(
-    searchRequestUrl(ready.endpoint, { q: 'pink', root: indexRoot, maxDistance: '0' }),
+    searchRequestUrl(endpoint, { q: 'pink', root: indexRoot, maxDistance: '0' }),
     { headers: { authorization: `Bearer ${token}` } }
   )
   await assertStatus(tightNeighbours, 200)
   assert.ok((await tightNeighbours.json()).total <= 1)
 
-  const distanceOnText = await searchError(ready.endpoint, token, {
+  const distanceOnText = await searchError(endpoint, token, {
     q: 'pink',
     type: 'glob',
     root: indexRoot,
@@ -502,30 +521,37 @@ try {
   })
   assert.equal(distanceOnText.status, 400)
   assert.equal(distanceOnText.body.error.code, 'invalid_request')
+}
 
+async function verifyHttpErrors(endpoint) {
   // Unmatched routes, wrong methods, and malformed bodies use the same envelope.
-  const unknownRoute = await fetch(`${ready.endpoint}/v1/does-not-exist`, {
+  const unknownRoute = await fetch(`${endpoint}/v1/does-not-exist`, {
     headers: { authorization: `Bearer ${token}` }
   })
   await assertStatus(unknownRoute, 404)
   assert.equal((await unknownRoute.json()).error.code, 'not_found')
 
-  const wrongMethod = await fetch(`${ready.endpoint}/v1/health`, {
+  const wrongMethod = await fetch(`${endpoint}/v1/health`, {
     method: 'DELETE',
     headers: { authorization: `Bearer ${token}` }
   })
   await assertStatus(wrongMethod, 405)
   assert.equal((await wrongMethod.json()).error.code, 'method_not_allowed')
 
-  const malformedBody = await fetch(`${ready.endpoint}/v1/jobs`, {
+  const malformedBody = await fetch(`${endpoint}/v1/jobs`, {
     method: 'POST',
     headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
     body: '{not json'
   })
   await assertStatus(malformedBody, 400)
   assert.equal((await malformedBody.json()).error.code, 'invalid_request')
+}
 
-  const backfillCreated = await fetch(`${ready.endpoint}/v1/thumbnails/generate`, {
+async function verifyThumbnailRoundTrip(endpoint, asset) {
+  const { assetId } = asset
+  const sourceModifiedNs = BigInt(asset.sourceModifiedNs)
+
+  const backfillCreated = await fetch(`${endpoint}/v1/thumbnails/generate`, {
     method: 'POST',
     headers: {
       authorization: `Bearer ${token}`,
@@ -541,13 +567,13 @@ try {
     })
   })
   await assertStatus(backfillCreated, 202)
-  const backfill = await waitForJob(ready.endpoint, token, await backfillCreated.json())
+  const backfill = await waitForJob(endpoint, token, await backfillCreated.json())
   assert.equal(backfill.type, 'thumbnailGenerate')
   assert.equal(backfill.status, 'completed')
   assert.equal(backfill.progress.thumbnailsGenerated, 1)
   assert.deepEqual(backfill.errors, [])
 
-  const thumbnailUrl = new URL('/v1/thumbnails', ready.endpoint)
+  const thumbnailUrl = new URL('/v1/thumbnails', endpoint)
   thumbnailUrl.searchParams.set('assetId', assetId.toString())
   thumbnailUrl.searchParams.set('sizeBucket', '128')
   thumbnailUrl.searchParams.set('generatorVersion', '1')
@@ -592,14 +618,16 @@ try {
   assert.equal(loaded.headers.get('x-nicegal-server-thumbnail-width'), '1')
   assert.equal(loaded.headers.get('x-nicegal-server-thumbnail-height'), '1')
   assert.deepEqual(Buffer.from(await loaded.arrayBuffer()), thumbnailBytes)
+}
 
+async function verifyPrune(endpoint) {
   await unlink(indexedSourcePath)
-  const dryPrune = await runTypedJob(ready.endpoint, token, 'pruneMissing', { root: indexRoot })
+  const dryPrune = await createAndWaitForJob(endpoint, token, 'pruneMissing', { root: indexRoot })
   assert.equal(dryPrune.progress.pruneCandidates, 1)
   assert.equal(dryPrune.progress.deleted, 0)
   assert.deepEqual(dryPrune.errors, [])
 
-  const pruned = await runTypedJob(ready.endpoint, token, 'pruneMissing', {
+  const pruned = await createAndWaitForJob(endpoint, token, 'pruneMissing', {
     root: indexRoot,
     dryRun: false
   })
@@ -607,25 +635,25 @@ try {
   assert.equal(pruned.progress.deleted, 1)
   assert.deepEqual(pruned.errors, [])
 
-  const emptyPrune = await runTypedJob(ready.endpoint, token, 'pruneMissing', { root: indexRoot })
+  const emptyPrune = await createAndWaitForJob(endpoint, token, 'pruneMissing', { root: indexRoot })
   assert.equal(emptyPrune.progress.total, 0)
+}
 
+async function verifyShutdown() {
   child.stdin.end()
   const [exitCode, signal] = await withTimeout(once(child, 'exit'), 5_000, 'server shutdown')
   assert.equal(signal, null)
   assert.equal(exitCode, 0, stderr)
-  assert.match(stderr, /paddle_ocr_load/)
+  const trace = await readFile(join(temporaryDirectory, 'nicegal-server.log'), 'utf8')
+  assert.match(trace, /paddle_ocr_load/)
   assert.ok(
-    (stderr.match(/onnx_compile/g) ?? []).length >= 4,
-    `expected detector and recognizer compilation traces for both loads\n${stderr}`
+    (trace.match(/onnx_compile/g) ?? []).length >= 4,
+    `expected detector and recognizer compilation traces for both loads\n${trace}`
   )
 
   console.log(
     `RPC smoke passed: indexed with PaddleOCR and round-tripped ${thumbnailBytes.length} thumbnail bytes`
   )
-} finally {
-  await stopChild(child)
-  await rm(temporaryDirectory, { force: true, recursive: true, maxRetries: 10, retryDelay: 50 })
 }
 
 function searchRequestUrl(endpoint, parameters) {
@@ -653,110 +681,4 @@ async function searchError(endpoint, token, parameters) {
 async function assertStatus(response, expected) {
   if (response.status === expected) return
   assert.equal(response.status, expected, `${await response.text()}\n${stderr}`)
-}
-
-async function runTypedJob(endpoint, token, type, params) {
-  const created = await fetch(`${endpoint}/v1/jobs`, {
-    method: 'POST',
-    headers: {
-      authorization: `Bearer ${token}`,
-      'content-type': 'application/json'
-    },
-    body: JSON.stringify({ type, params })
-  })
-  await assertStatus(created, 202)
-  return waitForJob(endpoint, token, await created.json())
-}
-
-async function waitForJob(endpoint, token, initialJob) {
-  let job = initialJob
-  const terminal = new Set(['cancelled', 'completed', 'failed'])
-  assert.match(job.jobId, /^[1-9]\d*$/)
-  if (!terminal.has(job.status)) {
-    const response = await fetch(`${endpoint}/v1/jobs/${job.jobId}/events`, {
-      headers: { authorization: `Bearer ${token}` }
-    })
-    await assertStatus(response, 200)
-    for await (const snapshot of sseSnapshots(response)) {
-      job = snapshot
-    }
-  }
-  assert.ok(terminal.has(job.status), `index job did not finish:\n${JSON.stringify(job)}\n${stderr}`)
-  assert.notEqual(job.status, 'failed', job.error)
-  return job
-}
-
-async function* sseSnapshots(response) {
-  let buffer = ''
-  for await (const chunk of response.body.pipeThrough(new TextDecoderStream())) {
-    buffer += chunk.replaceAll('\r\n', '\n')
-    let boundary
-    while ((boundary = buffer.indexOf('\n\n')) !== -1) {
-      const block = buffer.slice(0, boundary)
-      buffer = buffer.slice(boundary + 2)
-      const data = block
-        .split('\n')
-        .filter((line) => line.startsWith('data:'))
-        .map((line) => line.slice(5).trimStart())
-        .join('\n')
-      if (data) yield JSON.parse(data)
-    }
-  }
-}
-
-async function stopChild(process) {
-  if (process.exitCode !== null || process.signalCode !== null) return
-
-  const gracefulExit = once(process, 'exit')
-  if (!process.stdin.writableEnded) process.stdin.end()
-  try {
-    await withTimeout(gracefulExit, 5_000, 'server cleanup')
-    return
-  } catch {
-    // Fall through to forced termination after the graceful deadline.
-  }
-
-  if (process.exitCode === null && process.signalCode === null) {
-    const forcedExit = once(process, 'exit')
-    process.kill()
-    await withTimeout(forcedExit, 5_000, 'forced server cleanup')
-  }
-}
-
-function readReadyMessage(process) {
-  return new Promise((resolve, reject) => {
-    const lines = createInterface({ input: process.stdout })
-    const onError = (error) => {
-      lines.close()
-      reject(error)
-    }
-    const onExit = (code, signal) => {
-      lines.close()
-      reject(new Error(`server exited before readiness: code=${code} signal=${signal}\n${stderr}`))
-    }
-
-    process.once('error', onError)
-    process.once('exit', onExit)
-    lines.once('line', (line) => {
-      process.off('error', onError)
-      process.off('exit', onExit)
-      lines.close()
-      try {
-        resolve(JSON.parse(line))
-      } catch (error) {
-        reject(new Error(`invalid readiness message: ${line}`, { cause: error }))
-      }
-    })
-  })
-}
-
-function withTimeout(promise, milliseconds, operation) {
-  let timer
-  const timeout = new Promise((_, reject) => {
-    timer = setTimeout(
-      () => reject(new Error(`${operation} timed out after ${milliseconds}ms`)),
-      milliseconds
-    )
-  })
-  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer))
 }

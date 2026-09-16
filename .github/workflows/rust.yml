@@ -1,4 +1,4 @@
-name: Build Windows server
+name: Check Rust
 
 on:
   push:
@@ -8,133 +8,50 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: windows-release-${{ github.ref }}
-  cancel-in-progress: false
+  group: rust-check-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
-  contents: write
-  id-token: write
-  attestations: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-    if: github.repository == 'centuryofimage/nicegal-server'
-    runs-on: windows-latest
+  check:
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
           persist-credentials: false
 
-      - name: Choose the release version
-        id: version
-        shell: bash
-        run: |
-          latest=$(git tag -l 'v0.0.*' --sort=-v:refname | head -n1)
-          if [ -z "$latest" ]; then
-            version=0.0.1
-          else
-            version="0.0.$(( ${latest#v0.0.} + 1 ))"
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-
       - name: Setup MSVC
-        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
 
-      - name: Locate libclang
-        shell: pwsh
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
         run: |
-          $candidates = @(
-            "$env:ProgramFiles/LLVM/bin",
-            "$env:VCINSTALLDIR/Tools/Llvm/x64/bin"
-          )
-          $clangDirectory = $candidates | Where-Object {
-            Test-Path -LiteralPath (Join-Path $_ 'libclang.dll')
-          } | Select-Object -First 1
-          if (-not $clangDirectory) { throw 'The runner has no libclang.dll for Rust bindgen.' }
-          "LIBCLANG_PATH=$clangDirectory" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libssl-dev libclang-dev cmake nasm libvulkan1
 
-      - name: Locate Visual C++ runtime
-        shell: pwsh
-        run: |
-          $runtimeDirectory = Get-ChildItem -LiteralPath (Join-Path $env:VCToolsRedistDir 'x64') -Directory |
-            Where-Object {
-              $_.Name -like 'Microsoft.VC*.CRT' -and
-              (Test-Path -LiteralPath (Join-Path $_.FullName 'vcruntime140.dll')) -and
-              (Test-Path -LiteralPath (Join-Path $_.FullName 'msvcp140.dll'))
-            } | Sort-Object Name -Descending | Select-Object -First 1
-          if (-not $runtimeDirectory) { throw 'The runner has no x64 Visual C++ redistributable directory.' }
-          "NICEGAL_CRT_LIB_PATH=$($runtimeDirectory.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Setup Rust
-        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+      - name: Setup Rust with cache
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
-          target: x86_64-pc-windows-msvc
-          rustflags: ""
+          cache: true
+          build-warnings: warn
 
       - name: Setup uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
           enable-cache: true
 
-      - name: Build server and runtime libraries
+      # Cargo check runs build.rs, which stages the default providers' DLLs.
+      - name: Prepare native runtime dependencies
         shell: cmd
-        run: build-server.cmd
-
-      - name: Test workspace
-        shell: cmd
-        run: dev.cmd test --locked --workspace
-
+        run: |
+          uv venv --python 3.13 .venv-webgpu
+          uv pip install --python .venv-webgpu -r requirements-webgpu.txt
       - name: Check workspace
         shell: cmd
-        run: dev.cmd clippy --locked --workspace --all-targets
-
-      - name: Package server
-        env:
-          RELEASE_VERSION: ${{ steps.version.outputs.version }}
-        shell: pwsh
-        run: |
-          $packageDirectory = Join-Path $env:RUNNER_TEMP "nicegal-server-package"
-          New-Item -ItemType Directory -Path $packageDirectory -Force | Out-Null
-          Copy-Item -LiteralPath target/release/nicegal-server.exe -Destination $packageDirectory
-          Get-ChildItem -LiteralPath target/release -Filter '*.dll' -File |
-            Copy-Item -Destination $packageDirectory
-          Copy-Item -LiteralPath target/release/onnxruntime -Destination $packageDirectory -Recurse
-          Copy-Item -LiteralPath LICENSE,README.md -Destination $packageDirectory
-          $vendorLicenseDirectory = Join-Path $packageDirectory 'vendor/fastembed'
-          New-Item -ItemType Directory -Path $vendorLicenseDirectory -Force | Out-Null
-          Copy-Item -LiteralPath vendor/fastembed/LICENSE -Destination $vendorLicenseDirectory
-          New-Item -ItemType Directory -Path dist -Force | Out-Null
-          $archive = "dist/nicegal-server-$env:RELEASE_VERSION-windows-x64.zip"
-          Compress-Archive -Path "$packageDirectory/*" -DestinationPath $archive
-
-      - name: Attest Windows download
-        if: github.repository == 'centuryofimage/nicegal-server' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
-        id: attest
-        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
-        with:
-          subject-path: dist/*.zip
-
-      - name: Preserve the attestation bundle
-        if: github.repository == 'centuryofimage/nicegal-server' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
-        env:
-          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
-        shell: pwsh
-        run: Copy-Item -LiteralPath $env:BUNDLE_PATH -Destination dist/provenance.intoto.jsonl
-
-      - name: Tag and publish the release
-        if: github.repository == 'centuryofimage/nicegal-server' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_VERSION: ${{ steps.version.outputs.version }}
-        shell: bash
-        run: |
-          gh release create "v$RELEASE_VERSION" \
-            --target "$GITHUB_SHA" \
-            --title "nicegal-server $RELEASE_VERSION" \
-            --prerelease \
-            --notes-file CHANGELOG \
-            dist/*.zip dist/*.intoto.jsonl
+        run: dev.cmd check --locked --workspace --all-targets --exclude nicegal-cli

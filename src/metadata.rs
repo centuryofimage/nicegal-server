@@ -27,31 +27,69 @@ pub struct MetadataField {
     pub value: String,
 }
 
-pub fn inspect(asset: &Asset) -> FileMetadata {
-    let mut result = FileMetadata {
-        source_state: SourceState::Unavailable,
-        attributes: Vec::new(),
-        exif: Vec::new(),
-        error: None,
-    };
-    let metadata = match fs::metadata(&asset.path) {
+struct SourceCheck {
+    state: SourceState,
+    metadata: Option<fs::Metadata>,
+    error: Option<String>,
+}
+
+fn check_source(
+    expected: SourceFingerprint,
+    metadata: std::io::Result<fs::Metadata>,
+) -> SourceCheck {
+    let metadata = match metadata {
         Ok(metadata) => metadata,
         Err(error) => {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                result.source_state = SourceState::Missing;
-            } else {
-                result.error = Some(error.to_string());
-            }
-            return result;
+            let missing = error.kind() == std::io::ErrorKind::NotFound;
+            return SourceCheck {
+                state: if missing {
+                    SourceState::Missing
+                } else {
+                    SourceState::Unavailable
+                },
+                metadata: None,
+                error: (!missing).then(|| error.to_string()),
+            };
         }
     };
-    result.source_state = match SourceFingerprint::from_metadata(&metadata) {
-        Ok(fingerprint) if fingerprint == asset.fingerprint => SourceState::Current,
-        Ok(_) => SourceState::Changed,
-        Err(error) => {
-            result.error = Some(error.to_string());
-            return result;
-        }
+    match SourceFingerprint::from_metadata(&metadata) {
+        Ok(fingerprint) => SourceCheck {
+            state: if fingerprint == expected {
+                SourceState::Current
+            } else {
+                SourceState::Changed
+            },
+            metadata: Some(metadata),
+            error: None,
+        },
+        Err(error) => SourceCheck {
+            state: SourceState::Unavailable,
+            metadata: None,
+            error: Some(error.to_string()),
+        },
+    }
+}
+
+fn apply_source_recheck(result: &mut FileMetadata, source: SourceCheck) {
+    result.source_state = source.state;
+    if result.source_state != SourceState::Current {
+        result.exif.clear();
+        // EXIF and its errors describe a source we can no longer verify. Prefer the stat error,
+        // if any, so disappearance stays Missing and an unreadable source stays Unavailable.
+        result.error = source.error;
+    }
+}
+
+pub fn inspect(asset: &Asset) -> FileMetadata {
+    let source = check_source(asset.fingerprint, fs::metadata(&asset.path));
+    let mut result = FileMetadata {
+        source_state: source.state,
+        attributes: Vec::new(),
+        exif: Vec::new(),
+        error: source.error,
+    };
+    let Some(metadata) = source.metadata else {
+        return result;
     };
     if metadata.permissions().readonly() {
         result.attributes.push("Read-only");
@@ -110,14 +148,10 @@ pub fn inspect(asset: &Asset) -> FileMetadata {
         Err(error) => result.error = Some(error.to_string()),
     }
     // A source can be replaced while its EXIF is being read.
-    if fs::metadata(&asset.path)
-        .ok()
-        .and_then(|m| SourceFingerprint::from_metadata(&m).ok())
-        != Some(asset.fingerprint)
-    {
-        result.source_state = SourceState::Changed;
-        result.exif.clear();
-    }
+    apply_source_recheck(
+        &mut result,
+        check_source(asset.fingerprint, fs::metadata(&asset.path)),
+    );
     result
 }
 
@@ -126,6 +160,70 @@ mod tests {
     use super::*;
     use crate::assets::AssetCatalog;
     use camino::Utf8PathBuf;
+
+    #[test]
+    fn recheck_keeps_current_exif_and_discards_replaced_source_exif() -> anyhow::Result<()> {
+        let temp = tempfile::TempDir::new()?;
+        let path = temp.path().join("source");
+        fs::write(&path, "original")?;
+        let expected = SourceFingerprint::from_metadata(&fs::metadata(&path)?)?;
+        let mut result = FileMetadata {
+            source_state: SourceState::Current,
+            attributes: Vec::new(),
+            exif: vec![MetadataField {
+                label: "Camera make",
+                value: "camera".to_owned(),
+            }],
+            error: Some("EXIF warning".to_owned()),
+        };
+        apply_source_recheck(&mut result, check_source(expected, fs::metadata(&path)));
+        assert_eq!(result.source_state, SourceState::Current);
+        assert_eq!(result.exif.len(), 1);
+        assert_eq!(result.error.as_deref(), Some("EXIF warning"));
+
+        fs::write(&path, "replacement has a different size")?;
+        apply_source_recheck(&mut result, check_source(expected, fs::metadata(&path)));
+        assert_eq!(result.source_state, SourceState::Changed);
+        assert!(result.exif.is_empty());
+        assert!(result.error.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn recheck_preserves_missing_and_unavailable_instead_of_reporting_changed() {
+        let expected = SourceFingerprint {
+            modified_ns: 1,
+            size: 1,
+        };
+        for (kind, state, error) in [
+            (std::io::ErrorKind::NotFound, SourceState::Missing, None),
+            (
+                std::io::ErrorKind::PermissionDenied,
+                SourceState::Unavailable,
+                Some("permission denied"),
+            ),
+        ] {
+            let mut result = FileMetadata {
+                source_state: SourceState::Current,
+                attributes: Vec::new(),
+                exif: vec![MetadataField {
+                    label: "Camera make",
+                    value: "old camera".to_owned(),
+                }],
+                error: Some("old EXIF error".to_owned()),
+            };
+            apply_source_recheck(
+                &mut result,
+                check_source(
+                    expected,
+                    Err(std::io::Error::new(kind, "permission denied")),
+                ),
+            );
+            assert_eq!(result.source_state, state);
+            assert!(result.exif.is_empty());
+            assert_eq!(result.error.as_deref(), error);
+        }
+    }
 
     #[test]
     fn inspector_distinguishes_missing_changed_and_current_sources() -> anyhow::Result<()> {

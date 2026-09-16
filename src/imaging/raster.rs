@@ -73,7 +73,11 @@ impl Raster {
     pub fn has_alpha(&self) -> bool {
         match self {
             Self::Rgb { .. } => false,
-            Self::Rgba { pixels, .. } => pixels.chunks_exact(4).any(|pixel| pixel[3] != 255),
+            Self::Rgba { pixels, .. } => pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pixel| pixel[3] != 255),
         }
     }
 
@@ -83,7 +87,7 @@ impl Raster {
             Self::Rgba { pixels, .. } => pixels,
             Self::Rgb { pixels, .. } => {
                 let mut rgba = Vec::with_capacity(pixels.len() / 3 * 4);
-                for pixel in pixels.chunks_exact(3) {
+                for pixel in pixels.as_chunks::<3>().0 {
                     rgba.extend_from_slice(pixel);
                     rgba.push(255);
                 }
@@ -98,7 +102,7 @@ impl Raster {
             Self::Rgb { pixels, .. } => pixels,
             Self::Rgba { pixels, .. } => {
                 let mut rgb = Vec::with_capacity(pixels.len() / 4 * 3);
-                for pixel in pixels.chunks_exact(4) {
+                for pixel in pixels.as_chunks::<4>().0 {
                     rgb.extend_from_slice(&pixel[..3]);
                 }
                 rgb
@@ -115,7 +119,7 @@ impl Raster {
             Self::Rgb { pixels, .. } => pixels,
             Self::Rgba { pixels, .. } => {
                 let mut rgb = Vec::with_capacity(pixels.len() / 4 * 3);
-                for pixel in pixels.chunks_exact(4) {
+                for pixel in pixels.as_chunks::<4>().0 {
                     let alpha = u16::from(pixel[3]);
                     for channel in 0..3 {
                         let foreground = u16::from(pixel[channel]);
@@ -200,11 +204,7 @@ fn orient_pixels(
         }
     }
 
-    (
-        destination_width as u32,
-        destination_height as u32,
-        destination,
-    )
+    (destination_width as u32, destination_height, destination)
 }
 
 #[cfg(test)]
@@ -222,7 +222,9 @@ mod tests {
     fn values(raster: Raster) -> Vec<u8> {
         raster
             .pixels()
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|pixel| pixel[0])
             .collect()
     }

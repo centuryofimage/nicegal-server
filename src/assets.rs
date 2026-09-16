@@ -6,17 +6,48 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use camino::{Utf8Path as Path, Utf8PathBuf as PathBuf};
 use nom_exif::{ExifTag, read_exif};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params_from_iter};
+use rusqlite::{Connection, OptionalExtension, params_from_iter};
 
 use crate::imaging::{ExifOrientation, orientation_from_exif};
-use crate::schema::{check_schema_read_only, open_schema};
+use crate::schema::{check_schema_read_only, open_schema_with_migrations};
+use crate::storage::{
+    READ_ONLY_FLAGS, configure_reader, configure_writer, maintain, path_prefix_like,
+    validate_asset_ids,
+};
 
-const SCHEMA_VERSION: i32 = 5;
+const SCHEMA_VERSION: i32 = 6;
 const SCHEMA_LABEL: &str = "asset catalog";
+const MIGRATIONS: &[(i32, &str)] = &[
+    (
+        2,
+        "ALTER TABLE assets ADD COLUMN metadata_version INTEGER NOT NULL DEFAULT 1 CHECK(metadata_version > 0);",
+    ),
+    (
+        3,
+        "ALTER TABLE assets ADD COLUMN source_created_ns INTEGER;",
+    ),
+    (
+        4,
+        "CREATE TABLE decode_failure_state(
+        asset_id INTEGER PRIMARY KEY,
+        source_modified_ns INTEGER NOT NULL,
+        source_size INTEGER NOT NULL CHECK(source_size >= 0)
+    );",
+    ),
+    (5, "VACUUM;"),
+];
 // Creation time is filesystem metadata, not media-probe output. Keeping this version unchanged
 // lets version-3 catalogs backfill it with a narrow update instead of re-reading every image.
 const METADATA_VERSION: i32 = 2;
-const GALLERY_ROOT_PREDICATE: &str = r"(path = ?1 OR (substr(path, 1, length(?1)) = ?1 AND (substr(?1, -1) IN ('/', '\') OR substr(path, length(?1) + 1, 1) IN ('/', '\'))))";
+const GALLERY_ROOT_PREDICATE: &str = r"(
+    path = ?1 OR (
+        substr(path, 1, length(?1)) = ?1
+        AND (
+            substr(?1, -1) IN ('/', '\')
+            OR substr(path, length(?1) + 1, 1) IN ('/', '\')
+        )
+    )
+)";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SourceFingerprint {
@@ -48,7 +79,8 @@ pub fn canonicalize_path(path: &Path) -> Result<PathBuf> {
     Ok(normalize_windows_verbatim_path(path))
 }
 
-// EVAL: is this the right way to do this? is there a crate or another api to do this in a canonical way?
+// `fs::canonicalize` returns verbatim paths on Windows; strip that transport-only prefix so paths
+// use the spelling accepted and returned by the API.
 #[cfg(windows)]
 fn normalize_windows_verbatim_path(path: PathBuf) -> PathBuf {
     let path = path.as_str();
@@ -117,7 +149,8 @@ impl MediaKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Asset {
-    pub asset_id: i64, // EVAL: signed? does it matter with sqlite anyway?
+    /// SQLite row identifier; SQLite exposes rowids as signed 64-bit integers.
+    pub asset_id: i64,
     pub path: PathBuf,
     pub fingerprint: SourceFingerprint,
     pub source_created_ns: Option<i64>,
@@ -177,6 +210,45 @@ pub(crate) struct CatalogUpsertTimings {
     pub unchanged: bool,
 }
 
+impl CatalogUpsertTimings {
+    pub fn record(&self, span: &tracing::Span) {
+        for (name, duration) in [
+            ("canonicalize_us", self.canonicalize),
+            ("fingerprint_us", self.fingerprint),
+            ("lookup_us", self.lookup),
+            ("probe_us", self.probe),
+            ("dimensions_us", self.dimensions),
+            ("exif_us", self.exif),
+            ("animation_us", self.animation),
+            ("store_us", self.store),
+            ("transaction_begin_us", self.transaction_begin),
+            ("row_upsert_us", self.row_upsert),
+            ("revision_update_us", self.revision_update),
+            ("commit_us", self.commit),
+        ] {
+            span.record(
+                name,
+                u64::try_from(duration.as_micros()).unwrap_or(u64::MAX),
+            );
+        }
+    }
+
+    pub fn accumulate(&mut self, timings: Self) {
+        self.canonicalize += timings.canonicalize;
+        self.fingerprint += timings.fingerprint;
+        self.lookup += timings.lookup;
+        self.probe += timings.probe;
+        self.dimensions += timings.dimensions;
+        self.exif += timings.exif;
+        self.animation += timings.animation;
+        self.store += timings.store;
+        self.transaction_begin += timings.transaction_begin;
+        self.row_upsert += timings.row_upsert;
+        self.revision_update += timings.revision_update;
+        self.commit += timings.commit;
+    }
+}
+
 pub(crate) enum PreparedCatalogAsset {
     Unchanged(Asset),
     MetadataChanged(Asset),
@@ -197,16 +269,13 @@ impl AssetCatalog {
     pub fn new(path: &Path) -> Result<Self> {
         let conn =
             Connection::open(path).with_context(|| format!("opening asset catalog: {path}"))?;
-        conn.busy_timeout(Duration::from_secs(5))?;
-        conn.pragma_update(None, "auto_vacuum", "FULL")?;
-        conn.pragma_update(None, "journal_mode", "wal")?;
-        conn.pragma_update(None, "synchronous", "normal")?;
-        migrate_schema(&conn)?;
-        open_schema(
+        configure_writer(&conn)?;
+        open_schema_with_migrations(
             &conn,
             SCHEMA_LABEL,
             SCHEMA_VERSION,
             include_str!("assets_create.sql"),
+            MIGRATIONS,
         )?;
         Ok(Self { conn })
     }
@@ -215,14 +284,15 @@ impl AssetCatalog {
     /// Unlike [`AssetCatalog::new`] this never creates the schema, so a caller cannot silently
     /// read an empty catalog it just brought into existence.
     pub fn new_read_only(path: &Path) -> Result<Self> {
-        let conn = Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .with_context(|| format!("opening asset catalog read-only: {path}"))?;
-        conn.busy_timeout(Duration::from_secs(5))?;
+        let conn = Connection::open_with_flags(path, READ_ONLY_FLAGS)
+            .with_context(|| format!("opening asset catalog read-only: {path}"))?;
+        configure_reader(&conn)?;
         check_schema_read_only(&conn, SCHEMA_LABEL, SCHEMA_VERSION)?;
         Ok(Self { conn })
+    }
+
+    pub fn maintain(&self) -> Result<()> {
+        maintain(&self.conn).context("maintaining asset catalog")
     }
 
     /// Insert or refresh an asset while preserving the ID already assigned to its path.
@@ -328,9 +398,24 @@ impl AssetCatalog {
 
         let started = Instant::now();
         let mut statement = tx.prepare(
-            "INSERT INTO assets (path, source_modified_ns, source_created_ns, exif_taken_ns, source_size, media_kind, media_format, width, height, is_animated, frame_count, duration_ms, metadata_version) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
-             ON CONFLICT(path) DO UPDATE SET source_modified_ns=excluded.source_modified_ns, source_created_ns=excluded.source_created_ns, exif_taken_ns=excluded.exif_taken_ns, source_size=excluded.source_size, media_kind=excluded.media_kind, media_format=excluded.media_format, width=excluded.width, height=excluded.height, is_animated=excluded.is_animated, frame_count=excluded.frame_count, duration_ms=excluded.duration_ms, metadata_version=excluded.metadata_version \
+            "INSERT INTO assets (
+                 path, source_modified_ns, source_created_ns, exif_taken_ns, source_size,
+                 media_kind, media_format, width, height, is_animated, frame_count,
+                 duration_ms, metadata_version
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+             ON CONFLICT(path) DO UPDATE SET
+                 source_modified_ns = excluded.source_modified_ns,
+                 source_created_ns = excluded.source_created_ns,
+                 exif_taken_ns = excluded.exif_taken_ns,
+                 source_size = excluded.source_size,
+                 media_kind = excluded.media_kind,
+                 media_format = excluded.media_format,
+                 width = excluded.width,
+                 height = excluded.height,
+                 is_animated = excluded.is_animated,
+                 frame_count = excluded.frame_count,
+                 duration_ms = excluded.duration_ms,
+                 metadata_version = excluded.metadata_version
              RETURNING asset_id",
         )?;
         let mut metadata_statement =
@@ -410,7 +495,7 @@ impl AssetCatalog {
     pub fn get(&self, asset_id: i64) -> Result<Option<Asset>> {
         self.conn
             .query_row(
-                "SELECT asset_id, path, source_modified_ns, source_created_ns, exif_taken_ns, source_size, media_kind, media_format, width, height, is_animated, frame_count, duration_ms, metadata_version FROM assets WHERE media_kind = 'image' AND asset_id = ?1",
+                &format!("SELECT {ASSET_COLUMNS} FROM assets WHERE media_kind = 'image' AND asset_id = ?1"),
                 [asset_id],
                 asset_from_row,
             )
@@ -421,7 +506,9 @@ impl AssetCatalog {
     pub fn get_by_path(&self, path: &Path) -> Result<Option<Asset>> {
         self.conn
             .query_row(
-                "SELECT asset_id, path, source_modified_ns, source_created_ns, exif_taken_ns, source_size, media_kind, media_format, width, height, is_animated, frame_count, duration_ms, metadata_version FROM assets WHERE media_kind = 'image' AND path = ?1",
+                &format!(
+                    "SELECT {ASSET_COLUMNS} FROM assets WHERE media_kind = 'image' AND path = ?1"
+                ),
                 [path.as_str()],
                 asset_from_row,
             )
@@ -447,7 +534,8 @@ impl AssetCatalog {
                 .collect::<Vec<_>>()
                 .join(",");
             let sql = format!(
-                "SELECT asset_id, path, source_modified_ns, source_created_ns, exif_taken_ns, source_size, media_kind, media_format, width, height, is_animated, frame_count, duration_ms, metadata_version FROM assets WHERE media_kind = 'image' AND asset_id IN ({placeholders})"
+                "SELECT {ASSET_COLUMNS} FROM assets
+                 WHERE media_kind = 'image' AND asset_id IN ({placeholders})"
             );
             let mut statement = self.conn.prepare(&sql)?;
             let rows = statement.query_and_then(params_from_iter(asset_ids), asset_from_row)?;
@@ -464,9 +552,9 @@ impl AssetCatalog {
     }
 
     pub fn all(&self) -> Result<Vec<Asset>> {
-        let mut statement = self.conn.prepare_cached(
-            "SELECT asset_id, path, source_modified_ns, source_created_ns, exif_taken_ns, source_size, media_kind, media_format, width, height, is_animated, frame_count, duration_ms, metadata_version FROM assets WHERE media_kind = 'image' ORDER BY asset_id",
-        )?;
+        let mut statement = self.conn.prepare_cached(&format!(
+            "SELECT {ASSET_COLUMNS} FROM assets WHERE media_kind = 'image' ORDER BY asset_id"
+        ))?;
         let rows = statement.query_and_then([], asset_from_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .context("listing asset catalog")
@@ -490,7 +578,8 @@ impl AssetCatalog {
         };
         let predicate = predicate.replace("{time}", &expression);
         let sql = format!(
-            "SELECT asset_id, path, source_modified_ns, source_created_ns, exif_taken_ns, source_size, media_kind, media_format, width, height, is_animated, frame_count, duration_ms, metadata_version FROM assets WHERE media_kind = 'image' {predicate} ORDER BY {expression}, asset_id"
+            "SELECT {ASSET_COLUMNS} FROM assets
+             WHERE media_kind = 'image' {predicate} ORDER BY {expression}, asset_id"
         );
         let mut statement = self.conn.prepare(&sql)?;
         let rows = statement.query_and_then(params_from_iter(parameters), asset_from_row)?;
@@ -502,19 +591,66 @@ impl AssetCatalog {
         if !root.is_absolute() {
             bail!("asset root must be absolute: {root}");
         }
-        let mut statement = self.conn.prepare_cached(
-            "SELECT asset_id, path, source_modified_ns, source_created_ns, exif_taken_ns, source_size, media_kind, media_format, width, height, is_animated, frame_count, duration_ms, metadata_version FROM assets WHERE media_kind = 'image' AND path LIKE ?1 ESCAPE '#' ORDER BY asset_id",
-        )?;
+        let mut statement = self.conn.prepare_cached(&format!(
+            "SELECT {ASSET_COLUMNS} FROM assets
+             WHERE media_kind = 'image' AND path LIKE ?1 ESCAPE '#' ORDER BY asset_id"
+        ))?;
         let rows = statement.query_and_then([path_prefix_like(root)], asset_from_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .context("listing assets under root")
+    }
+
+    /// Return catalog rows under `root` that were not present in a completed filesystem scan.
+    /// The scan set lives only on this connection and never rewrites persistent asset rows.
+    pub fn unseen_under_root(
+        &mut self,
+        root: &Path,
+        seen_asset_ids: impl IntoIterator<Item = i64>,
+    ) -> Result<Vec<Asset>> {
+        if !root.is_absolute() {
+            bail!("asset root must be absolute: {root}");
+        }
+        let transaction = self.conn.transaction()?;
+        transaction.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS scan_seen_assets(
+                asset_id INTEGER PRIMARY KEY
+            ) WITHOUT ROWID;
+            DELETE FROM scan_seen_assets;",
+        )?;
+        {
+            let mut insert = transaction
+                .prepare_cached("INSERT OR IGNORE INTO scan_seen_assets(asset_id) VALUES (?1)")?;
+            for asset_id in seen_asset_ids {
+                insert.execute([asset_id])?;
+            }
+        }
+        let unseen = {
+            let mut statement = transaction.prepare(&format!(
+                "SELECT {ASSET_COLUMNS} FROM assets
+                 WHERE media_kind = 'image' AND {GALLERY_ROOT_PREDICATE}
+                   AND NOT EXISTS (
+                       SELECT 1 FROM scan_seen_assets
+                       WHERE scan_seen_assets.asset_id = assets.asset_id
+                   )
+                 ORDER BY asset_id"
+            ))?;
+            let rows = statement.query_and_then(
+                [root.as_str().trim_end_matches(['/', '\\'])],
+                asset_from_row,
+            )?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        transaction.commit()?;
+        Ok(unseen)
     }
 
     /// Desktop reads use literal path boundaries, including roots containing SQL wildcards.
     pub fn list_gallery(&self, root: &Path, timeline: Timeline) -> Result<Vec<Asset>> {
         let order = timeline.expression("assets");
         let mut statement = self.conn.prepare(&format!(
-            "SELECT asset_id, path, source_modified_ns, source_created_ns, exif_taken_ns, source_size, media_kind, media_format, width, height, is_animated, frame_count, duration_ms, metadata_version FROM assets WHERE media_kind = 'image' AND {GALLERY_ROOT_PREDICATE} ORDER BY {order} DESC, asset_id DESC"
+            "SELECT {ASSET_COLUMNS} FROM assets
+             WHERE media_kind = 'image' AND {GALLERY_ROOT_PREDICATE}
+             ORDER BY {order} DESC, asset_id DESC"
         ))?;
         Ok(statement
             .query_and_then(
@@ -546,25 +682,14 @@ impl AssetCatalog {
         &self,
         fingerprints: &[(i64, SourceFingerprint)],
     ) -> Result<HashSet<i64>> {
-        let mut failed = HashSet::with_capacity(fingerprints.len());
-        let mut statement = self.conn.prepare_cached(
+        crate::storage::matching_fingerprint_ids(
+            &self.conn,
             "SELECT EXISTS(\
                  SELECT 1 FROM decode_failure_state \
                   WHERE asset_id = ?1 AND source_modified_ns = ?2 AND source_size = ?3\
              )",
-        )?;
-        for (asset_id, fingerprint) in fingerprints {
-            let source_size = i64::try_from(fingerprint.size)
-                .context("source byte size exceeds SQLite's integer range")?;
-            let exists: bool = statement
-                .query_row((*asset_id, fingerprint.modified_ns, source_size), |row| {
-                    row.get(0)
-                })?;
-            if exists {
-                failed.insert(*asset_id);
-            }
-        }
-        Ok(failed)
+            fingerprints,
+        )
     }
 
     /// Remember that this exact revision could not be decoded. This state is shared by OCR and
@@ -613,26 +738,10 @@ impl AssetCatalog {
     }
 }
 
-fn validate_asset_ids(asset_ids: &[i64]) -> Result<()> {
-    if asset_ids.iter().any(|asset_id| *asset_id <= 0) {
-        bail!("asset identifiers must be greater than zero");
-    }
-    Ok(())
-}
-
-fn path_prefix_like(path: &Path) -> String {
-    let mut prefix = path.as_str().to_owned();
-    if !prefix.ends_with(['/', '\\']) {
-        prefix.push(std::path::MAIN_SEPARATOR);
-    }
-    format!(
-        "{}%",
-        prefix
-            .replace('#', "##")
-            .replace('%', "#%")
-            .replace('_', "#_")
-    )
-}
+// Keep this projection in the positional order consumed by asset_from_row.
+const ASSET_COLUMNS: &str = "asset_id, path, source_modified_ns, source_created_ns,
+    exif_taken_ns, source_size, media_kind, media_format, width, height, is_animated,
+    frame_count, duration_ms, metadata_version";
 
 fn asset_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Asset> {
     let kind: String = row.get(6)?;
@@ -794,53 +903,12 @@ fn probe_exif_metadata(path: &Path) -> Result<(Option<i64>, ExifOrientation)> {
     };
     let timestamp = match datetime.aware() {
         Some(datetime) => datetime.timestamp_nanos_opt(),
+        // EXIF timestamps without an offset are interpreted as UTC for stable, host-independent
+        // catalog values.
         None => datetime.into_naive().and_utc().timestamp_nanos_opt(),
     }
     .context("EXIF capture time exceeds the nanosecond timestamp range")?;
     Ok((Some(timestamp), orientation))
-}
-
-fn migrate_schema(conn: &Connection) -> Result<()> {
-    let version: i32 = conn
-        .query_row("SELECT user_version FROM pragma_user_version", [], |row| {
-            row.get(0)
-        })
-        .context("reading asset catalog schema version")?;
-    match version {
-        2 => conn
-            .execute_batch(
-                "BEGIN;
-                 ALTER TABLE assets ADD COLUMN metadata_version INTEGER NOT NULL DEFAULT 1 CHECK(metadata_version > 0);
-                 ALTER TABLE assets ADD COLUMN source_created_ns INTEGER;
-                 CREATE TABLE decode_failure_state(asset_id INTEGER PRIMARY KEY, source_modified_ns INTEGER NOT NULL, source_size INTEGER NOT NULL CHECK(source_size >= 0));
-                 PRAGMA user_version = 5;
-                 COMMIT;",
-            )
-            .context("migrating asset catalog schema from version 2 to 5")?,
-        3 => conn
-            .execute_batch(
-                "BEGIN;
-                 ALTER TABLE assets ADD COLUMN source_created_ns INTEGER;
-                 CREATE TABLE decode_failure_state(asset_id INTEGER PRIMARY KEY, source_modified_ns INTEGER NOT NULL, source_size INTEGER NOT NULL CHECK(source_size >= 0));
-                 PRAGMA user_version = 5;
-                 COMMIT;",
-            )
-            .context("migrating asset catalog schema from version 3 to 5")?,
-        4 => conn
-            .execute_batch(
-                "BEGIN;
-                 CREATE TABLE decode_failure_state(
-                     asset_id INTEGER PRIMARY KEY,
-                     source_modified_ns INTEGER NOT NULL,
-                     source_size INTEGER NOT NULL CHECK(source_size >= 0)
-                 );
-                 PRAGMA user_version = 5;
-                 COMMIT;",
-            )
-            .context("migrating asset catalog schema from version 4 to 5")?,
-        _ => {}
-    }
-    Ok(())
 }
 
 fn probe_gif(path: &Path) -> Result<(u32, u64)> {
@@ -1067,37 +1135,56 @@ mod tests {
     }
 
     #[test]
-    fn migrates_existing_catalogs_to_decode_failure_version_five() -> Result<()> {
-        let temp = TempDir::new()?;
-        let catalog_path = PathBuf::try_from(temp.path().join("assets.db"))?;
-        let conn = Connection::open(&catalog_path)?;
-        conn.execute_batch(
-            "CREATE TABLE assets(asset_id INTEGER PRIMARY KEY);
+    fn migrates_existing_catalogs_through_incremental_vacuum_version_six() -> Result<()> {
+        for old_version in 2..=5 {
+            let temp = TempDir::new()?;
+            let catalog_path = PathBuf::try_from(temp.path().join("assets.db"))?;
+            let conn = Connection::open(&catalog_path)?;
+            conn.execute_batch(
+                "CREATE TABLE assets(asset_id INTEGER PRIMARY KEY);
+             INSERT INTO assets VALUES (42);
              PRAGMA user_version = 2;",
-        )?;
-        drop(conn);
+            )?;
+            for (from, sql) in MIGRATIONS {
+                if *from < old_version {
+                    conn.execute_batch(sql)?;
+                }
+            }
+            conn.pragma_update(None, "user_version", old_version)?;
+            drop(conn);
 
-        let catalog = AssetCatalog::new(&catalog_path)?;
-        let version: i32 =
-            catalog
-                .conn
-                .query_row("SELECT user_version FROM pragma_user_version", [], |row| {
-                    row.get(0)
-                })?;
-        let has_metadata_version: bool = catalog.conn.query_row(
+            let catalog = AssetCatalog::new(&catalog_path)?;
+            let version: i32 = catalog.conn.query_row(
+                "SELECT user_version FROM pragma_user_version",
+                [],
+                |row| row.get(0),
+            )?;
+            let has_metadata_version: bool = catalog.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('assets') WHERE name = 'metadata_version')",
             [],
             |row| row.get(0),
         )?;
-        let has_source_created_ns: bool = catalog.conn.query_row(
+            let has_source_created_ns: bool = catalog.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('assets') WHERE name = 'source_created_ns')",
             [],
             |row| row.get(0),
         )?;
 
-        assert_eq!(version, SCHEMA_VERSION);
-        assert!(has_metadata_version);
-        assert!(has_source_created_ns);
+            assert_eq!(version, SCHEMA_VERSION);
+            assert!(has_metadata_version);
+            assert!(has_source_created_ns);
+            let retained: (i64, i32, Option<i64>) = catalog.conn.query_row(
+                "SELECT asset_id, metadata_version, source_created_ns FROM assets",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            assert_eq!(retained, (42, 1, None));
+            catalog
+                .conn
+                .execute("INSERT INTO decode_failure_state VALUES (42, 1, 1)", [])?;
+            drop(catalog);
+            AssetCatalog::new(&catalog_path)?;
+        }
         Ok(())
     }
 
@@ -1361,6 +1448,37 @@ mod tests {
         let listed = catalog.under_root(&canonicalize_path(&root)?)?;
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].asset_id, inside.asset_id);
+        Ok(())
+    }
+
+    #[test]
+    fn temporary_seen_set_returns_only_unseen_assets_inside_root() -> Result<()> {
+        let temp = TempDir::new()?;
+        let root = PathBuf::try_from(temp.path().join("gallery"))?;
+        let sibling = PathBuf::try_from(temp.path().join("gallery-other"))?;
+        fs::create_dir_all(&root)?;
+        fs::create_dir_all(&sibling)?;
+        let seen_path = root.join("seen.bmp");
+        let unseen_path = root.join("unseen.bmp");
+        let sibling_path = sibling.join("sibling.bmp");
+        for path in [&seen_path, &unseen_path, &sibling_path] {
+            File::create(path)?;
+        }
+        let catalog_path = PathBuf::try_from(temp.path().join("assets.db"))?;
+        let mut catalog = AssetCatalog::new(&catalog_path)?;
+        let seen = catalog.upsert(&seen_path, &fs::metadata(&seen_path)?)?;
+        let unseen = catalog.upsert(&unseen_path, &fs::metadata(&unseen_path)?)?;
+        catalog.upsert(&sibling_path, &fs::metadata(&sibling_path)?)?;
+
+        assert_eq!(
+            catalog.unseen_under_root(&root, [seen.asset_id])?,
+            vec![unseen.clone()]
+        );
+        assert!(
+            catalog
+                .unseen_under_root(&root, [seen.asset_id, unseen.asset_id])?
+                .is_empty()
+        );
         Ok(())
     }
 

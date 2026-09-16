@@ -13,16 +13,10 @@ categories = ["multimedia::images"]
 [features]
 default = ["regex"]
 regex = ["dep:regex", "rusqlite/functions"]
-# The shared log writer. Off by default so the library only carries the `tracing` facade; a
-# binary that wants output turns it on and calls `logging::init` once.
 logging = ["dep:tracing-subscriber", "dep:tracing-appender"]
 ort-openvino = ["ort/openvino"]
 ort-webgpu = ["ort/webgpu", "fastembed/webgpu"]
 ort-profiling = ["ort/api-25", "fastembed/ort-profiling"]
-# FastEmbed's own `directml` feature isn't about registering the provider (our `ort/directml`
-# already does that for every session in the process) — it turns on FastEmbed's DirectML-specific
-# session builder tweaks (disabled memory pattern and parallel execution) once it sees a DirectML
-# dispatch in the execution providers we hand it.
 ort-directml = ["ort/directml", "fastembed/directml"]
 
 [dependencies]
@@ -33,7 +27,7 @@ fastembed = { path = "vendor/fastembed", version = "6.0.0", default-features = f
 fast_image_resize = { version = "6.1.0", default-features = false, features = ["std"] }
 gif = { version = "0.14.2", default-features = false, features = ["std"] }
 glob = "0.3.4"
-hf-hub = { version = "0.4.3", default-features = false, features = ["native-tls", "tokio", "ureq"] }
+hf-hub = { version = "0.5.0", default-features = false, features = ["native-tls", "tokio", "ureq"] }
 imagesize = "0.15.0"
 image = { version = "0.25.10", default-features = false, features = ["bmp"] }
 image-webp = "0.2.4"
@@ -48,6 +42,7 @@ rayon = "1.12.0"
 regex = { version = "1.13.1", optional = true }
 rusqlite = { version = "0.40.2", features = ["bundled", "hooks"] }
 sqlite-vec = "0.1.9"
+serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 strum = { version = "0.28.0", features = ["derive"] }
 time = "0.3.55"
@@ -55,6 +50,7 @@ tracing = { version = "0.1.44", default-features = false, features = ["std", "at
 tracing-appender = { version = "0.2.3", optional = true }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["std", "fmt", "ansi", "env-filter", "time", "tracing-log", "json", "registry"], optional = true }
 walkdir = "2.5.0"
+yaml_serde = "0.10.7"
 
 [workspace]
 members = [".", "nicegal-cli", "nicegal-server"]
@@ -66,21 +62,6 @@ opt-level = 3
 strip = false
 debug = 1     # for perf analysis
 lto = "thin"
-
-[profile.bench]
-inherits = "release"
-
-[[bench]]
-name = "ocr_index"
-harness = false
-
-[[bench]]
-name = "text_embed_index"
-harness = false
-
-[[bench]]
-name = "image_index"
-harness = false
 
 [dev-dependencies]
 tempfile = "3.27.0"

@@ -255,13 +255,17 @@ mod tests {
             Some(det_path.clone())
         );
         runtime::initialize_bundled_runtime(runtime::ExecutionProvider::Cpu)?;
-        let _ocr = crate::ocr::PaddleOcrModels::load_with_options(
-            det,
-            &det_path,
-            &det_config_path,
-            rec,
-            &rec_path,
-            &rec_config_path,
+        let _ocr = crate::ocr::PaddleOcrModels::load_files(
+            crate::ocr::OcrModelFiles {
+                source: &det,
+                model_path: &det_path,
+                config_path: &det_config_path,
+            },
+            crate::ocr::OcrModelFiles {
+                source: &rec,
+                model_path: &rec_path,
+                config_path: &rec_config_path,
+            },
             RuntimeOptions::default(),
         )?;
         for model in [

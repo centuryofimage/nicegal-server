@@ -1,19 +1,15 @@
-import { spawn } from 'node:child_process'
+import { spawnServer, createAndWaitForJob, readReadyMessage, stopChild, withTimeout } from './server-harness.mjs'
 import { randomBytes } from 'node:crypto'
-import { once } from 'node:events'
-import { createWriteStream } from 'node:fs'
 import { mkdtemp, realpath, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { createInterface } from 'node:readline'
 import { DatabaseSync } from 'node:sqlite'
-import { finished } from 'node:stream/promises'
 import { fileURLToPath } from 'node:url'
 
 const HELP = `Usage: node scripts/thumbnail-perf.mjs [SERVER_EXE] [options]
 
 Creates a fresh catalog for a corpus, then measures staggered, overlapping synchronous
-POST /v1/thumbnails ensure requests. Server stderr is both displayed and written to trace.log.
+POST /v1/thumbnails ensure requests. Server stderr is displayed; detailed traces are written to nicegal-server.log.
 
 Options:
   --requests N          Number of ensure requests in each burst (default: 12)
@@ -22,7 +18,7 @@ Options:
   --required-size N     Required thumbnail size, from 1 through 1024 (default: 256)
   --corpus PATH         Corpus root (default: ../testdata/catcopy)
   --executable PATH     Server executable (default: target/release/nicegal-server)
-  --keep                Keep the temporary databases and trace.log
+  --keep                Keep the temporary databases and nicegal-server.log
   --warm                Run a separately labelled warm burst after the cold burst
   --help                Show this help
 
@@ -45,15 +41,8 @@ const rustLog = process.env.RUST_LOG ??
   'nicegal_core=trace,nicegal_server=trace,tower_http=info,hyper=warn,h2=warn,tower=warn,rustls=warn'
 const stateDirectory = await mkdtemp(join(tmpdir(), `nicegal-server-thumbnail-perf-${process.pid}-`))
 const assetDatabasePath = join(stateDirectory, 'assets.db')
-const ocrDatabasePath = join(stateDirectory, 'index.db')
-const thumbnailDatabasePath = join(stateDirectory, 'thumbnails.db')
-const tracePath = join(stateDirectory, 'trace.log')
+const tracePath = join(stateDirectory, 'nicegal-server.log')
 const token = randomBytes(32).toString('hex')
-const trace = createWriteStream(tracePath, { flags: 'a' })
-let traceError
-trace.on('error', (error) => {
-  traceError = error
-})
 
 let child
 let primaryError
@@ -63,30 +52,11 @@ try {
   console.log(`Corpus: ${corpus}`)
   console.log(`Executable: ${executable}`)
 
-  child = spawn(
-    executable,
-    [
-      '--asset-database', assetDatabasePath,
-      '--ocr-database', ocrDatabasePath,
-      '--thumbnail-database', thumbnailDatabasePath
-    ],
-    {
-      cwd: repository,
-      env: {
-        ...process.env,
-        NICEGAL_RPC_TOKEN: token,
-        // Trace is required because this harness is specifically for attributing request latency.
-        RUST_LOG: rustLog
-      },
-      stdio: ['pipe', 'pipe', 'pipe'],
-      windowsHide: true
-    }
-  )
+  child = spawnServer({ executable, repository, stateDirectory, token, env: { RUST_LOG: rustLog } })
 
   let stderrTail = ''
   child.stderr.setEncoding('utf8')
   child.stderr.on('data', (chunk) => {
-    trace.write(chunk)
     process.stderr.write(chunk)
     stderrTail = `${stderrTail}${chunk}`.slice(-32_768)
   })
@@ -135,14 +105,6 @@ try {
     } catch (error) {
       cleanupError = error
     }
-  }
-
-  try {
-    trace.end()
-    await finished(trace)
-    if (traceError) throw traceError
-  } catch (error) {
-    cleanupError ??= error
   }
 
   if (options.keep) {
@@ -345,116 +307,6 @@ function percentile(sorted, percent) {
   return sorted[lower] + (sorted[upper] - sorted[lower]) * (position - lower)
 }
 
-async function createAndWaitForJob(endpoint, token, type, params, stderrTail) {
-  const created = await fetch(`${endpoint}/v1/jobs`, {
-    method: 'POST',
-    headers: {
-      authorization: `Bearer ${token}`,
-      'content-type': 'application/json'
-    },
-    body: JSON.stringify({ type, params })
-  })
-  const createdBody = await created.text()
-  if (created.status !== 202) {
-    throw new Error(`creating ${type} returned HTTP ${created.status}: ${createdBody}\n${stderrTail()}`)
-  }
-
-  let job
-  try {
-    job = JSON.parse(createdBody)
-  } catch (error) {
-    throw new Error(`creating ${type} returned invalid JSON: ${createdBody}`, { cause: error })
-  }
-  const terminal = new Set(['cancelled', 'completed', 'failed'])
-  if (!terminal.has(job.status)) {
-    const events = await fetch(`${endpoint}/v1/jobs/${job.jobId}/events`, {
-      headers: { authorization: `Bearer ${token}` }
-    })
-    if (events.status !== 200) {
-      throw new Error(`opening ${type} event stream returned HTTP ${events.status}: ${await events.text()}`)
-    }
-    for await (const snapshot of sseSnapshots(events)) job = snapshot
-  }
-  if (!terminal.has(job.status)) throw new Error(`${type} event stream ended without a terminal job state`)
-  if (job.status !== 'completed') {
-    throw new Error(`${type} failed: ${JSON.stringify(job)}\n${stderrTail()}`)
-  }
-  return job
-}
-
-async function* sseSnapshots(response) {
-  let buffer = ''
-  for await (const chunk of response.body.pipeThrough(new TextDecoderStream())) {
-    buffer += chunk.replaceAll('\r\n', '\n')
-    let boundary
-    while ((boundary = buffer.indexOf('\n\n')) !== -1) {
-      const block = buffer.slice(0, boundary)
-      buffer = buffer.slice(boundary + 2)
-      const data = block
-        .split('\n')
-        .filter((line) => line.startsWith('data:'))
-        .map((line) => line.slice(5).trimStart())
-        .join('\n')
-      if (data) yield JSON.parse(data)
-    }
-  }
-}
-
-async function stopChild(process) {
-  if (process.exitCode !== null || process.signalCode !== null) return
-  const gracefulExit = once(process, 'exit')
-  if (!process.stdin.writableEnded) process.stdin.end()
-  try {
-    await withTimeout(gracefulExit, 10_000, 'server shutdown')
-    return
-  } catch {
-    // The process is ours, so a direct signal cannot affect unrelated processes.
-  }
-
-  if (process.exitCode === null && process.signalCode === null) {
-    const forcedExit = once(process, 'exit')
-    process.kill()
-    await withTimeout(forcedExit, 5_000, 'forced server shutdown')
-  }
-}
-
-function readReadyMessage(process, stderrTail) {
-  return new Promise((resolve, reject) => {
-    const lines = createInterface({ input: process.stdout })
-    const onError = (error) => {
-      lines.close()
-      reject(error)
-    }
-    const onExit = (code, signal) => {
-      lines.close()
-      reject(new Error(`server exited before readiness: code=${code} signal=${signal}\n${stderrTail()}`))
-    }
-    process.once('error', onError)
-    process.once('exit', onExit)
-    lines.once('line', (line) => {
-      process.off('error', onError)
-      process.off('exit', onExit)
-      lines.close()
-      try {
-        resolve(JSON.parse(line))
-      } catch (error) {
-        reject(new Error(`invalid readiness message: ${line}`, { cause: error }))
-      }
-    })
-  })
-}
-
 function delay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds))
-}
-
-function withTimeout(promise, milliseconds, operation) {
-  let timer
-  const timeout = new Promise((_, reject) => {
-    timer = setTimeout(
-      () => reject(new Error(`${operation} timed out after ${milliseconds}ms`)),
-      milliseconds
-    )
-  })
-  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer))
 }

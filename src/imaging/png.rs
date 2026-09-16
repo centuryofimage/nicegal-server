@@ -29,7 +29,7 @@ pub fn decode(data: &[u8]) -> Result<Raster> {
         },
         ColorType::GrayscaleAlpha => {
             let mut rgba = Vec::with_capacity(buffer.len() * 2);
-            for pixel in buffer.chunks_exact(2) {
+            for pixel in buffer.as_chunks::<2>().0 {
                 rgba.extend_from_slice(&[pixel[0], pixel[0], pixel[0], pixel[1]]);
             }
             Raster::Rgba {

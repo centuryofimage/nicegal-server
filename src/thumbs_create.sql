@@ -13,5 +13,5 @@ CREATE TABLE thumbnails(
 ) WITHOUT ROWID;
 CREATE INDEX thumbnail_lookup_idx
     ON thumbnails(asset_id, generator_version, size_bucket);
-PRAGMA user_version = 3;
+PRAGMA user_version = 4;
 COMMIT;

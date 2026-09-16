@@ -1,36 +1,9 @@
-//! Search: one vector-first route over OCR text and indexed images, in one request.
+//! Search over OCR text and indexed images.
 //!
-//! # Why the modes combine into one request rather than one request each
+//! `GET /v1/search` runs one mode. `POST /v1/search` runs several modes, shares one OCR snapshot
+//! across OCR queries, and can combine their ranked lists with reciprocal rank fusion.
 //!
-//! Clients search several ways at once, and the alternative — a parallel `GET` per mode — was
-//! rejected for four reasons, in descending order of how much they matter:
-//!
-//! 1. **One OCR snapshot.** [`DB::read_snapshot`] runs every OCR mode against a single WAL read
-//!    transaction. `type=image` has an independent image-index connection because its data lives
-//!    in another database file; see below. Parallel requests each get their own, so an index job
-//!    committing between them lets a client fuse two different versions of the library into one
-//!    ranking.
-//! 2. **Fusion needs both lists.** Reciprocal rank fusion is defined over the ranked lists, so it
-//!    has to happen where both exist. Server-side it is one implementation over result sets that
-//!    never leave the process; client-side every client reimplements it over as many as 250,000
-//!    ids per mode, shipped across the socket only to be discarded.
-//! 3. **The query is embedded once per engine.** A request that searches the same words
-//!    semantically, literally, and visually pays for no duplicate forward pass within one engine.
-//! 4. **One root resolution and one connection per store.** Each handler opens its own SQLite
-//!    connections and re-registers their scalar functions; N modes over N requests pays that N
-//!    times.
-//!
-//! `GET /v1/search` stays exactly as it was for the single-mode case, including its `total` and
-//! `results` shape, and gains `type=vector` and `type=image`. `POST /v1/search` is the combined
-//! form. Vector queries are the reason the combined form is a POST at all: an embedding request
-//! carries a distance ceiling and per-mode weights that do not belong in a query string.
-//!
-//! `type=image` answers from the CLIP image index rather than the OCR store: a different engine
-//! and a different database, joined to the request only by the shared filters and the combined
-//! response. It cannot share the OCR snapshot — the two stores are separate files — so it runs in
-//! the same blocking task on its own read-only connection, which is the closest one-request
-//! equivalent: the image index changes only through indexing jobs, so the two reads a request
-//! makes agree unless an index job commits mid-request.
+//! Image searches use an independent image-index snapshot because it is a separate database.
 
 use std::collections::HashMap;
 
@@ -51,51 +24,22 @@ use serde::{Deserialize, Serialize};
 use super::error::ApiError;
 use super::external_image::{self, ExternalImageRequest};
 use super::extract::{ApiJson, ApiQuery};
-use super::{AppState, roots, run_blocking};
+use super::{AppState, roots, run_cancellable as run_search};
 
 const DEFAULT_LIMIT: usize = 100_000;
 const MAX_LIMIT: usize = 250_000;
 // Long enough for any query a person types or pastes, short enough that a runaway client cannot
 // push a megabyte of text through the FTS5 parser or the embedder.
 const MAX_QUERY_BYTES: usize = 4096;
-/// More modes than this in one request is a client bug, not a search.
+/// Maximum modes in one combined request.
 const MAX_QUERIES: usize = 6;
-/// A composite image query is intentionally small: each component may trigger model inference or
-/// a database lookup, and a human search needs only a handful of positive and negative examples.
+/// Maximum components in one image query.
 const MAX_IMAGE_QUERY_COMPONENTS: usize = 16;
-/// Keep weighted CLIP arithmetic numerically meaningful and bounded. Larger intent is expressed
-/// by changing relative component weights, not by pushing an unbounded float through the API.
+/// Bound component weights before vector arithmetic.
 const MAX_IMAGE_QUERY_COMPONENT_WEIGHT: f64 = 100.0;
 /// The constant from the reciprocal-rank-fusion paper. It damps the top of each list so one mode's
 /// first hit cannot outweigh agreement between the others.
 const DEFAULT_RRF_K: f64 = 60.0;
-
-/// The async handler owns this guard; the blocking worker owns only the token.
-/// Dropping the handler (for example on a disconnected HTTP request) interrupts its readers.
-struct CancelSearchOnDrop(Option<SearchCancellation>);
-
-impl Drop for CancelSearchOnDrop {
-    fn drop(&mut self) {
-        if let Some(cancellation) = &self.0 {
-            cancellation.cancel();
-            tracing::debug!("cancelled abandoned search");
-        }
-    }
-}
-
-async fn run_search<T: Send + 'static>(
-    task: impl FnOnce(SearchCancellation) -> Result<T, ApiError> + Send + 'static,
-) -> Result<T, ApiError> {
-    let cancellation = SearchCancellation::default();
-    let mut guard = CancelSearchOnDrop(Some(cancellation.clone()));
-    let result = run_blocking(move || {
-        cancellation.check()?;
-        task(cancellation)
-    })
-    .await;
-    guard.0 = None;
-    result
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -113,6 +57,16 @@ enum SearchTypeRequest {
 }
 
 impl SearchTypeRequest {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Vector => "vector",
+            Self::Image => "image",
+            Self::Simple => "simple",
+            Self::Match => "match",
+            Self::Glob => "glob",
+            Self::Regex => "regex",
+        }
+    }
     /// The modes that rank by cosine distance and therefore accept `maxDistance`.
     fn uses_distance(self) -> bool {
         matches!(self, Self::Vector | Self::Image)
@@ -140,11 +94,7 @@ struct SearchRequest {
     time: TimeRequest,
 }
 
-/// The time filter every search mode accepts, defined once and flattened into each request shape.
-///
-/// `timeline` has no default on purpose: "when it was taken" and "when the file last changed" are
-/// different questions, and picking one silently produces a result set the caller cannot interpret.
-/// It is therefore required whenever a bound is given, and pointless without one.
+/// Time filter shared by all search modes. A bound requires an explicit timeline.
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct TimeRequest {
@@ -272,20 +222,10 @@ fn marks_its_own_snippet(kind: SearchType) -> bool {
     matches!(kind, SearchType::Simple | SearchType::Match)
 }
 
-/// Fills in each OCR hit's `highlights` from its own snippet.
-///
-/// Two modes reach the same field by different routes, and the difference is worth keeping in
-/// mind: FTS5 *knows* which terms it matched and says so with markers, while vector search returns
-/// a ranking and no reason for it at all, so its spans are estimated after the fact by matching the
-/// query's words against the OCR text that came back. Both only ever decorate a hit — neither
-/// filters or reorders one — and `kind` is what tells a client which of the two it is holding.
-///
-/// This runs inside the read snapshot, where the snippet is produced.
+/// Populate display-only highlights from FTS markers or lexical estimates without reordering hits.
 fn add_highlights(query: &str, kind: Option<SearchType>, hits: &mut [SearchHit]) {
     for hit in hits {
         let highlights = if kind.is_some_and(marks_its_own_snippet) {
-            // Trading the marked-up snippet for the plain one is the whole point: a client that
-            // renders spans should never also have to strip delimiters out of the text.
             let (snippet, highlights) =
                 highlight::from_marked(&hit.snippet, SNIPPET_OPEN, SNIPPET_CLOSE);
             hit.snippet = snippet;
@@ -347,9 +287,7 @@ struct QueryRequest {
     time: TimeRequest,
 }
 
-/// Structured components whose normalized CLIP vectors are weighted and summed into one image
-/// query. Paths and binary vectors can become additional component sources without changing this
-/// composition contract.
+/// Components whose normalized vectors are weighted and summed into one image query.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ImageQueryRequest {
@@ -395,9 +333,7 @@ struct MultiSearchResponse {
     /// The embedding model the stored vectors belong to, so a client can tell "no vector hits"
     /// from "nothing has been embedded yet". Null before the first backfill.
     model: Option<EmbeddingModelResponse>,
-    /// The image engine's model, whose stored CLIP vectors `type=image` queries are compared
-    /// against. Always present: the image index belongs to the process from startup, and its
-    /// model changes only through a restart.
+    /// Model whose stored vectors image queries search. Always present.
     image_model: EmbeddingModelResponse,
     queries: Vec<QueryResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -463,55 +399,31 @@ async fn search(
         ));
     }
     let time = request.time.resolve("search")?;
-    let kind = search_type(request.kind)?;
     let plan = QueryPlan {
         key: String::new(),
-        input: match kind {
-            PlanKind::Image => QueryInput::Image(ImageQuery::from_text(query)),
-            _ => QueryInput::Text(query),
-        },
-        kind,
+        input: query_input(search_type(request.kind)?, Some(query), None, "search")?,
         limit,
         max_distance,
         weight: 1.0,
         time,
     };
-    let requested_root = request.root;
-    let databases = state.databases;
-    let embedder = state.embedder;
-    let image_query_embedder = state.image_query_embedder;
-
-    let (total, hits) = run_search(move |cancellation| {
-        // A root that exists but has never been indexed is not an error: an empty result set is
-        // the honest answer, and the gallery tells the two apart from its own catalog.
-        let root = roots::resolve_root("search", &requested_root)?;
-        let (total, mut hits) = if matches!(plan.kind, PlanKind::Image) {
-            // Embedding after the root check on purpose: a bad root is the caller's mistake and
-            // should not pay a forward pass to be told so.
-            let images = databases.open_images_read_only(image_query_embedder.dimensions())?;
-            images.set_search_cancellation(&cancellation)?;
-            let mut snapshot = images.begin_read_snapshot()?;
-            let mut resolver = ImageQueryResolver::new(&image_query_embedder, &snapshot);
-            let vector = resolver.resolve(plan.image_query(), &cancellation)?;
-            cancellation.check()?;
-            let result = plan.run_image(&snapshot, Some(vector.as_slice()), &root, None)?;
-            snapshot.commit()?;
-            result
-        } else {
-            let mut db = databases.open_ocr_read_only()?;
-            db.set_search_cancellation(&cancellation)?;
-            let vector = match plan.kind {
-                PlanKind::OcrVector => Some(embedder.ready_or_cached()?.embed_query(plan.text())?),
-                _ => None,
-            };
-            cancellation.check()?;
-            db.read_snapshot(|db| plan.run(db, &root, None, vector.as_deref()))
-                .map_err(classify)?
-        };
-        stamp_ranks(&mut hits);
-        Ok((total, hits))
-    })
-    .await?;
+    let batch = MultiSearchPlan {
+        root: request.root,
+        exclude: None,
+        queries: vec![plan],
+        fusion: None,
+    };
+    let response =
+        run_search(move |cancellation| execute_search(state, batch, cancellation, false)).await?;
+    let QueryResponse {
+        total,
+        results: hits,
+        ..
+    } = response
+        .queries
+        .into_iter()
+        .next()
+        .expect("a single search produces one response");
 
     Ok(Json(SearchResponse {
         total,
@@ -523,6 +435,20 @@ async fn multi_search(
     State(state): State<AppState>,
     ApiJson(request): ApiJson<MultiSearchRequest>,
 ) -> Result<Json<MultiSearchResponse>, ApiError> {
+    let plan = plan_multi_search(request)?;
+    run_search(move |cancellation| execute_search(state, plan, cancellation, true))
+        .await
+        .map(Json)
+}
+
+struct MultiSearchPlan {
+    root: PathBuf,
+    exclude: Option<PathBuf>,
+    queries: Vec<QueryPlan>,
+    fusion: Option<Fusion>,
+}
+
+fn plan_multi_search(request: MultiSearchRequest) -> Result<MultiSearchPlan, ApiError> {
     let default_limit = validate_limit("limit", request.limit)?;
     if request.queries.is_empty() {
         return Err(ApiError::bad_request("at least one query is required"));
@@ -537,12 +463,7 @@ async fn multi_search(
     let mut plans = Vec::with_capacity(request.queries.len());
     let mut seen = Vec::with_capacity(request.queries.len());
     for query in request.queries {
-        let key = query.key.unwrap_or_else(|| {
-            serde_json::to_value(query.kind).map_or_else(
-                |_| "query".to_owned(),
-                |value| value.as_str().unwrap_or("query").to_owned(),
-            )
-        });
+        let key = query.key.unwrap_or_else(|| query.kind.as_str().to_owned());
         if key.trim().is_empty() {
             return Err(ApiError::bad_request("a query key must not be empty"));
         }
@@ -574,7 +495,6 @@ async fn multi_search(
         let kind = search_type(query.kind)?;
         let input = query_input(kind, query.q, query.image_query, &key)?;
         plans.push(QueryPlan {
-            kind,
             input,
             limit: match query.limit {
                 Some(limit) => validate_limit("query limit", limit)?,
@@ -604,159 +524,178 @@ async fn multi_search(
         })
         .transpose()?;
 
-    let requested_root = request.root;
-    let requested_exclude = request.exclude;
-    let databases = state.databases;
-    let embedder = state.embedder;
-    let image_query_embedder = state.image_query_embedder;
-    let image_dimensions = image_query_embedder.dimensions();
-    let image_embedder = state.image_embedder;
-    let external_bytes: usize = plans
-        .iter()
-        .filter_map(|plan| match &plan.input {
-            QueryInput::Image(query) => Some(
-                query
-                    .components
-                    .iter()
-                    .map(|component| match &component.source {
-                        ImageQuerySource::ExternalImage(bytes) => bytes.len(),
-                        _ => 0,
-                    })
-                    .sum::<usize>(),
-            ),
-            _ => None,
-        })
-        .sum();
+    let external_bytes: usize = plans.iter().map(QueryPlan::external_image_bytes).sum();
     if external_bytes > external_image::MAX_TOTAL_BYTES {
         return Err(ApiError::bad_request(
             "external images exceed 32 MiB in one request",
         ));
     }
 
-    run_search(move |cancellation| {
-        let root = roots::resolve_root("search", &requested_root)?;
-        let exclude = requested_exclude
-            .map(|exclude| roots::resolve_root("exclude", &exclude))
-            .transpose()?;
-        let exclude = exclude.as_deref().map(camino::Utf8Path::as_str);
-        let mut db = databases.open_ocr_read_only()?;
-        db.set_search_cancellation(&cancellation)?;
-        // The image index is a separate store, opened only when a query plans to use it.
-        let has_image_queries = plans
-            .iter()
-            .any(|plan| matches!(plan.kind, PlanKind::Image));
-        let images = if has_image_queries {
-            let images = databases.open_images_read_only(image_dimensions)?;
-            images.set_search_cancellation(&cancellation)?;
-            Some(images)
-        } else {
-            None
-        };
-        // Resolve every asset component and run every image search in the same image-index
-        // snapshot. Without this, an asset could be current when its vector is read and become
-        // stale just before the result query correctly filters stale rows.
-        let mut image_snapshot = images
-            .as_ref()
-            .map(ImageIndexDb::begin_read_snapshot)
-            .transpose()?;
+    Ok(MultiSearchPlan {
+        root: request.root,
+        exclude: request.exclude,
+        queries: plans,
+        fusion,
+    })
+}
 
-        // One forward pass covers every OCR-vector query with the same text. Composite image
-        // queries have their own resolver: it similarly caches repeated text and asset
-        // components, then normalizes each weighted sum before it reaches the image index.
-        let mut ocr_embeddings: HashMap<&str, Vec<f32>> = HashMap::new();
+fn execute_search(
+    state: AppState,
+    plan: MultiSearchPlan,
+    cancellation: SearchCancellation,
+    include_model_metadata: bool,
+) -> Result<MultiSearchResponse, ApiError> {
+    let MultiSearchPlan {
+        root: requested_root,
+        exclude: requested_exclude,
+        queries: plans,
+        fusion,
+    } = plan;
+    let databases = state.databases;
+    let embedder = state.embedder;
+    let image_query_embedder = state.image_query_embedder;
+    let image_dimensions = image_query_embedder.dimensions();
+    let image_embedder = state.image_embedder;
+    // Validate the root before preparing embeddings. An existing, unindexed root still
+    // produces an empty result set through the read-only stores.
+    let root = roots::resolve_root("search", &requested_root)?;
+    let exclude = requested_exclude
+        .map(|exclude| roots::resolve_root("exclude", &exclude))
+        .transpose()?;
+    let exclude = exclude.as_deref().map(camino::Utf8Path::as_str);
+    let mut db = if include_model_metadata
+        || plans
+            .iter()
+            .any(|plan| matches!(plan.input, QueryInput::Ocr(_)))
+    {
+        let db = databases.open_ocr_read_only()?;
+        db.set_search_cancellation(&cancellation)?;
+        Some(db)
+    } else {
+        None
+    };
+    // The image index is a separate store, opened only when a query plans to use it.
+    let has_image_queries = plans
+        .iter()
+        .any(|plan| matches!(plan.input, QueryInput::Image(_)));
+    let images = if has_image_queries {
+        let images = databases.open_images_read_only(image_dimensions)?;
+        images.set_search_cancellation(&cancellation)?;
+        Some(images)
+    } else {
+        None
+    };
+    // Resolve every asset component and run every image search in the same image-index
+    // snapshot. Without this, an asset could be current when its vector is read and become
+    // stale just before the result query correctly filters stale rows.
+    let mut image_snapshot = images
+        .as_ref()
+        .map(ImageIndexDb::begin_read_snapshot)
+        .transpose()?;
+
+    // One forward pass covers every OCR-vector query with the same text. Composite image
+    // queries have their own resolver: it similarly caches repeated text and asset
+    // components, then normalizes each weighted sum before it reaches the image index.
+    let mut ocr_embeddings: HashMap<&str, Vec<f32>> = HashMap::new();
+    for plan in &plans {
+        cancellation.check()?;
+        match &plan.input {
+            QueryInput::Ocr(OcrQuery {
+                kind: OcrQueryKind::Vector,
+                text,
+            }) if !ocr_embeddings.contains_key(text.as_str()) => {
+                ocr_embeddings.insert(text, embedder.ready_or_cached()?.embed_query(text)?);
+            }
+            _ => {}
+        }
+    }
+    let mut image_vectors: HashMap<&str, Vec<f32>> = HashMap::new();
+    if let Some(snapshot) = image_snapshot.as_ref() {
+        let mut resolver = ImageQueryResolver::new(&image_query_embedder, snapshot);
+        resolver.image_embedder = Some(&image_embedder);
+        for plan in &plans {
+            if let QueryInput::Image(query) = &plan.input {
+                image_vectors.insert(plan.key.as_str(), resolver.resolve(query, &cancellation)?);
+            }
+        }
+    }
+
+    cancellation.check()?;
+    let model = db
+        .as_ref()
+        .filter(|_| include_model_metadata)
+        .map(|db| db.text_embedding_model(TextEmbeddingSpace::OcrText))
+        .transpose()?
+        .flatten()
+        .map(|model| EmbeddingModelResponse {
+            model: model.model,
+            dimensions: model.dimensions,
+        });
+    let image_model = EmbeddingModelResponse {
+        model: image_query_embedder.model().id().to_owned(),
+        dimensions: image_query_embedder.dimensions(),
+    };
+
+    let answer = |mut db: Option<&mut DB>| {
+        let mut answered = Vec::with_capacity(plans.len());
         for plan in &plans {
             cancellation.check()?;
-            match plan.kind {
-                PlanKind::OcrVector if !ocr_embeddings.contains_key(plan.text()) => {
-                    ocr_embeddings.insert(
-                        plan.text(),
-                        embedder.ready_or_cached()?.embed_query(plan.text())?,
-                    );
+            let (total, results) = match &plan.input {
+                QueryInput::Image(_) => {
+                    let images = image_snapshot
+                        .as_ref()
+                        .expect("an image query opens the image snapshot first");
+                    let vector = image_vectors.get(plan.key.as_str()).map(Vec::as_slice);
+                    plan.run_image(images, vector, &root, exclude)?
                 }
-                _ => {}
-            }
-        }
-        let mut image_vectors: HashMap<&str, Vec<f32>> = HashMap::new();
-        if let Some(snapshot) = image_snapshot.as_ref() {
-            let mut resolver = ImageQueryResolver::new(&image_query_embedder, snapshot);
-            resolver.image_embedder = Some(&image_embedder);
-            for plan in &plans {
-                if matches!(plan.kind, PlanKind::Image) {
-                    image_vectors.insert(
-                        plan.key.as_str(),
-                        resolver.resolve(plan.image_query(), &cancellation)?,
-                    );
+                QueryInput::Ocr(query) => {
+                    let vector = ocr_embeddings.get(query.text.as_str()).map(Vec::as_slice);
+                    plan.run_ocr(
+                        query,
+                        db.as_deref_mut()
+                            .expect("an OCR query opens the OCR snapshot first"),
+                        &root,
+                        exclude,
+                        vector,
+                    )?
                 }
-            }
-        }
-
-        cancellation.check()?;
-        let model = db
-            .text_embedding_model(TextEmbeddingSpace::OcrText)?
-            .map(|model| EmbeddingModelResponse {
-                model: model.model,
-                dimensions: model.dimensions,
+            };
+            answered.push(QueryResponse {
+                key: plan.key.clone(),
+                kind: plan.request_kind(),
+                total,
+                results,
             });
-        let image_model = EmbeddingModelResponse {
-            model: image_query_embedder.model().id().to_owned(),
-            dimensions: image_query_embedder.dimensions(),
-        };
-
-        let mut queries = db
-            .read_snapshot(|db| {
-                let mut answered = Vec::with_capacity(plans.len());
-                for plan in &plans {
-                    cancellation.check()?;
-                    let (total, results) = match plan.kind {
-                        PlanKind::Image => {
-                            let images = image_snapshot
-                                .as_ref()
-                                .expect("an image query opens the image snapshot first");
-                            let vector = image_vectors.get(plan.key.as_str()).map(Vec::as_slice);
-                            plan.run_image(images, vector, &root, exclude)?
-                        }
-                        _ => {
-                            let vector = ocr_embeddings.get(plan.text()).map(Vec::as_slice);
-                            plan.run(db, &root, exclude, vector)?
-                        }
-                    };
-                    answered.push(QueryResponse {
-                        key: plan.key.clone(),
-                        kind: plan.request_kind(),
-                        total,
-                        results,
-                    });
-                }
-                Ok(answered)
-            })
-            .map_err(classify)?;
-        if let Some(snapshot) = image_snapshot.as_mut() {
-            snapshot.commit()?;
         }
-        for query in &mut queries {
-            stamp_ranks(&mut query.results);
-        }
+        Ok(answered)
+    };
+    let mut queries = match db.as_mut() {
+        Some(db) => db.read_snapshot(|db| answer(Some(db))).map_err(classify)?,
+        None => answer(None).map_err(classify)?,
+    };
+    if let Some(snapshot) = image_snapshot.as_mut() {
+        snapshot.commit()?;
+    }
+    for query in &mut queries {
+        stamp_ranks(&mut query.results);
+    }
 
-        cancellation.check()?;
-        let fused = fusion.map(|fusion| fusion.apply(&plans, &queries));
-        Ok(Json(MultiSearchResponse {
-            model,
-            image_model,
-            queries,
-            fused,
-        }))
+    cancellation.check()?;
+    let fused = fusion.map(|fusion| fusion.apply(&plans, &queries));
+    Ok(MultiSearchResponse {
+        model,
+        image_model,
+        queries,
+        fused,
     })
-    .await
 }
 
 /// Which engine a validated query runs against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PlanKind {
-    /// Nearest OCR-text vectors: the query embedded by the OCR engine's own text model and
-    /// searched over the OCR store's vector space.
+    /// Nearest OCR-text vectors.
     OcrVector,
-    /// Nearest image vectors: the query embedded by the image engine's paired text encoder and
-    /// searched over the CLIP image index. A separate engine, a separate database.
+    /// Nearest image vectors in the image index.
     Image,
     /// A literal text mode over the OCR store.
     Text(SearchType),
@@ -782,6 +721,7 @@ struct ImageQuery {
 }
 
 impl ImageQuery {
+    #[cfg(test)]
     fn from_text(text: String) -> Self {
         Self {
             components: vec![ImageQueryComponent {
@@ -792,18 +732,28 @@ impl ImageQuery {
     }
 }
 
-/// A plan's input is deliberately typed by its engine: OCR modes only ever see text, whereas the
-/// image engine composes CLIP text and image-vector components before one vector search.
+/// Validated input for an OCR or image-search engine.
 #[derive(Debug)]
 enum QueryInput {
-    Text(String),
+    Ocr(OcrQuery),
     Image(ImageQuery),
+}
+
+#[derive(Debug)]
+struct OcrQuery {
+    kind: OcrQueryKind,
+    text: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum OcrQueryKind {
+    Vector,
+    Literal(SearchType),
 }
 
 /// One mode's validated query, ready to run against its stores.
 struct QueryPlan {
     key: String,
-    kind: PlanKind,
     input: QueryInput,
     limit: usize,
     max_distance: Option<f64>,
@@ -812,54 +762,51 @@ struct QueryPlan {
 }
 
 impl QueryPlan {
-    fn text(&self) -> &str {
+    fn external_image_bytes(&self) -> usize {
         match &self.input {
-            QueryInput::Text(text) => text,
-            QueryInput::Image(_) => {
-                unreachable!("only OCR plans have a single text query")
-            }
-        }
-    }
-
-    fn image_query(&self) -> &ImageQuery {
-        match &self.input {
-            QueryInput::Image(query) => query,
-            QueryInput::Text(_) => {
-                unreachable!("only image plans have composite image queries")
-            }
+            QueryInput::Image(query) => query
+                .components
+                .iter()
+                .map(|component| match &component.source {
+                    ImageQuerySource::ExternalImage(bytes) => bytes.len(),
+                    _ => 0,
+                })
+                .sum(),
+            QueryInput::Ocr(_) => 0,
         }
     }
 
     fn request_kind(&self) -> SearchTypeRequest {
-        match self.kind {
-            PlanKind::OcrVector => SearchTypeRequest::Vector,
-            PlanKind::Image => SearchTypeRequest::Image,
-            PlanKind::Text(SearchType::Simple) => SearchTypeRequest::Simple,
-            PlanKind::Text(SearchType::Match) => SearchTypeRequest::Match,
-            PlanKind::Text(SearchType::Glob) => SearchTypeRequest::Glob,
+        let QueryInput::Ocr(query) = &self.input else {
+            return SearchTypeRequest::Image;
+        };
+        match query.kind {
+            OcrQueryKind::Vector => SearchTypeRequest::Vector,
+            OcrQueryKind::Literal(SearchType::Simple) => SearchTypeRequest::Simple,
+            OcrQueryKind::Literal(SearchType::Match) => SearchTypeRequest::Match,
+            OcrQueryKind::Literal(SearchType::Glob) => SearchTypeRequest::Glob,
             #[cfg(feature = "regex")]
-            PlanKind::Text(SearchType::Regex) => SearchTypeRequest::Regex,
+            OcrQueryKind::Literal(SearchType::Regex) => SearchTypeRequest::Regex,
         }
     }
 
     /// Run inside a caller-owned snapshot, which is why this uses `search_count` and `search`
     /// rather than `search_with_count`: the latter opens a transaction of its own. Covers the
     /// OCR-store modes; image plans route to [`Self::run_image`] instead.
-    fn run(
+    fn run_ocr(
         &self,
+        query: &OcrQuery,
         db: &mut DB,
         root: &camino::Utf8Path,
         exclude: Option<&str>,
         vector: Option<&[f32]>,
     ) -> anyhow::Result<(usize, Vec<SearchHit>)> {
-        // Every mode narrows the same way. The root, the exclusion, and the time range are built
-        // once here and handed to whichever mode runs, rather than each mode re-deriving them.
         let filters = SearchFilters::new(root)
             .with_exclude(exclude)
             .with_time(self.time);
-        match self.kind {
-            PlanKind::Text(kind) => {
-                let text = self.text();
+        let text = query.text.as_str();
+        match query.kind {
+            OcrQueryKind::Literal(kind) => {
                 let total = db.search_count(vec![text], &filters, kind)?;
                 let results = db.search(vec![text], &filters, self.limit, kind)?;
                 let mut hits: Vec<SearchHit> = results
@@ -876,8 +823,7 @@ impl QueryPlan {
                 add_highlights(text, Some(kind), &mut hits);
                 Ok((total, hits))
             }
-            PlanKind::OcrVector => {
-                let text = self.text();
+            OcrQueryKind::Vector => {
                 let vector = vector.expect("a vector query is embedded before it is run");
                 let options = TextVectorSearchOptions {
                     max_distance: self.max_distance,
@@ -904,13 +850,10 @@ impl QueryPlan {
                 add_highlights(text, None, &mut hits);
                 Ok((total, hits))
             }
-            PlanKind::Image => unreachable!("image plans run against the image index"),
         }
     }
 
-    /// Run against the CLIP image index on its own connection, outside the OCR snapshot: the two
-    /// stores are separate databases, so this is the closest one-request equivalent of sharing
-    /// one. Same filters, same `total`-before-`limit` contract as every other mode.
+    /// Run against the independent image-index snapshot.
     fn run_image(
         &self,
         images: &ImageIndexDb,
@@ -926,8 +869,7 @@ impl QueryPlan {
             max_distance: self.max_distance,
         };
         let (total, results) = images.search_vectors(vector, &filters, self.limit, &options)?;
-        // The image mode has no text of its own: the hit is the picture, so `snippet` is empty
-        // and there is nothing to estimate matches in.
+        // Image hits have no OCR snippet or highlights.
         let hits = results
             .into_iter()
             .map(|hit| SearchHit {
@@ -971,9 +913,7 @@ impl<'a> ImageQueryResolver<'a> {
     ///
     /// `normalize(weight₁ × normalize(component₁) + …)`.
     ///
-    /// A negative weight is directional arithmetic, not a boolean exclusion. For example,
-    /// `+beach - people` finds the CLIP direction that is beach-like and people-unlike; it does
-    /// not prove a result contains no person.
+    /// A negative weight changes vector direction; it is not a boolean exclusion.
     fn resolve(
         &mut self,
         query: &ImageQuery,
@@ -1096,17 +1036,7 @@ fn normalize_combined_image_vector(combined: Vec<f64>) -> Result<Vec<f32>, ApiEr
         .collect())
 }
 
-/// Stamps every hit's `rank` from its position in `hits`, from 1. Called once per mode, after
-/// retrieval and before the hits are returned to the caller — so callers (including
-/// [`Fusion::apply`]) always see a `rank` that matches the order actually returned. Retrieval
-/// already produced that order (cosine distance ascending for vector search, `bm25()`/match count
-/// for the text modes); this only stamps it, it does not reorder.
-///
-/// A cross-encoder reranking pass used to run here. It was removed: vector-mode hits were already
-/// cosine-sorted, so reranking them only spent a second-plus of ONNX inference to reorder a list
-/// that was already in the right order — and the text modes' gain from it was marginal for this
-/// corpus's short, keyword-heavy OCR snippets. See git history (`src/rerank/`) if it's ever worth
-/// resurrecting for a different corpus shape.
+/// Stamp each hit with its one-based position in the retrieval order without reordering it.
 fn stamp_ranks(hits: &mut [SearchHit]) {
     for (index, hit) in hits.iter_mut().enumerate() {
         hit.rank = index + 1;
@@ -1131,9 +1061,7 @@ impl Fusion {
     /// Reciprocal rank fusion: an asset scores `weight / (k + rank)` in every mode that returned
     /// it, summed across modes.
     ///
-    /// Ranks are used rather than the underlying scores on purpose. FTS5 rank and cosine distance
-    /// are not on a common scale and cannot be made comparable by normalising them, so combining
-    /// the positions is the only combination that means anything.
+    /// Ranks combine modes whose native scores use incomparable scales.
     fn apply(&self, plans: &[QueryPlan], queries: &[QueryResponse]) -> FusedResponse {
         let FuseMethod::Rrf = self.method;
         let weights: HashMap<&str, f64> = plans
@@ -1232,24 +1160,28 @@ fn validate_max_distance(max_distance: Option<f64>) -> Result<Option<f64>, ApiEr
     }
 }
 
-/// Validate a query according to its engine and turn its wire form into the representation the
-/// execution plan owns. Legacy `q` stays a positive image-text component, so existing image
-/// callers retain their exact meaning while POST can add signed components around it.
+/// Validate a query and build its engine-specific input.
 fn query_input(
     kind: PlanKind,
     q: Option<String>,
     image_query: Option<ImageQueryRequest>,
     key: &str,
 ) -> Result<QueryInput, ApiError> {
-    if !matches!(kind, PlanKind::Image) {
+    let ocr_kind = match kind {
+        PlanKind::Text(kind) => Some(OcrQueryKind::Literal(kind)),
+        PlanKind::OcrVector => Some(OcrQueryKind::Vector),
+        PlanKind::Image => None,
+    };
+    if let Some(kind) = ocr_kind {
         if image_query.is_some() {
             return Err(ApiError::bad_request(format!(
                 "query {key}: imageQuery applies only to type=image"
             )));
         }
-        return Ok(QueryInput::Text(
-            validate_query(q.as_deref().unwrap_or_default())?.to_owned(),
-        ));
+        return Ok(QueryInput::Ocr(OcrQuery {
+            kind,
+            text: validate_query(q.as_deref().unwrap_or_default())?.to_owned(),
+        }));
     }
 
     let mut components = match image_query {
@@ -1451,8 +1383,10 @@ mod tests {
     fn plan(key: &str, weight: f64) -> QueryPlan {
         QueryPlan {
             key: key.to_owned(),
-            kind: PlanKind::Text(SearchType::Simple),
-            input: QueryInput::Text("x".to_owned()),
+            input: QueryInput::Ocr(OcrQuery {
+                kind: OcrQueryKind::Literal(SearchType::Simple),
+                text: "x".to_owned(),
+            }),
             limit: 10,
             max_distance: None,
             weight,
@@ -1489,6 +1423,40 @@ mod tests {
         // Vector search is the default mode; the text modes are opt-in.
         assert_eq!(request.kind, SearchTypeRequest::Vector);
         assert_eq!(request.max_distance, None);
+    }
+
+    #[test]
+    fn planning_preserves_typed_modes_keys_and_time_inheritance() {
+        let request: MultiSearchRequest = serde_json::from_value(serde_json::json!({
+            "root": "C:/gallery", "timeline": "modified", "after": "5",
+            "queries": [
+                {"type": "simple", "q": "literal"},
+                {"type": "vector", "q": "semantic", "timeline": "modified", "before": "4"},
+                {"type": "image", "imageQuery": {"components": [{"assetId": 7}]}}
+            ], "fuse": {"method": "rrf"}
+        }))
+        .unwrap();
+        let planned = plan_multi_search(request).unwrap();
+        assert_eq!(
+            planned
+                .queries
+                .iter()
+                .map(|q| q.key.as_str())
+                .collect::<Vec<_>>(),
+            ["simple", "vector", "image"]
+        );
+        assert!(
+            matches!(&planned.queries[0].input, QueryInput::Ocr(OcrQuery { kind: OcrQueryKind::Literal(SearchType::Simple), text }) if text == "literal")
+        );
+        assert!(
+            matches!(&planned.queries[1].input, QueryInput::Ocr(OcrQuery { kind: OcrQueryKind::Vector, text }) if text == "semantic")
+        );
+        assert!(matches!(&planned.queries[2].input, QueryInput::Image(_)));
+        assert_eq!(planned.queries[0].time.unwrap().after_ns, Some(5));
+        assert_eq!(planned.queries[1].time.unwrap().after_ns, None);
+        assert_eq!(planned.queries[1].time.unwrap().before_ns, Some(4));
+        assert_eq!(planned.queries[2].time, planned.queries[0].time);
+        assert!(planned.fusion.is_some());
     }
 
     #[test]

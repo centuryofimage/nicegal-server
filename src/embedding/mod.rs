@@ -23,17 +23,8 @@ pub struct TextEmbedderOptions {
     /// Longest input the backend accepts, in bytes of UTF-8. Longer text is truncated on a
     /// character boundary before embedding.
     pub max_input_bytes: usize,
-    /// Largest batch [`TextEmbedder::embed_documents`] should be given. A caller may ask for less;
-    /// asking for more is clamped, because the backend sizes its buffers from this.
-    ///
-    /// 64 rather than something larger: attention memory is `batch * heads * seq^2`, so cost grows
-    /// with batch size *and* with the longest row in the batch (ONNX pads every row to it). Live
-    /// benchmarking (`benches/text_embed_index.rs`) against a corpus mixing short OCR lines with
-    /// occasional near-cap rows plateaued throughput by batch 32-64 on both CPU and DirectML, then
-    /// DirectML failed outright at batch 256 with a device-level error, and CPU failed at batch
-    /// 1024 trying to allocate a single ~12 GiB buffer. 64 sits with real margin below both cliffs
-    /// while giving up none of the measured throughput, and keeps peak memory modest for the 16 GB
-    /// machines this backend also has to run on.
+    /// Largest batch [`TextEmbedder::embed_documents`] accepts. Larger batches are rejected.
+    /// Memory grows with the batch size and the longest padded input in the batch.
     pub max_batch_size: usize,
     /// The execution provider to compile the ONNX session for, with the same
     /// request/fallback/thread-budget contract [`crate::runtime::load_sessions`] gives OCR.
@@ -69,8 +60,7 @@ impl TextEmbedder {
     /// Load the model described by `options`.
     ///
     /// The model is downloaded on first use into the standard Hugging Face cache and reused from
-    /// there on subsequent starts. ONNX Runtime binaries are provided by the backend's download
-    /// feature for now.
+    /// there on subsequent starts.
     #[instrument(name = "embedder_load", skip_all, fields(model = %options.model))]
     pub fn load(options: &TextEmbedderOptions) -> Result<Self> {
         Self::load_with_progress(options, &())
@@ -173,11 +163,7 @@ impl TextEmbedder {
 
     /// Embed a batch of OCR texts, returning one vector per input in the same order.
     ///
-    /// Batching is the shape the real backend wants — a single padded forward pass over the whole
-    /// batch, parallelised inside ONNX Runtime — so the backfill job is written against it from
-    /// the start rather than being retrofitted later. A batch longer than
-    /// [`Self::max_batch_size`] is refused rather than silently split, because a caller that has
-    /// stopped honouring the limit will otherwise quietly lose the batching it thinks it has.
+    /// A batch longer than [`Self::max_batch_size`] is rejected rather than silently split.
     #[instrument(
         name = "embed_documents",
         level = "debug",

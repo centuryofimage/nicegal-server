@@ -1,10 +1,11 @@
+use crate::api::jobs::cancel_if;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use hf_hub::api::tokio::Progress;
 use nicegal_core::hub::{self, DownloadObserver, ModelSource};
 use nicegal_core::index::IndexObserver;
-use nicegal_core::ocr::PaddleOcrPool;
+use nicegal_core::ocr::{OcrModelFiles, PaddleOcrPool};
 use nicegal_core::runtime::{ExecutionProvider, RuntimeOptions};
 use serde::Deserialize;
 use tracing::{error, warn};
@@ -105,7 +106,7 @@ pub(crate) async fn run(
     store: &ModelStore,
     runtime: &Arc<RuntimeSettings>,
     job: Arc<Job>,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<()> {
     let cache = hub::cache();
     let api = hub::api()?;
 
@@ -119,9 +120,7 @@ pub(crate) async fn run(
         )
         .await?;
     job.model_download_complete();
-    if job.is_cancelled() {
-        return Ok(true);
-    }
+    cancel_if(job.is_cancelled())?;
     let detection_config_path = spec
         .detection_config
         .get_with_progress(
@@ -130,9 +129,7 @@ pub(crate) async fn run(
             ModelDownloadProgress::new(Arc::clone(&job), spec.detection_config.clone()),
         )
         .await?;
-    if job.is_cancelled() {
-        return Ok(true);
-    }
+    cancel_if(job.is_cancelled())?;
 
     let recognition_path = spec
         .recognition
@@ -143,9 +140,7 @@ pub(crate) async fn run(
         )
         .await?;
     job.model_download_complete();
-    if job.is_cancelled() {
-        return Ok(true);
-    }
+    cancel_if(job.is_cancelled())?;
     let recognition_config_path = spec
         .recognition_config
         .get_with_progress(
@@ -154,9 +149,7 @@ pub(crate) async fn run(
             ModelDownloadProgress::new(Arc::clone(&job), spec.recognition_config.clone()),
         )
         .await?;
-    if job.is_cancelled() {
-        return Ok(true);
-    }
+    cancel_if(job.is_cancelled())?;
 
     job.loading_models();
     let detection = spec.detection;
@@ -166,13 +159,17 @@ pub(crate) async fn run(
         ..RuntimeOptions::default()
     };
     let models = tokio::task::spawn_blocking(move || {
-        PaddleOcrPool::load_with_options(
-            detection,
-            &detection_path,
-            &detection_config_path,
-            recognition,
-            &recognition_path,
-            &recognition_config_path,
+        PaddleOcrPool::load_files(
+            OcrModelFiles {
+                source: &detection,
+                model_path: &detection_path,
+                config_path: &detection_config_path,
+            },
+            OcrModelFiles {
+                source: &recognition,
+                model_path: &recognition_path,
+                config_path: &recognition_config_path,
+            },
             runtime_options,
         )
     })
@@ -198,13 +195,10 @@ pub(crate) async fn run(
             }
         }
     }
-    Ok(false)
+    Ok(())
 }
 
-/// Exits the process shortly after this job's completion has had time to reach the client (the
-/// HTTP response and SSE completion event both go out before this fires), asking the desktop
-/// launcher to respawn the server — see `RESTART_EXIT_CODE` and
-/// `main/backend/nicegal-server-process.ts`'s exit handler.
+/// Exit after completion is published so the launcher can restart with the selected runtime.
 fn schedule_restart() {
     tokio::spawn(async {
         tokio::time::sleep(Duration::from_millis(500)).await;

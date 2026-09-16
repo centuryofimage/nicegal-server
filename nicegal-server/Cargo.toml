@@ -16,15 +16,15 @@ ort-profiling = ["nicegal-core/ort-profiling"]
 ort-directml = ["nicegal-core/ort-directml"]
 [dependencies]
 anyhow = "1.0.104"
-base64 = "0.22.1"
+base64 = "0.23.1"
 imagesize = "0.15.0"
-sha2 = "0.10.9"
+sha2 = "0.11.0"
 axum = "0.8.9"
 camino = { version = "1.2.5", features = ["serde1"] }
 clap = { version = "4.6.6", features = ["derive", "env"] }
-dirs = "6.0.0"
+dirs = "7.0.0"
 glob = "0.3.4"
-hf-hub = { version = "0.4.3", default-features = false, features = ["native-tls", "tokio"] }
+hf-hub = { version = "0.5.0", default-features = false, features = ["native-tls", "tokio", "ureq"] }
 nicegal-core = { path = "..", default-features = false, features = ["logging"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"

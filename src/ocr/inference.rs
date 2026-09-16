@@ -9,19 +9,11 @@ use image::imageops::{FilterType, resize, rotate90};
 use image::{Rgb, RgbImage};
 use ort::session::Session;
 use ort::value::TensorRef;
+use serde::Deserialize;
 use tracing::{Span, debug, field, instrument};
 
 const DETECTION_TARGET_SIDE: u32 = 736;
-/// Longest detector input side, matching PaddleOCR's own default.
-///
-/// Detection inference costs roughly one multiply per input pixel, and this bound decides how many
-/// pixels each image contributes. At the previous 2,000 it left the mean detector input at 1.70 MP
-/// and detection inference at 57% of the whole OCR phase; 960 cuts that to 0.32x the pixels.
-///
-/// Lowering it can only cost recall on small text, so it was checked rather than assumed: over 490
-/// images the benchmark's OCR content digest came out *identical* at 2,000, 1,280 and 960, while
-/// wall time fell from 209s to 132s. That is one corpus, so the bound stays tunable through
-/// [`PaddleOcrOptions::detection_max_side`] — re-check the digest before moving it again.
+/// Default longest detector input side. Lower values reduce work but may miss small text.
 const DETECTION_MAX_SIDE: u32 = 960;
 const DETECTION_MIN_MAX_SIDE: u32 = 320;
 const DETECTION_LIMIT_MAX_SIDE: u32 = 8_192;
@@ -100,6 +92,51 @@ struct RecognizerConfig {
     characters: Vec<String>,
 }
 
+#[derive(Deserialize)]
+struct ModelConfig<P> {
+    #[serde(rename = "PreProcess")]
+    preprocess: PreprocessConfig,
+    #[serde(rename = "PostProcess")]
+    postprocess: P,
+}
+
+#[derive(Deserialize)]
+struct PreprocessConfig {
+    transform_ops: Vec<TransformConfig>,
+}
+
+#[derive(Deserialize)]
+struct TransformConfig {
+    #[serde(rename = "NormalizeImage")]
+    normalize: Option<NormalizeConfig>,
+    #[serde(rename = "RecResizeImg")]
+    resize: Option<RecognizerResize>,
+}
+
+#[derive(Deserialize)]
+struct NormalizeConfig {
+    mean: [f32; 3],
+    std: [f32; 3],
+}
+
+#[derive(Deserialize)]
+struct DetectorPostprocess {
+    thresh: f32,
+    box_thresh: f32,
+    max_candidates: usize,
+    unclip_ratio: f32,
+}
+
+#[derive(Deserialize)]
+struct RecognizerResize {
+    image_shape: [usize; 3],
+}
+
+#[derive(Deserialize)]
+struct RecognizerPostprocess {
+    character_dict: Vec<String>,
+}
+
 impl PaddleOcrConfig {
     pub(super) fn load(detection_path: &Path, recognition_path: &Path) -> Result<Self> {
         let detection = fs::read_to_string(detection_path).with_context(|| {
@@ -116,85 +153,46 @@ impl PaddleOcrConfig {
         })?;
 
         Ok(Self {
-            detector: DetectorConfig {
-                threshold: parse_scalar(&detection, "thresh")?,
-                box_threshold: parse_scalar(&detection, "box_thresh")?,
-                max_candidates: parse_scalar(&detection, "max_candidates")?,
-                unclip_ratio: parse_scalar(&detection, "unclip_ratio")?,
-                mean: parse_three_values(&detection, "mean")?,
-                std: parse_three_values(&detection, "std")?,
-            },
+            detector: parse_detector_config(&detection)?,
             recognizer: parse_recognizer_config(&recognition)?,
         })
     }
 }
 
-fn parse_scalar<T>(document: &str, key: &str) -> Result<T>
-where
-    T: std::str::FromStr,
-    T::Err: std::fmt::Display,
-{
-    let prefix = format!("{key}:");
-    let value = document
-        .lines()
-        .map(str::trim)
-        .find_map(|line| line.strip_prefix(&prefix))
-        .map(str::trim)
-        .ok_or_else(|| anyhow!("PaddleOCR configuration is missing {key}"))?;
-    value
-        .parse()
-        .map_err(|error| anyhow!("invalid PaddleOCR {key} value {value:?}: {error}"))
-}
-
-fn parse_three_values(document: &str, key: &str) -> Result<[f32; 3]> {
-    let marker = format!("{key}:");
-    let mut lines = document.lines();
-    while let Some(line) = lines.next() {
-        if line.trim() != marker {
-            continue;
-        }
-        let values = lines
-            .by_ref()
-            .take(3)
-            .map(|line| {
-                line.trim()
-                    .strip_prefix("- ")
-                    .ok_or_else(|| anyhow!("invalid PaddleOCR {key} sequence"))?
-                    .parse::<f32>()
-                    .map_err(|error| anyhow!("invalid PaddleOCR {key} value: {error}"))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        return values
-            .try_into()
-            .map_err(|_| anyhow!("PaddleOCR {key} must contain three values"));
-    }
-    bail!("PaddleOCR configuration is missing {key}")
+fn parse_detector_config(document: &str) -> Result<DetectorConfig> {
+    let config: ModelConfig<DetectorPostprocess> =
+        yaml_serde::from_str(document).context("invalid PaddleOCR detection configuration")?;
+    let normalize = config
+        .preprocess
+        .transform_ops
+        .into_iter()
+        .find_map(|op| op.normalize)
+        .context("PaddleOCR detection configuration is missing NormalizeImage")?;
+    Ok(DetectorConfig {
+        threshold: config.postprocess.thresh,
+        box_threshold: config.postprocess.box_thresh,
+        max_candidates: config.postprocess.max_candidates,
+        unclip_ratio: config.postprocess.unclip_ratio,
+        mean: normalize.mean,
+        std: normalize.std,
+    })
 }
 
 fn parse_recognizer_config(document: &str) -> Result<RecognizerConfig> {
-    let image_shape = parse_usize_sequence(document, "image_shape", 3)?;
+    let config: ModelConfig<RecognizerPostprocess> =
+        yaml_serde::from_str(document).context("invalid PaddleOCR recognition configuration")?;
+    let image_shape = config
+        .preprocess
+        .transform_ops
+        .into_iter()
+        .find_map(|op| op.resize)
+        .context("PaddleOCR recognition configuration is missing RecResizeImg")?
+        .image_shape;
     if image_shape[0] != 3 || image_shape[1] == 0 || image_shape[2] == 0 {
         bail!("PaddleOCR recognition image_shape must be [3, height, width]");
     }
 
-    let mut in_dictionary = false;
-    let mut characters = Vec::new();
-    for line in document.lines() {
-        if line.trim() == "character_dict:" {
-            in_dictionary = true;
-            continue;
-        }
-        if !in_dictionary {
-            continue;
-        }
-        let Some(value) = line.strip_prefix("  - ") else {
-            if !line.trim().is_empty() {
-                break;
-            }
-            continue;
-        };
-        characters.push(parse_yaml_character(value.trim_end())?);
-    }
+    let characters = config.postprocess.character_dict;
     if characters.is_empty() {
         bail!("PaddleOCR recognition configuration has no character_dict entries");
     }
@@ -205,64 +203,6 @@ fn parse_recognizer_config(document: &str) -> Result<RecognizerConfig> {
         base_width: image_shape[2],
         characters,
     })
-}
-
-fn parse_usize_sequence(document: &str, key: &str, count: usize) -> Result<Vec<usize>> {
-    let marker = format!("{key}:");
-    let mut lines = document.lines();
-    while let Some(line) = lines.next() {
-        if line.trim() != marker {
-            continue;
-        }
-        return lines
-            .by_ref()
-            .take(count)
-            .map(|line| {
-                line.trim()
-                    .strip_prefix("- ")
-                    .ok_or_else(|| anyhow!("invalid PaddleOCR {key} sequence"))?
-                    .parse::<usize>()
-                    .map_err(|error| anyhow!("invalid PaddleOCR {key} value: {error}"))
-            })
-            .collect();
-    }
-    bail!("PaddleOCR configuration is missing {key}")
-}
-
-fn parse_yaml_character(value: &str) -> Result<String> {
-    if value.starts_with('\'') {
-        if !value.ends_with('\'') || value.len() < 2 {
-            bail!("invalid single-quoted PaddleOCR character {value:?}");
-        }
-        return Ok(value[1..value.len() - 1].replace("''", "'"));
-    }
-    if value.starts_with('"') {
-        if !value.ends_with('"') || value.len() < 2 {
-            bail!("invalid double-quoted PaddleOCR character {value:?}");
-        }
-        let mut decoded = String::new();
-        let mut escaped = false;
-        for character in value[1..value.len() - 1].chars() {
-            if escaped {
-                decoded.push(match character {
-                    'n' => '\n',
-                    'r' => '\r',
-                    't' => '\t',
-                    other => other,
-                });
-                escaped = false;
-            } else if character == '\\' {
-                escaped = true;
-            } else {
-                decoded.push(character);
-            }
-        }
-        if escaped {
-            bail!("invalid escape in PaddleOCR character {value:?}");
-        }
-        return Ok(decoded);
-    }
-    Ok(value.trim().to_owned())
 }
 
 pub(super) struct PaddleOcrEngine<'a> {
@@ -603,6 +543,7 @@ struct Point {
 
 #[derive(Debug, Clone, Copy)]
 struct TextBox {
+    /// Corners in principal-axis order: min/min, max/min, max/max, min/max.
     points: [Point; 4],
 }
 
@@ -687,13 +628,8 @@ fn boxes_from_probability_map(
 
 /// Order boxes top-to-bottom, then left-to-right within a row.
 ///
-/// The obvious one-pass comparator — "same row if the tops are within `ROW_TOLERANCE`, then
-/// compare x, otherwise compare y" — is not a total order: for tops at 0, 6 and 12, the first two
-/// and the last two compare by x while the outer pair compares by y, so the relation is not
-/// transitive. `slice::sort_by` detects that and **panics** with "user-provided comparison
-/// function does not correctly implement a total order", which is why rows have to be decided in
-/// a separate pass from the comparison. `total_cmp` also keeps a NaN coordinate from silently
-/// re-introducing the same panic through a `partial_cmp(..).unwrap_or(Equal)`.
+/// Row membership is assigned before horizontal sorting because a tolerance-based comparator is
+/// not transitive. `total_cmp` also gives malformed coordinates a deterministic order.
 fn sort_into_reading_order(boxes: &mut [TextBox]) {
     const ROW_TOLERANCE: f32 = 10.0;
 
@@ -740,6 +676,7 @@ fn oriented_component_box(component: &[usize], width: usize, unclip_ratio: f32) 
                 )
             });
     let angle = 0.5 * (2.0 * cov_xy).atan2(cov_xx - cov_yy);
+    // The dominant covariance eigenvector gives the component's principal text axis.
     let axis_x = Point {
         x: angle.cos(),
         y: angle.sin(),
@@ -755,6 +692,7 @@ fn oriented_component_box(component: &[usize], width: usize, unclip_ratio: f32) 
     for index in component {
         let delta_x = (*index % width) as f32 - center.x;
         let delta_y = (*index / width) as f32 - center.y;
+        // Project into the principal-axis basis to measure an oriented bounding rectangle.
         let projected_x = delta_x * axis_x.x + delta_y * axis_x.y;
         let projected_y = delta_x * axis_y.x + delta_y * axis_y.y;
         min_x = min_x.min(projected_x);
@@ -767,6 +705,7 @@ fn oriented_component_box(component: &[usize], width: usize, unclip_ratio: f32) 
     if box_width.min(box_height) < MIN_COMPONENT_PIXELS as f32 {
         return None;
     }
+    // DB-style "unclip": expand by area × ratio / perimeter before mapping back to image space.
     let expansion = box_width * box_height * unclip_ratio / (2.0 * (box_width + box_height));
     min_x -= expansion;
     max_x += expansion;
@@ -963,12 +902,7 @@ mod tests {
         }
     }
 
-    /// The comparator this replaced grouped two boxes into one row whenever their tops were
-    /// within `ROW_TOLERANCE`, which makes the relation intransitive across a chain of boxes that
-    /// each overlap the next. `sort_by` detects that and aborts the whole OCR job with "user-
-    /// provided comparison function does not correctly implement a total order"; the very first
-    /// layout this generates used to panic. Ordinary photos hit it as soon as the detector finds
-    /// enough scattered boxes, so the property, not one captured layout, is the regression.
+    /// Exercises row chains that make pairwise tolerance comparisons intransitive.
     #[test]
     fn reading_order_survives_scattered_boxes() {
         let mut state = 0x2545_F491_4F6C_DD1D_u64;
@@ -1025,19 +959,71 @@ mod tests {
     #[test]
     fn recognition_config_preserves_quoted_characters() -> Result<()> {
         let config = r#"
-        image_shape:
-        - 3
-        - 48
-        - 320
+PreProcess:
+  transform_ops:
+  - RecResizeImg:
+      image_shape: [3, 48, 320]
 PostProcess:
   character_dict:
   - '!'
   - ''''
   - \
   - ' '
+  - "\u4E2D"
 "#;
         let parsed = parse_recognizer_config(config)?;
-        assert_eq!(parsed.characters, ["!", "'", "\\", " "]);
+        assert_eq!(parsed.characters, ["!", "'", "\\", " ", "中"]);
+        assert_eq!(
+            (parsed.channels, parsed.height, parsed.base_width),
+            (3, 48, 320)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recognition_config_rejects_invalid_shapes_and_empty_dictionary() {
+        for shape in [
+            "[]",
+            "[3]",
+            "[3, 48]",
+            "[3, 48, 320, 1]",
+            "[1, 48, 320]",
+            "[3, 0, 320]",
+        ] {
+            let config = format!(
+                "PreProcess:\n  transform_ops:\n  - RecResizeImg:\n      image_shape: {shape}\nPostProcess:\n  character_dict: ['a']"
+            );
+            assert!(
+                parse_recognizer_config(&config).is_err(),
+                "accepted {shape}"
+            );
+        }
+        assert!(parse_recognizer_config(
+            "PreProcess:\n  transform_ops:\n  - RecResizeImg:\n      image_shape: [3, 48, 320]\nPostProcess:\n  character_dict: []"
+        ).is_err());
+    }
+
+    #[test]
+    fn detection_config_reads_nested_yaml_and_aliases() -> Result<()> {
+        let config = r#"
+unrelated: {thresh: 99}
+PreProcess:
+  transform_ops:
+  - DecodeImage: {img_mode: BGR}
+  - NormalizeImage:
+      mean: &values [0.1, 0.2, 0.3]
+      std: *values
+PostProcess:
+  thresh: 0.2
+  box_thresh: 0.45
+  max_candidates: 3000
+  unclip_ratio: 1.4
+"#;
+        let parsed = parse_detector_config(config)?;
+        assert_eq!(parsed.threshold, 0.2);
+        assert_eq!(parsed.mean, [0.1, 0.2, 0.3]);
+        assert_eq!(parsed.std, parsed.mean);
+        assert!(parse_detector_config(&config.replace("[0.1, 0.2, 0.3]", "[0.1]")).is_err());
         Ok(())
     }
 

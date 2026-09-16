@@ -131,17 +131,40 @@ pub trait IndexObserver: Send + Sync {
 /// Only `IndexOptions::exclude`, `IndexOptions::limit`, and `IndexOptions::subdirs` apply. Changed
 /// assets are committed in bounded batches; progress is published only after each batch is durable
 /// and visible to concurrent SQLite readers.
-#[instrument(
-    name = "catalog_sync",
-    skip_all,
-    fields(root = %path, cataloged = field::Empty, cancelled = field::Empty)
-)]
 pub fn catalog_dir_observed(
     assets: &AssetCatalog,
     path: &Path,
     options: IndexOptions,
     observer: &dyn IndexObserver,
 ) -> Result<CatalogSummary> {
+    catalog_dir_with_step(assets, path, options, observer, |_| Ok(false))
+}
+
+/// Catalog a directory and pass its committed assets, in scan order, to derived work.
+/// Returning true from the step cancels the job without discarding committed results.
+pub fn catalog_dir_with_step(
+    assets: &AssetCatalog,
+    path: &Path,
+    options: IndexOptions,
+    observer: &dyn IndexObserver,
+    catalog_step: impl FnOnce(&[Asset]) -> Result<bool>,
+) -> Result<CatalogSummary> {
+    let (catalog, mut summary) = catalog_snapshot(assets, path, options, observer)?;
+    summary.cancelled = summary.cancelled || catalog_step(&catalog)? || observer.is_cancelled();
+    Ok(summary)
+}
+
+#[instrument(
+    name = "catalog_sync",
+    skip_all,
+    fields(root = %path, cataloged = field::Empty, cancelled = field::Empty)
+)]
+fn catalog_snapshot(
+    assets: &AssetCatalog,
+    path: &Path,
+    options: IndexOptions,
+    observer: &dyn IndexObserver,
+) -> Result<(Vec<Asset>, CatalogSummary)> {
     let root = canonicalize_path(path).context("canonicalizing catalog path")?;
     let pipeline = CatalogPipeline {
         assets,
@@ -154,24 +177,23 @@ pub fn catalog_dir_observed(
     } else {
         pipeline.catalog_files(&files.paths)?
     };
+    let scan_complete = files.complete && catalog_complete && !pipeline.cancelled();
+    let cancelled = pipeline.cancelled();
     let summary = CatalogSummary {
         cataloged: catalog.len(),
-        cancelled: pipeline.cancelled(),
-        scan_complete: files.complete && catalog_complete && !pipeline.cancelled(),
+        cancelled,
+        scan_complete,
     };
     let span = Span::current();
     span.record("cataloged", summary.cataloged);
     span.record("cancelled", summary.cancelled);
-    Ok(summary)
+    Ok((catalog, summary))
 }
 
 /// Scan and catalog a root, then OCR its new or changed images with the loaded PaddleOCR pair.
 ///
-/// Filesystem discovery and cataloging intentionally finish before derived work begins. This keeps
-/// the gallery's primary asset list responsive even when image decoding or ONNX inference is slow.
-/// During OCR, a small number of decode workers feed a bounded channel to one inference worker per
-/// pool replica; see [`BoundedOcrPipeline`]. Decode and completion order are both intentionally
-/// allowed to differ from scan order.
+/// Cataloging finishes before derived work. OCR decode and completion order may differ from scan
+/// order; see [`BoundedOcrPipeline`].
 pub fn index_dir_observed(
     assets: &mut AssetCatalog,
     db: &mut DB,
@@ -180,10 +202,10 @@ pub fn index_dir_observed(
     options: IndexOptions,
     observer: &dyn IndexObserver,
 ) -> Result<IndexSummary> {
-    index_dir_with_catalog_step(assets, db, models, path, options, observer, || Ok(false))
+    index_dir_with_catalog_step(assets, db, models, path, options, observer, |_| Ok(false))
 }
 
-/// Run an additional derived-index step after cataloging and before OCR.
+/// Run an additional derived-index step with committed assets in scan order, before OCR.
 /// Returning true cancels the remaining work while retaining committed results.
 pub fn index_dir_with_catalog_step(
     assets: &mut AssetCatalog,
@@ -192,7 +214,7 @@ pub fn index_dir_with_catalog_step(
     path: &Path,
     options: IndexOptions,
     observer: &dyn IndexObserver,
-    catalog_step: impl FnOnce() -> Result<bool>,
+    catalog_step: impl FnOnce(&[Asset]) -> Result<bool>,
 ) -> Result<IndexSummary> {
     if options.commit_chunk_size == 0 {
         bail!("OCR commit chunk size must be greater than zero");
@@ -225,15 +247,19 @@ impl IndexPipeline<'_> {
     fn run(
         &mut self,
         path: &Path,
-        catalog_step: impl FnOnce() -> Result<bool>,
+        catalog_step: impl FnOnce(&[Asset]) -> Result<bool>,
     ) -> Result<IndexSummary> {
         let root = canonicalize_path(path).context("canonicalizing index path")?;
-        let Some((sources, scan_complete)) = self.prepare_sources(&root)? else {
-            return Ok(record_summary(cancelled_summary(0)));
+        let (sources, scan_complete) = {
+            let Some((catalog, scan_complete)) = self.prepare_catalog(&root)? else {
+                return Ok(record_summary(cancelled_summary(0)));
+            };
+            let sources = self.select_ocr_sources(&catalog)?;
+            if catalog_step(&catalog)? || self.cancelled() {
+                return Ok(record_summary(cancelled_summary(0)));
+            }
+            (sources, scan_complete)
         };
-        if catalog_step()? || self.cancelled() {
-            return Ok(record_summary(cancelled_summary(0)));
-        }
         let indexed = self.run_ocr(sources)?;
         if self.cancelled() {
             return Ok(record_summary(cancelled_summary(indexed)));
@@ -244,7 +270,7 @@ impl IndexPipeline<'_> {
         Ok(record_summary(summary))
     }
 
-    fn prepare_sources(&mut self, root: &Path) -> Result<Option<(Vec<Asset>, bool)>> {
+    fn prepare_catalog(&mut self, root: &Path) -> Result<Option<(Vec<Asset>, bool)>> {
         let files = CatalogPipeline {
             assets: &*self.assets,
             options: &self.options,
@@ -272,8 +298,7 @@ impl IndexPipeline<'_> {
         if self.options.cleanup {
             self.db.mark_for_deletion(root)?;
         }
-        self.select_ocr_sources(&catalog)
-            .map(|sources| Some((sources, scan_complete)))
+        Ok(Some((catalog, scan_complete)))
     }
 
     #[instrument(
@@ -579,7 +604,7 @@ impl CatalogPipeline<'_> {
                 match self.assets.prepare_upsert_timed(source_path, &metadata) {
                     Ok((asset, timings)) => {
                         unchanged += usize::from(timings.unchanged);
-                        accumulate_catalog_timings(&mut upsert_timings, timings);
+                        upsert_timings.accumulate(timings);
                         prepared.push(asset);
                     }
                     Err(error) => {
@@ -612,7 +637,7 @@ impl CatalogPipeline<'_> {
                 .store_prepared_batch(prepared)
                 .context("storing catalog batch")?;
             write_batches += usize::from(timings.store > Duration::ZERO);
-            accumulate_catalog_timings(&mut upsert_timings, timings);
+            upsert_timings.accumulate(timings);
             self.progress(IndexProgressDelta {
                 phase_completed: assets.len(),
                 cataloged: assets.len(),
@@ -628,30 +653,7 @@ impl CatalogPipeline<'_> {
         span.record("unchanged", unchanged);
         span.record("write_batches", write_batches);
         span.record("metadata_us", duration_micros(metadata_time));
-        span.record(
-            "canonicalize_us",
-            duration_micros(upsert_timings.canonicalize),
-        );
-        span.record(
-            "fingerprint_us",
-            duration_micros(upsert_timings.fingerprint),
-        );
-        span.record("lookup_us", duration_micros(upsert_timings.lookup));
-        span.record("probe_us", duration_micros(upsert_timings.probe));
-        span.record("dimensions_us", duration_micros(upsert_timings.dimensions));
-        span.record("exif_us", duration_micros(upsert_timings.exif));
-        span.record("animation_us", duration_micros(upsert_timings.animation));
-        span.record("store_us", duration_micros(upsert_timings.store));
-        span.record(
-            "transaction_begin_us",
-            duration_micros(upsert_timings.transaction_begin),
-        );
-        span.record("row_upsert_us", duration_micros(upsert_timings.row_upsert));
-        span.record(
-            "revision_update_us",
-            duration_micros(upsert_timings.revision_update),
-        );
-        span.record("commit_us", duration_micros(upsert_timings.commit));
+        upsert_timings.record(&span);
         Ok((catalog, complete && !self.cancelled()))
     }
 
@@ -680,21 +682,6 @@ fn duration_micros(duration: Duration) -> u64 {
     u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
-fn accumulate_catalog_timings(total: &mut CatalogUpsertTimings, timings: CatalogUpsertTimings) {
-    total.canonicalize += timings.canonicalize;
-    total.fingerprint += timings.fingerprint;
-    total.lookup += timings.lookup;
-    total.probe += timings.probe;
-    total.dimensions += timings.dimensions;
-    total.exif += timings.exif;
-    total.animation += timings.animation;
-    total.store += timings.store;
-    total.transaction_begin += timings.transaction_begin;
-    total.row_upsert += timings.row_upsert;
-    total.revision_update += timings.revision_update;
-    total.commit += timings.commit;
-}
-
 /// What a worker reports back to the coordinator about one asset.
 ///
 /// Completion callbacks stay on the coordinator. Workers do announce when a source enters their
@@ -720,21 +707,12 @@ enum OcrOutcome {
 /// sources -> [decode workers] -> decoded -> [inference replicas] -> outcomes -> coordinator -> DB
 /// ```
 ///
-/// Decoding is CPU work that would otherwise leave an ONNX session idle, so a few workers perform
-/// only that step. Inference used to be the coordinator alone, because `ort` requires
-/// `&mut Session`; that pinned the phase to roughly one core and let a single slow image stall
-/// everything decoded behind it, so it is now one worker per [`PaddleOcrPool`] replica, each
-/// driving its own sessions.
+/// The coordinator is the only thread that touches `DB`, keeping SQLite writes single-threaded.
+/// Workers may emit observer callbacks concurrently, while committed-result progress is emitted
+/// by the coordinator. Results arrive in completion order rather than scan order.
 ///
-/// The coordinator owns every side effect: it is the only thread that touches `DB`, so SQLite
-/// stays single-threaded without a writer actor, and the only one that emits observer events.
-/// Results therefore arrive in completion order rather than scan order.
-///
-/// Teardown is the subtle part. A worker parked in a full `send` is only released by every
-/// receiver dropping, which the coordinator cannot arrange for channels the workers themselves
-/// hold — so every blocking send races an `abort` channel whose sole sender is a coordinator
-/// local. Dropping it releases every worker at once, and it drops on *any* exit: a clean finish,
-/// a failed transaction, a worker panic, or the coordinator unwinding.
+/// Every blocking send races the coordinator's abort channel so teardown wakes workers parked on
+/// full queues.
 struct BoundedOcrPipeline<'a> {
     assets: &'a AssetCatalog,
     db: &'a mut DB,
@@ -907,11 +885,20 @@ impl BoundedOcrPipeline<'_> {
     }
 }
 
+pub(crate) fn worker_panic(body: impl FnOnce()) -> Option<String> {
+    let panic = catch_unwind(AssertUnwindSafe(body)).err()?;
+    Some(
+        panic
+            .downcast_ref::<&str>()
+            .map(|text| (*text).to_owned())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "panicked".to_owned()),
+    )
+}
+
 /// Run a worker body, turning a panic into a [`OcrOutcome::Fatal`] rather than unwinding out of
 /// the thread.
 ///
-/// `thread::scope` only re-raises a worker's panic once every other worker has been joined, so
-/// letting it escape buys nothing and costs the coordinator its chance to stop the run promptly.
 /// The body is asserted unwind-safe because a panic ends the run: the replica it borrows is never
 /// touched again, whatever state its scratch buffers were left in.
 fn guard_worker(
@@ -920,14 +907,9 @@ fn guard_worker(
     abort: &Receiver<()>,
     body: impl FnOnce(),
 ) {
-    let Err(panic) = catch_unwind(AssertUnwindSafe(body)) else {
+    let Some(message) = crate::index::worker_panic(body) else {
         return;
     };
-    let message = panic
-        .downcast_ref::<&str>()
-        .map(|text| (*text).to_owned())
-        .or_else(|| panic.downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "panicked".to_owned());
     error!(stage, "{message}");
     send_unless_aborted(outcomes, OcrOutcome::Fatal { stage, message }, abort);
 }
@@ -1017,7 +999,7 @@ fn flush(db: &mut DB, observer: &dyn IndexObserver, pending: &mut Vec<OcrResult>
     Ok(count)
 }
 
-fn report_item_failure(observer: &dyn IndexObserver, path: &Path, message: String) {
+pub(crate) fn report_item_failure(observer: &dyn IndexObserver, path: &Path, message: String) {
     error!(path = %path, "{message}");
     observer.on_event(IndexEvent::Error {
         path: Some(path.to_owned()),
@@ -1165,6 +1147,46 @@ mod tests {
     }
 
     #[test]
+    fn derived_step_receives_scan_order_instead_of_insertion_order() -> Result<()> {
+        let temp = TempDir::new()?;
+        let root = canonicalize_path(&PathBuf::try_from(temp.path().to_owned())?)?;
+        let assets = AssetCatalog::new(&root.join("assets.db"))?;
+        for name in ["first.png", "second.png", "third.png"] {
+            std::fs::write(root.join(name), b"unreadable image")?;
+        }
+        let observer = TestObserver { cancelled: false };
+        let options = IndexOptions::default();
+        let expected = CatalogPipeline {
+            assets: &assets,
+            options: &options,
+            observer: &observer,
+        }
+        .collect_files(&root)?
+        .paths;
+        for path in expected.iter().rev() {
+            assets.upsert(path, &path.metadata()?)?;
+        }
+        let mut called = false;
+        let summary = catalog_dir_with_step(&assets, &root, options, &observer, |catalog| {
+            called = true;
+            assert_eq!(
+                catalog.iter().map(|asset| &asset.path).collect::<Vec<_>>(),
+                expected.iter().collect::<Vec<_>>()
+            );
+            assert!(
+                catalog
+                    .windows(2)
+                    .all(|pair| pair[0].asset_id > pair[1].asset_id)
+            );
+            Ok(false)
+        })?;
+        assert!(called);
+        assert!(summary.scan_complete);
+        assert_eq!(summary.cataloged, 3);
+        Ok(())
+    }
+
+    #[test]
     fn scan_completeness_rejects_missing_roots_limits_and_cancellation() -> Result<()> {
         let temp = TempDir::new()?;
         let root = PathBuf::try_from(temp.path().to_owned())?;
@@ -1231,14 +1253,7 @@ mod tests {
         Ok(())
     }
 
-    /// The teardown contract, exercised on the pipeline's channel topology without needing models.
-    ///
-    /// A producer is given far more items than the bounded channel can hold, so it must block in
-    /// `send`, and the consumer then panics — the shape of a panicking inference replica on a
-    /// machine sized to one. With a plain `mpsc` channel the producer was never woken (only
-    /// dropping the receiver does that, which a scope closure cannot do for a value its threads
-    /// borrow), so `thread::scope` joined forever at zero CPU and the panic never surfaced.
-    /// Runs on a helper thread so a regression fails on the timeout instead of hanging the suite.
+    /// Runs on a helper thread so a blocked-producer regression times out instead of hanging.
     #[test]
     fn a_panicking_consumer_cannot_strand_a_blocked_producer() {
         let (finished, outcome) = channel();

@@ -1,499 +1,35 @@
-//! Model-specific CLIP image-vector storage and ingestion.
+//! Model-specific image-vector storage and ingestion.
 //!
 //! Each model owns a database file, so incompatible coordinate spaces never share a table. The
 //! database tracks source fingerprints directly from the asset catalog; OCR success or failure has
 //! no bearing on image-vector coverage.
 
 use std::collections::HashSet;
-use std::ops::Deref;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use camino::{Utf8Path as Path, Utf8PathBuf as PathBuf};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use image::RgbImage;
-use rusqlite::types::Value;
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
-use tracing::{debug, error, info, instrument};
+#[cfg(test)]
+use rusqlite::Connection;
+use tracing::{debug, info, instrument};
 
-use crate::assets::{Asset, AssetCatalog, MediaKind, SourceFingerprint};
-use crate::db::{
-    FilterScope, SearchFilters, UNBOUNDED_DISTANCE, bind_named, configure_vector_reads,
-    register_glob, register_vector_extension, vector_to_blob,
-};
+#[cfg(test)]
+use crate::assets::SourceFingerprint;
+use crate::assets::{Asset, AssetCatalog, MediaKind};
+#[cfg(test)]
+use crate::db::SearchFilters;
 use crate::embedding::ImageEmbedder;
 use crate::index::{
     IndexEvent, IndexObserver, IndexPhase, IndexProgressDelta, aborted, send_unless_aborted,
 };
-use crate::schema::{check_schema_read_only, open_schema};
 
-const SCHEMA_VERSION: i32 = 1;
-const SCHEMA_LABEL: &str = "image embedding database";
-const MAX_EMBEDDING_DIMENSIONS: usize = 65_536;
+mod storage;
+use storage::StoredImageEmbedding;
+pub use storage::{ImageIndexDb, ImageIndexReadSnapshot, ImageVectorHit, ImageVectorSearchOptions};
+
 const MAX_DECODE_WORKERS: usize = 4;
-
-pub struct ImageIndexDb {
-    conn: Connection,
-    dimensions: usize,
-}
-
-/// A consistent read view of one image index and its attached asset catalog.
-///
-/// Image-query components and their neighbour search must share this transaction: otherwise a
-/// component could be current when read, become stale while the request is running, and still
-/// affect a search that correctly excludes it. Dropping an uncommitted snapshot rolls it back.
-pub struct ImageIndexReadSnapshot<'db> {
-    db: &'db ImageIndexDb,
-    active: bool,
-}
-
-impl Deref for ImageIndexReadSnapshot<'_> {
-    type Target = ImageIndexDb;
-
-    fn deref(&self) -> &Self::Target {
-        self.db
-    }
-}
-
-impl ImageIndexReadSnapshot<'_> {
-    /// Cleanly complete this read-only transaction. Errors and unwinding roll back through
-    /// [`Drop`] instead.
-    pub fn commit(&mut self) -> Result<()> {
-        self.db
-            .conn
-            .execute_batch("COMMIT")
-            .context("committing image index read snapshot")?;
-        self.active = false;
-        Ok(())
-    }
-}
-
-impl Drop for ImageIndexReadSnapshot<'_> {
-    fn drop(&mut self) {
-        if self.active {
-            // There is no useful recovery path in Drop. A best-effort rollback only releases the
-            // SQLite snapshot; the original error remains the one returned to the caller.
-            let _ = self.db.conn.execute_batch("ROLLBACK");
-        }
-    }
-}
-
-#[derive(Debug)]
-struct StoredImageEmbedding {
-    asset_id: i64,
-    path: PathBuf,
-    fingerprint: SourceFingerprint,
-    vector: Vec<f32>,
-}
-
-impl ImageIndexDb {
-    /// Attach cancellation to a reader owned exclusively by one search request.
-    pub fn set_search_cancellation(
-        &self,
-        cancellation: &crate::cancellation::SearchCancellation,
-    ) -> Result<()> {
-        cancellation.register(&self.conn)
-    }
-
-    /// Open the database belonging to one model and ensure its fixed-width vector table exists.
-    pub fn new(path: &Path, dimensions: usize) -> Result<Self> {
-        if dimensions == 0 || dimensions > MAX_EMBEDDING_DIMENSIONS {
-            bail!("image embedding dimensions must be between 1 and {MAX_EMBEDDING_DIMENSIONS}");
-        }
-        register_vector_extension();
-        let conn = Connection::open(path)
-            .with_context(|| format!("opening image embedding database: {path}"))?;
-        conn.busy_timeout(Duration::from_secs(5))?;
-        conn.pragma_update(None, "auto_vacuum", "FULL")?;
-        configure_vector_reads(&conn)?;
-        conn.pragma_update(None, "journal_mode", "wal")?;
-        conn.pragma_update(None, "synchronous", "normal")?;
-        open_schema(
-            &conn,
-            SCHEMA_LABEL,
-            SCHEMA_VERSION,
-            include_str!("image_index_create.sql"),
-        )?;
-        conn.execute_batch(&format!(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS image_embeddings USING vec0(\
-                 asset_id INTEGER PRIMARY KEY, \
-                 embedding FLOAT[{dimensions}] distance_metric=cosine\
-             );"
-        ))
-        .context("creating the image embedding vector table")?;
-        let db = Self { conn, dimensions };
-        db.check_vector_width()?;
-        Ok(db)
-    }
-
-    /// Open one model's database for searching, with the asset catalog attached read-only under
-    /// the `catalog` schema alias.
-    ///
-    /// Search needs the catalog's rows and not only the vectors: root, exclude, and time filters
-    /// run against catalog columns, and a vector only answers while its recorded fingerprint
-    /// still matches the catalog's current row for that asset. A read-only main connection opens
-    /// its attached databases read-only as well, which the tests pin.
-    pub fn new_read_only(path: &Path, dimensions: usize, catalog: &Path) -> Result<Self> {
-        if dimensions == 0 || dimensions > MAX_EMBEDDING_DIMENSIONS {
-            bail!("image embedding dimensions must be between 1 and {MAX_EMBEDDING_DIMENSIONS}");
-        }
-        register_vector_extension();
-        let conn = Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .with_context(|| format!("opening image embedding database: {path}"))?;
-        conn.busy_timeout(Duration::from_secs(5))?;
-        configure_vector_reads(&conn)?;
-        check_schema_read_only(&conn, SCHEMA_LABEL, SCHEMA_VERSION)?;
-        let db = Self { conn, dimensions };
-        db.check_vector_width()?;
-        db.conn
-            .execute("ATTACH DATABASE ?1 AS catalog", [catalog.as_str()])
-            .with_context(|| format!("attaching the asset catalog: {catalog}"))?;
-        register_glob(&db.conn)?;
-        Ok(db)
-    }
-
-    /// Start a deferred SQLite read transaction spanning this image database and its attached
-    /// catalog. The first lookup establishes one view that every component read and vector search
-    /// in the request shares.
-    pub fn begin_read_snapshot(&self) -> Result<ImageIndexReadSnapshot<'_>> {
-        self.conn
-            .execute_batch("BEGIN")
-            .context("starting image index read snapshot")?;
-        Ok(ImageIndexReadSnapshot {
-            db: self,
-            active: true,
-        })
-    }
-
-    /// The vec0 table bakes the model's width into its DDL, so a database written by another model
-    /// is refused rather than searched with incomparable vectors.
-    fn check_vector_width(&self) -> Result<()> {
-        let schema: String = self
-            .conn
-            .query_row(
-                "SELECT sql FROM sqlite_master WHERE name = 'image_embeddings'",
-                [],
-                |row| row.get(0),
-            )
-            .context("reading the image embedding vector schema")?;
-        if !schema.contains(&format!("embedding FLOAT[{}]", self.dimensions)) {
-            bail!(
-                "image embedding database vector width does not match the model's {} dimensions",
-                self.dimensions
-            );
-        }
-        Ok(())
-    }
-
-    fn current_asset_ids(&self, fingerprints: &[(i64, SourceFingerprint)]) -> Result<HashSet<i64>> {
-        let mut current = HashSet::with_capacity(fingerprints.len());
-        let mut statement = self.conn.prepare_cached(
-            "SELECT EXISTS(\
-                 SELECT 1 FROM image_embedding_state \
-                  WHERE asset_id = ?1 AND source_modified_ns = ?2 AND source_size = ?3\
-             )",
-        )?;
-        for (asset_id, fingerprint) in fingerprints {
-            let source_size = i64::try_from(fingerprint.size)
-                .context("source byte size exceeds SQLite's integer range")?;
-            let exists: bool = statement
-                .query_row((*asset_id, fingerprint.modified_ns, source_size), |row| {
-                    row.get(0)
-                })?;
-            if exists {
-                current.insert(*asset_id);
-            }
-        }
-        Ok(current)
-    }
-
-    #[instrument(
-        name = "save_image_embeddings",
-        level = "debug",
-        skip_all,
-        fields(batch = items.len())
-    )]
-    fn save_embeddings(&mut self, items: Vec<StoredImageEmbedding>) -> Result<usize> {
-        for item in &items {
-            if item.vector.len() != self.dimensions {
-                bail!(
-                    "asset {} has {} dimensions but this image index requires {}",
-                    item.asset_id,
-                    item.vector.len(),
-                    self.dimensions
-                );
-            }
-            if item.vector.iter().any(|value| !value.is_finite()) {
-                bail!(
-                    "asset {} has a vector containing a non-finite value",
-                    item.asset_id
-                );
-            }
-        }
-
-        let tx = self.conn.transaction()?;
-        let stored = items.len();
-        {
-            let mut state = tx.prepare_cached(
-                "INSERT INTO image_embedding_state \
-                     (asset_id, source_path, source_modified_ns, source_size) \
-                 VALUES (?1, ?2, ?3, ?4) \
-                 ON CONFLICT(asset_id) DO UPDATE SET \
-                     source_path = excluded.source_path, \
-                     source_modified_ns = excluded.source_modified_ns, \
-                     source_size = excluded.source_size",
-            )?;
-            let mut clear =
-                tx.prepare_cached("DELETE FROM image_embeddings WHERE asset_id = ?1")?;
-            let mut insert = tx.prepare_cached(
-                "INSERT INTO image_embeddings (asset_id, embedding) VALUES (?1, ?2)",
-            )?;
-            for item in items {
-                let source_size = i64::try_from(item.fingerprint.size)
-                    .context("source byte size exceeds SQLite's integer range")?;
-                state.execute((
-                    item.asset_id,
-                    item.path.as_str(),
-                    item.fingerprint.modified_ns,
-                    source_size,
-                ))?;
-                clear.execute([item.asset_id])?;
-                insert.execute((item.asset_id, vector_to_blob(&item.vector)))?;
-            }
-        }
-        tx.commit()?;
-        Ok(stored)
-    }
-
-    pub fn clear(&mut self) -> Result<usize> {
-        let tx = self.conn.transaction()?;
-        let cleared = tx.execute("DELETE FROM image_embeddings", [])?;
-        tx.execute("DELETE FROM image_embedding_state", [])?;
-        tx.commit()?;
-        Ok(cleared)
-    }
-
-    pub fn delete_assets(&mut self, asset_ids: &[i64]) -> Result<usize> {
-        let tx = self.conn.transaction()?;
-        let mut deleted = 0;
-        {
-            let mut vectors =
-                tx.prepare_cached("DELETE FROM image_embeddings WHERE asset_id = ?1")?;
-            let mut state =
-                tx.prepare_cached("DELETE FROM image_embedding_state WHERE asset_id = ?1")?;
-            for asset_id in asset_ids {
-                if *asset_id <= 0 {
-                    bail!("asset identifiers must be greater than zero");
-                }
-                deleted += vectors.execute([asset_id])?;
-                state.execute([asset_id])?;
-            }
-        }
-        tx.commit()?;
-        Ok(deleted)
-    }
-
-    /// Nearest neighbours of `vector` among this model's current image embeddings, restricted to
-    /// `filters`.
-    ///
-    /// Same contract as the OCR store's vector search: an exact cosine scan rather than a `vec0`
-    /// `MATCH ... k = ?` lookup, because `k` is applied before any join and a root filter would
-    /// make a globally limited top-k silently under-return. `total` counts matches before `limit`.
-    ///
-    /// A vector answers only while its fingerprint still matches the catalog's row for the asset,
-    /// so a changed-but-not-yet-re-embedded source drops out of results exactly like a re-OCR'd
-    /// row does in the OCR store's vector search.
-    #[instrument(
-        name = "search_image_vectors",
-        level = "debug",
-        skip_all,
-        fields(dimensions = vector.len(), limit, total = tracing::field::Empty)
-    )]
-    pub fn search_vectors(
-        &self,
-        vector: &[f32],
-        filters: &SearchFilters<'_>,
-        limit: usize,
-        options: &ImageVectorSearchOptions,
-    ) -> Result<(usize, Vec<ImageVectorHit>)> {
-        if vector.len() != self.dimensions {
-            bail!(
-                "query vector has {} dimensions but this image index requires {}",
-                vector.len(),
-                self.dimensions
-            );
-        }
-        let bound = filters.bind(FilterScope::CATALOG_ROWS)?;
-        let scored = format!(
-            r#"
-            WITH scored AS MATERIALIZED (
-                SELECT image_embeddings.asset_id AS asset_id,
-                       vec_distance_cosine(image_embeddings.embedding, :query) AS distance,
-                       catalog.assets.source_modified_ns AS source_modified_ns
-                  FROM image_embeddings
-                  INNER JOIN image_embedding_state
-                          ON image_embedding_state.asset_id = image_embeddings.asset_id
-                  INNER JOIN catalog.assets
-                          ON catalog.assets.asset_id = image_embeddings.asset_id
-                         AND catalog.assets.source_modified_ns
-                              = image_embedding_state.source_modified_ns
-                         AND catalog.assets.source_size = image_embedding_state.source_size
-                 WHERE 1{filters}
-            )"#,
-            filters = bound.sql
-        );
-
-        // Materialize only IDs, distances and tie breakers: scalar reads from vec0 open a
-        // vector blob per evaluation. Counting and sorting must reuse those scores.
-        let mut shared = bound.params;
-        shared.push((":query", Value::Blob(vector_to_blob(vector))));
-        shared.push((
-            ":max_distance",
-            Value::Real(options.max_distance.unwrap_or(UNBOUNDED_DISTANCE)),
-        ));
-
-        let mut params = shared;
-        params.push((
-            ":limit",
-            Value::Integer(
-                i64::try_from(limit).context("search limit exceeds SQLite's integer range")?,
-            ),
-        ));
-
-        let mut statement = self.conn.prepare_cached(&format!(
-            r#"{scored}
-            , hits AS (
-            SELECT asset_id, distance, source_modified_ns
-              FROM scored
-             WHERE distance <= :max_distance
-             ORDER BY distance ASC, source_modified_ns DESC, asset_id ASC
-             LIMIT :limit
-            )
-            SELECT totals.total, hits.asset_id, hits.distance
-              FROM (SELECT count(*) AS total FROM scored WHERE distance <= :max_distance) totals
-              LEFT JOIN hits ON 1
-             ORDER BY hits.distance ASC, hits.source_modified_ns DESC, hits.asset_id ASC"#
-        ))?;
-        let mut rows = statement
-            .query(bind_named(&params).as_slice())
-            .context("querying the image embedding vector index")?;
-        let mut total = 0_i64;
-        let mut results = Vec::new();
-        while let Some(row) = rows.next()? {
-            total = row.get(0)?;
-            // LEFT JOIN retains the total for an empty result, including limit = 0.
-            if let Some(asset_id) = row.get::<_, Option<i64>>(1)? {
-                results.push(ImageVectorHit {
-                    asset_id,
-                    distance: row.get(2)?,
-                });
-            }
-        }
-
-        tracing::Span::current().record("total", total);
-        Ok((
-            usize::try_from(total).context("image vector search result count exceeds usize")?,
-            results,
-        ))
-    }
-
-    /// Current image-search coverage, excluding videos, stale vectors and other roots.
-    pub fn coverage(&self, filters: &SearchFilters<'_>) -> Result<(usize, usize)> {
-        let bound = filters.bind(FilterScope::CATALOG_ROWS)?;
-        let sql = format!(
-            "SELECT count(*), count(image_embedding_state.asset_id) \
-             FROM catalog.assets \
-             LEFT JOIN image_embedding_state \
-               ON image_embedding_state.asset_id = catalog.assets.asset_id \
-              AND image_embedding_state.source_modified_ns = catalog.assets.source_modified_ns \
-              AND image_embedding_state.source_size = catalog.assets.source_size \
-             WHERE catalog.assets.media_kind = 'image'{}",
-            bound.sql
-        );
-        let (total, indexed): (i64, i64) =
-            self.conn
-                .query_row(&sql, bind_named(&bound.params).as_slice(), |row| {
-                    Ok((row.get(0)?, row.get(1)?))
-                })?;
-        Ok((usize::try_from(total)?, usize::try_from(indexed)?))
-    }
-
-    /// Return one asset's vector only while it is current with the attached catalog.
-    ///
-    /// Query-reference assets deliberately are not constrained to a search root: an image from
-    /// one library may be the example used to search another. They must still belong to this
-    /// model's index and match the catalog fingerprint, or this answers `None` rather than
-    /// accidentally comparing an obsolete or incompatible vector.
-    pub fn current_vector(&self, asset_id: i64) -> Result<Option<Vec<f32>>> {
-        let bytes: Option<Vec<u8>> = self
-            .conn
-            .query_row(
-                "SELECT image_embeddings.embedding \
-                   FROM image_embeddings \
-                  INNER JOIN image_embedding_state \
-                          ON image_embedding_state.asset_id = image_embeddings.asset_id \
-                  INNER JOIN catalog.assets \
-                          ON catalog.assets.asset_id = image_embeddings.asset_id \
-                         AND catalog.assets.source_modified_ns \
-                              = image_embedding_state.source_modified_ns \
-                         AND catalog.assets.source_size = image_embedding_state.source_size \
-                  WHERE image_embeddings.asset_id = ?1",
-                [asset_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .context("reading a current image query vector")?;
-        bytes.map(|bytes| self.vector_from_blob(&bytes)).transpose()
-    }
-
-    fn vector_from_blob(&self, bytes: &[u8]) -> Result<Vec<f32>> {
-        let expected_bytes = self
-            .dimensions
-            .checked_mul(std::mem::size_of::<f32>())
-            .context("image vector dimensions overflow the byte length")?;
-        if bytes.len() != expected_bytes {
-            bail!(
-                "image index returned a {}-byte vector, expected {expected_bytes} bytes for {} dimensions",
-                bytes.len(),
-                self.dimensions
-            );
-        }
-        let (chunks, remainder) = bytes.as_chunks::<4>();
-        debug_assert!(remainder.is_empty(), "the length check left no remainder");
-        Ok(chunks.iter().copied().map(f32::from_le_bytes).collect())
-    }
-
-    #[cfg(test)]
-    fn vector_count(&self) -> Result<usize> {
-        let count: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM image_embeddings", [], |row| {
-                row.get(0)
-            })
-            .context("counting image embeddings")?;
-        usize::try_from(count).context("image embedding count exceeds usize")
-    }
-}
-
-/// Options for [`ImageIndexDb::search_vectors`].
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ImageVectorSearchOptions {
-    /// Drop neighbours further than this cosine distance. `None` keeps every neighbour.
-    pub max_distance: Option<f64>,
-}
-
-/// One nearest neighbour of an image query.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ImageVectorHit {
-    pub asset_id: i64,
-    /// Cosine distance from the query vector: 0 identical, 1 orthogonal, 2 opposite.
-    pub distance: f64,
-}
 
 /// Flags for an incremental image-indexing pass.
 #[derive(Debug, Clone, Copy, Default)]
@@ -520,16 +56,46 @@ pub fn index_images_observed(
     options: ImageIndexOptions,
     observer: &dyn IndexObserver,
 ) -> Result<bool> {
+    let assets = catalog.under_root(root)?;
+    index_catalog_images(catalog, db, embedder, &assets, options, observer)
+}
+
+/// Embed a supplied catalog snapshot, preserving its order when selecting pending work.
+#[instrument(
+    name = "image_index",
+    skip_all,
+    fields(root = %root, model = %embedder.model(), sources = tracing::field::Empty)
+)]
+pub fn index_catalog_images_observed(
+    catalog: &AssetCatalog,
+    db: &mut ImageIndexDb,
+    embedder: &ImageEmbedder,
+    root: &Path,
+    assets: &[Asset],
+    options: ImageIndexOptions,
+    observer: &dyn IndexObserver,
+) -> Result<bool> {
+    index_catalog_images(catalog, db, embedder, assets, options, observer)
+}
+
+fn index_catalog_images(
+    catalog: &AssetCatalog,
+    db: &mut ImageIndexDb,
+    embedder: &ImageEmbedder,
+    assets: &[Asset],
+    options: ImageIndexOptions,
+    observer: &dyn IndexObserver,
+) -> Result<bool> {
     let ImageIndexOptions {
         force,
         retry_failed,
         limit,
     } = options;
-    let assets = catalog.under_root(root)?;
     observer.on_event(IndexEvent::PhaseChanged(IndexPhase::ImageEmbedding));
     let images = assets
-        .into_iter()
-        .filter(is_embedding_image)
+        .iter()
+        .filter(|asset| is_embedding_image(asset))
+        .cloned()
         .collect::<Vec<_>>();
     let current = if force {
         let asset_ids = images
@@ -705,7 +271,7 @@ impl BoundedImagePipeline<'_> {
             decode_workers,
             batch_size,
             cancelled = self.observer.is_cancelled(),
-            "CLIP image indexing complete"
+            "image embedding indexing complete"
         );
         Ok(cancelled)
     }
@@ -772,12 +338,12 @@ fn decode_sources(
             }
             Err(PreparationError::Decode(error)) => DecodeOutcome::Failure {
                 asset: asset.clone(),
-                message: format!("decoding image for CLIP failed: {error:#}"),
+                message: format!("decoding image for embedding failed: {error:#}"),
                 cache_decode_failure: true,
             },
             Err(PreparationError::Preprocess(error)) => DecodeOutcome::Failure {
                 asset: asset.clone(),
-                message: format!("preprocessing image for CLIP failed: {error:#}"),
+                message: format!("preprocessing image for embedding failed: {error:#}"),
                 cache_decode_failure: false,
             },
         };
@@ -843,7 +409,7 @@ fn flush_batch(
     let vectors = match embedder.embed_preprocessed_images(pixels) {
         Ok(vectors) => vectors,
         Err(error) => {
-            let message = format!("CLIP image inference failed: {error:#}");
+            let message = format!("image embedding inference failed: {error:#}");
             for asset in assets {
                 observer.on_event(IndexEvent::ActiveAsset {
                     path: asset.path.clone(),
@@ -851,7 +417,7 @@ fn flush_batch(
                 });
                 report_failure(observer, asset.path, message.clone());
             }
-            return Err(error).context("running the CLIP image embedding batch");
+            return Err(error).context("running the image embedding batch");
         }
     };
     let attempted = assets.len();
@@ -883,22 +449,12 @@ fn flush_batch(
             active: false,
         });
     }
-    debug!(stored, "saved a CLIP image embedding batch");
+    debug!(stored, "saved an image embedding batch");
     Ok(())
 }
 
 fn report_failure(observer: &dyn IndexObserver, path: PathBuf, message: String) {
-    error!(path = %path, "{message}");
-    observer.on_event(IndexEvent::Error {
-        path: Some(path),
-        message,
-    });
-    observer.on_event(IndexEvent::Progress(IndexProgressDelta {
-        processed: 1,
-        phase_completed: 1,
-        failed: 1,
-        ..IndexProgressDelta::default()
-    }));
+    crate::index::report_item_failure(observer, &path, message);
 }
 
 fn guard_decode_worker(
@@ -906,14 +462,9 @@ fn guard_decode_worker(
     abort: &Receiver<()>,
     body: impl FnOnce(),
 ) {
-    let Err(panic) = catch_unwind(AssertUnwindSafe(body)) else {
+    let Some(message) = crate::index::worker_panic(body) else {
         return;
     };
-    let message = panic
-        .downcast_ref::<&str>()
-        .map(|text| (*text).to_owned())
-        .or_else(|| panic.downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "panicked".to_owned());
     send_unless_aborted(outcomes, DecodeOutcome::Fatal(message), abort);
 }
 

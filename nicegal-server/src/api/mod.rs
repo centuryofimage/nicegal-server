@@ -46,17 +46,14 @@ pub(crate) use ocr_models::ModelStore;
 pub(crate) use runtime::RuntimeSettings;
 
 pub(crate) const API_VERSION: u8 = 1;
-/// Process exit code an `ocrModelLoad` job uses to ask the desktop launcher for a clean restart
-/// after silently downgrading the configured provider — see `ocr_models::job::run`. Distinct from
-/// a crash so the launcher can respawn quietly instead of surfacing an error; the desktop side
-/// checks for this exact value in `main/backend/nicegal-server-process.ts`.
+/// Requests a clean launcher restart after the configured provider changes.
 pub(crate) const RESTART_EXIT_CODE: i32 = 75;
 const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 /// A process-local correlation key for concurrent HTTP spans. It intentionally has no API
 /// meaning and only needs to remain distinct for the lifetime of the process.
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
-/// The three independent stores, addressed by path.
+/// The four independent stores, addressed by path.
 ///
 /// Query handlers open short-lived read-only connections inside the blocking pool. Thumbnail
 /// mutations instead go through the process-wide service, whose writer owns its connection.
@@ -93,9 +90,7 @@ pub(crate) struct AppState {
     pub(crate) jobs: Arc<JobManager>,
     /// Prepared on request by indexing or model preparation, then shared by searches.
     pub(crate) embedder: Arc<TextEmbedder>,
-    /// The image engine's paired text encoder, the query half of the same CLIP model the image
-    /// embedder encodes pictures with. Prepared with its pair, and on CPU: see
-    /// `main` for why.
+    /// Text encoder paired with the active image embedding model.
     pub(crate) image_query_embedder: Arc<ImageQueryEmbedder>,
     pub(crate) image_embedder: Arc<ImageModel>,
     pub(crate) ocr_models: Arc<ocr_models::ModelStore>,
@@ -219,11 +214,36 @@ async fn method_not_allowed() -> ApiError {
     ApiError::method_not_allowed()
 }
 
+/// Cancels request-owned work when its handler is dropped; already-started shared work may finish.
+async fn run_cancellable<T: Send + 'static>(
+    task: impl FnOnce(nicegal_core::cancellation::SearchCancellation) -> Result<T, ApiError>
+    + Send
+    + 'static,
+) -> Result<T, ApiError> {
+    use nicegal_core::cancellation::SearchCancellation;
+    struct CancelOnDrop(Option<SearchCancellation>);
+    impl Drop for CancelOnDrop {
+        fn drop(&mut self) {
+            if let Some(cancellation) = &self.0 {
+                cancellation.cancel();
+                tracing::debug!("cancelled abandoned request");
+            }
+        }
+    }
+    let cancellation = SearchCancellation::default();
+    let mut guard = CancelOnDrop(Some(cancellation.clone()));
+    let result = run_blocking(move || {
+        cancellation.check()?;
+        task(cancellation)
+    })
+    .await;
+    guard.0 = None;
+    result
+}
+
 /// Run one handler's blocking database or filesystem work on the blocking pool.
 ///
-/// The task returns [`ApiError`] directly so a handler can classify its own failures; ordinary
-/// [`anyhow`] errors still convert into `500 internal_error` through `?`. The current request
-/// span crosses into the blocking worker, where a child span records both pool queueing and work.
+/// Handler-classified failures remain [`ApiError`]; other errors become `internal_error`.
 async fn run_blocking<T>(
     task: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
 ) -> Result<T, ApiError>
@@ -281,7 +301,19 @@ mod tests {
     /// A router over real databases holding one indexed OCR row, so the search tests
     /// exercise SQLite rather than a stub.
     fn test_router(temp: &TempDir) -> Router {
-        test_router_with_preparation(temp, true)
+        test_router_with_preparation(temp, false)
+    }
+
+    fn prepared_text_model() -> Arc<TextEmbedder> {
+        static MODEL: std::sync::OnceLock<Arc<TextEmbedder>> = std::sync::OnceLock::new();
+        Arc::clone(MODEL.get_or_init(|| {
+            initialize_test_runtime();
+            let model = Arc::new(TextEmbedder::deferred(
+                nicegal_core::embedding::TextEmbedderOptions::default(),
+            ));
+            model.prepare().unwrap();
+            model
+        }))
     }
 
     fn test_router_with_preparation(temp: &TempDir, prepare_models: bool) -> Router {
@@ -311,10 +343,14 @@ mod tests {
         drop(AssetCatalog::new(&databases.assets).unwrap());
         drop(ThumbnailDb::new(&databases.thumbnails).unwrap());
 
-        let embedder = Arc::new(
-            TextEmbedder::deferred(nicegal_core::embedding::TextEmbedderOptions::default())
-                .without_cached_loading(),
-        );
+        let embedder = if prepare_models {
+            prepared_text_model()
+        } else {
+            Arc::new(
+                TextEmbedder::deferred(nicegal_core::embedding::TextEmbedderOptions::default())
+                    .without_cached_loading(),
+            )
+        };
         let image_embedder = Arc::new(ImageModel::deferred(
             nicegal_core::embedding::ImageEmbedderOptions::default(),
         ));
@@ -324,11 +360,6 @@ mod tests {
             )
             .without_cached_loading(),
         );
-        if prepare_models {
-            embedder.prepare().unwrap();
-            image_embedder.prepare().unwrap();
-            image_query_embedder.prepare().unwrap();
-        }
         drop(ImageIndexDb::new(&databases.images, image_query_embedder.dimensions()).unwrap());
         let ocr_models = Arc::new(ModelStore::new(
             nicegal_core::runtime::ExecutionProvider::Cpu,
@@ -342,13 +373,7 @@ mod tests {
             .unwrap(),
         );
         runtime.set_onnx_runtime_build_info("test build".to_owned());
-        let image_model_settings = Arc::new(
-            ImageModelSettings::load(
-                databases.assets.parent().unwrap().join("image-model.json"),
-                None,
-            )
-            .unwrap(),
-        );
+        let image_model_settings = Arc::new(ImageModelSettings::new(Arc::clone(&runtime), None));
         let state = AppState {
             image_model_settings,
             jobs: Arc::new(JobManager::new(
@@ -631,6 +656,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn asset_batch_body_rejections_use_the_error_envelope() {
+        let temp = TempDir::new().unwrap();
+        let router = test_router_with_preparation(&temp, false);
+        for body in ["{not json", r#"{"assetIds":"wrong shape"}"#] {
+            let (status, body) = send_json(&router, Method::POST, "/v1/assets", body).await;
+            assert!(status.is_client_error());
+            assert_eq!(body["error"]["code"], "invalid_request");
+        }
+        let (status, body) = send(&router, Method::POST, "/v1/assets").await;
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(body["error"]["code"], "unsupported_media_type");
+
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/assets")
+            .header(header::AUTHORIZATION, TOKEN)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(vec![b' '; MAX_REQUEST_BYTES + 1]))
+            .unwrap();
+        let (status, body) = response_parts(&router, request).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(body["error"]["code"], "payload_too_large");
+    }
+
+    #[tokio::test]
     async fn a_well_formed_search_returns_its_hits() {
         let temp = TempDir::new().unwrap();
         let router = test_router(&temp);
@@ -701,10 +751,7 @@ mod tests {
     /// Give the router's OCR database vectors for its rows, the way a completed embed job would.
     fn embed_everything(temp: &TempDir) {
         let ocr_path = PathBuf::try_from(temp.path().join("ocr.db")).unwrap();
-        let embedder = nicegal_core::embedding::TextEmbedder::load(
-            &nicegal_core::embedding::TextEmbedderOptions::default(),
-        )
-        .unwrap();
+        let embedder = prepared_text_model().ready().unwrap();
         let mut ocr = DB::new(&ocr_path).unwrap();
         let space = nicegal_core::db::TextEmbeddingSpace::OcrText;
         ocr.set_text_embedding_model(space, embedder.model().id(), embedder.dimensions(), true)
@@ -743,7 +790,7 @@ mod tests {
     #[tokio::test]
     async fn vector_is_the_default_search_mode_and_is_empty_until_something_is_embedded() {
         let temp = TempDir::new().unwrap();
-        let router = test_router(&temp);
+        let router = test_router_with_preparation(&temp, true);
         let root = urlencode(temp.path().to_str().unwrap());
 
         // No `type=`: the default is vector, and nothing is embedded yet.
@@ -801,7 +848,7 @@ mod tests {
     #[tokio::test]
     async fn a_combined_search_answers_every_mode_and_fuses_them() {
         let temp = TempDir::new().unwrap();
-        let router = test_router(&temp);
+        let router = test_router_with_preparation(&temp, true);
         embed_everything(&temp);
 
         let (status, body) = post_json(
@@ -826,6 +873,14 @@ mod tests {
         assert_eq!(queries[0]["type"], "vector");
         assert_eq!(queries[0]["total"], 1);
         assert_eq!(queries[1]["total"], 1);
+        for (index, kind) in [(0, "vector"), (1, "simple")] {
+            let (single_status, single) =
+                send(&router, Method::GET, &search_uri(&temp, "hello", kind)).await;
+            assert_eq!(single_status, StatusCode::OK, "{single}");
+            assert_eq!(single["total"], queries[index]["total"]);
+            assert_eq!(single["results"], queries[index]["results"]);
+        }
+
         assert_eq!(
             queries[2]["total"], 0,
             "a mode with no hits is not an error"
@@ -971,7 +1026,7 @@ mod tests {
     #[tokio::test]
     async fn an_embed_backfill_starts_a_job_and_a_bad_root_does_not() {
         let temp = TempDir::new().unwrap();
-        let router = test_router(&temp);
+        let router = test_router_with_preparation(&temp, true);
 
         let (status, body) = post_json(
             &router,
@@ -1033,7 +1088,7 @@ mod tests {
     #[tokio::test]
     async fn time_bounds_narrow_every_search_mode() {
         let temp = TempDir::new().unwrap();
-        let router = test_router(&temp);
+        let router = test_router_with_preparation(&temp, true);
         embed_everything(&temp);
         let root = urlencode(temp.path().to_str().unwrap());
         // The fixture row has source_modified_ns = 1 and no EXIF capture time.
@@ -1124,7 +1179,7 @@ mod tests {
     #[tokio::test]
     async fn a_combined_search_applies_the_request_range_and_lets_one_query_override_it() {
         let temp = TempDir::new().unwrap();
-        let router = test_router(&temp);
+        let router = test_router_with_preparation(&temp, true);
         embed_everything(&temp);
 
         let (status, body) = post_json(
@@ -1302,5 +1357,60 @@ mod tests {
         let (status, body) = send(&router, Method::GET, "/v1/jobs/abc").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["code"], "invalid_request");
+    }
+
+    #[tokio::test]
+    async fn thumbnail_ensure_bounds_the_batch_and_deduplicates_ids() {
+        let temp = TempDir::new().unwrap();
+        let router = test_router(&temp);
+        let (status, body) = post_json(
+            &router,
+            "/v1/thumbnails",
+            serde_json::json!({
+                "assetIds": vec![1; 513], "requiredSize": 128
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "invalid_request");
+        assert!(body["error"]["message"].as_str().unwrap().contains("512"));
+
+        // A one-pixel GIF keeps this route test independent of model downloads and image tooling.
+        use base64::Engine as _;
+        let source = PathBuf::try_from(temp.path().join("pixel.gif")).unwrap();
+        std::fs::write(
+            &source,
+            base64::engine::general_purpose::STANDARD
+                .decode("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7")
+                .unwrap(),
+        )
+        .unwrap();
+        let catalog =
+            AssetCatalog::new(&PathBuf::try_from(temp.path().join("assets.db")).unwrap()).unwrap();
+        let asset = catalog
+            .upsert(&source, &std::fs::metadata(&source).unwrap())
+            .unwrap();
+        for ids in [vec![asset.asset_id], vec![asset.asset_id, asset.asset_id]] {
+            let (status, body) = post_json(
+                &router,
+                "/v1/thumbnails",
+                serde_json::json!({
+                    "assetIds": ids, "requiredSize": 128
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["assetIds"], serde_json::json!([asset.asset_id]));
+        }
+        let (status, body) = post_json(
+            &router,
+            "/v1/thumbnails",
+            serde_json::json!({
+                "assetIds": [asset.asset_id, 99999], "requiredSize": 128
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], "asset_not_found");
     }
 }
