@@ -238,6 +238,25 @@ struct IndexPipeline<'a> {
     observer: &'a dyn IndexObserver,
 }
 
+struct OcrSelection {
+    sources: Vec<Asset>,
+    total: usize,
+    skipped: usize,
+}
+
+fn announce_ocr_selection(observer: &dyn IndexObserver, total: usize, skipped: usize) {
+    observer.on_event(IndexEvent::PhaseChanged(IndexPhase::Ocr));
+    observer.on_event(IndexEvent::DiscoveryComplete { total });
+    if skipped > 0 {
+        observer.on_event(IndexEvent::Progress(IndexProgressDelta {
+            phase_completed: skipped,
+            processed: skipped,
+            skipped,
+            ..IndexProgressDelta::default()
+        }));
+    }
+}
+
 impl IndexPipeline<'_> {
     #[instrument(
         name = "index",
@@ -250,17 +269,22 @@ impl IndexPipeline<'_> {
         catalog_step: impl FnOnce(&[Asset]) -> Result<bool>,
     ) -> Result<IndexSummary> {
         let root = canonicalize_path(path).context("canonicalizing index path")?;
-        let (sources, scan_complete) = {
+        let (selection, scan_complete) = {
             let Some((catalog, scan_complete)) = self.prepare_catalog(&root)? else {
                 return Ok(record_summary(cancelled_summary(0)));
             };
-            let sources = self.select_ocr_sources(&catalog)?;
+            let selection = self.select_ocr_sources(&catalog)?;
             if catalog_step(&catalog)? || self.cancelled() {
                 return Ok(record_summary(cancelled_summary(0)));
             }
-            (sources, scan_complete)
+            (selection, scan_complete)
         };
-        let indexed = self.run_ocr(sources)?;
+        // The derived catalog step may have switched the shared observer to image embedding.
+        // Announce OCR only after that step returns so its completions cannot be accumulated under
+        // the image phase. Selection still happens first so a CLIP decode failure recorded by the
+        // derived step cannot suppress an independent OCR attempt in this same run.
+        announce_ocr_selection(self.observer, selection.total, selection.skipped);
+        let indexed = self.run_ocr(selection.sources)?;
         if self.cancelled() {
             return Ok(record_summary(cancelled_summary(indexed)));
         }
@@ -306,11 +330,7 @@ impl IndexPipeline<'_> {
         skip_all,
         fields(catalog = catalog.len(), sources = field::Empty)
     )]
-    fn select_ocr_sources(&mut self, catalog: &[Asset]) -> Result<Vec<Asset>> {
-        self.phase(IndexPhase::Ocr);
-        self.observer.on_event(IndexEvent::DiscoveryComplete {
-            total: catalog.len(),
-        });
+    fn select_ocr_sources(&mut self, catalog: &[Asset]) -> Result<OcrSelection> {
         let image_fingerprints = catalog
             .iter()
             .filter(|asset| is_ocr_image(asset))
@@ -337,20 +357,21 @@ impl IndexPipeline<'_> {
                 .current_decode_failure_asset_ids(&image_fingerprints)?
         };
         let mut sources = Vec::new();
+        let mut skipped = 0;
         for asset in catalog {
             if self.cancelled() {
                 break;
             }
             if !is_ocr_image(asset) {
-                self.skip_asset();
+                skipped += 1;
                 continue;
             }
             if current.contains(&asset.asset_id) {
-                self.skip_asset();
+                skipped += 1;
                 continue;
             }
             if decode_failed.contains(&asset.asset_id) {
-                self.skip_asset();
+                skipped += 1;
                 continue;
             }
             if self.exceeds_dimension_limit(asset) {
@@ -361,13 +382,17 @@ impl IndexPipeline<'_> {
                     height = asset.height.unwrap_or_default(),
                     "skipping image over the OCR dimension limit"
                 );
-                self.skip_asset();
+                skipped += 1;
                 continue;
             }
             sources.push(asset.clone());
         }
         Span::current().record("sources", sources.len());
-        Ok(sources)
+        Ok(OcrSelection {
+            sources,
+            total: catalog.len(),
+            skipped,
+        })
     }
 
     #[instrument(
@@ -424,15 +449,6 @@ impl IndexPipeline<'_> {
             (Some((max_width, max_height)), Some(width), Some(height))
                 if width as usize > max_width || height as usize > max_height
         )
-    }
-
-    fn skip_asset(&self) {
-        self.progress(IndexProgressDelta {
-            phase_completed: 1,
-            processed: 1,
-            skipped: 1,
-            ..IndexProgressDelta::default()
-        });
     }
 
     fn cancelled(&self) -> bool {
@@ -1130,6 +1146,7 @@ fn cancelled_summary(indexed: usize) -> IndexSummary {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
     use std::sync::mpsc::channel;
     use std::time::Duration;
 
@@ -1144,6 +1161,46 @@ mod tests {
         fn is_cancelled(&self) -> bool {
             self.cancelled
         }
+    }
+
+    #[derive(Default)]
+    struct EventObserver(Mutex<Vec<IndexEvent>>);
+
+    impl IndexObserver for EventObserver {
+        fn on_event(&self, event: IndexEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+
+    #[test]
+    fn ocr_progress_is_reannounced_after_a_derived_catalog_step() {
+        let observer = EventObserver::default();
+        observer.on_event(IndexEvent::PhaseChanged(IndexPhase::ImageEmbedding));
+        observer.on_event(IndexEvent::DiscoveryComplete { total: 71_882 });
+        observer.on_event(IndexEvent::Progress(IndexProgressDelta {
+            phase_completed: 71_882,
+            ..IndexProgressDelta::default()
+        }));
+
+        announce_ocr_selection(&observer, 72_228, 71_882);
+
+        let events = observer.0.lock().unwrap();
+        assert!(matches!(
+            events[3],
+            IndexEvent::PhaseChanged(IndexPhase::Ocr)
+        ));
+        assert!(matches!(
+            events[4],
+            IndexEvent::DiscoveryComplete { total: 72_228 }
+        ));
+        assert!(matches!(
+            events[5],
+            IndexEvent::Progress(IndexProgressDelta {
+                phase_completed: 71_882,
+                skipped: 71_882,
+                ..
+            })
+        ));
     }
 
     #[test]

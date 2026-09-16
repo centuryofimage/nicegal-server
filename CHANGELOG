@@ -1,4 +1,1 @@
-- Major cleanups
-- Speed up database, add maintainence runs
-- Improve speed and fix ui bugs
-- Added diagnostics to about panel
+- Fix migration
