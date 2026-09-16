@@ -11,6 +11,8 @@ use anyhow::{Context, Result, bail};
 use camino::Utf8Path as Path;
 use rusqlite::{Connection, OptionalExtension};
 use tracing::{debug_span, field, trace_span};
+// Keep this in sync with THUMBNAIL_SCHEMA_VERSION in the Electron frontend's
+// src/main/backend/thumbnail-reader.ts; it reads this database directly.
 const SCHEMA_VERSION: i32 = 4;
 const SCHEMA_LABEL: &str = "thumbnail database";
 const MIGRATIONS: &[(i32, &str)] = &[(3, "VACUUM;")];
