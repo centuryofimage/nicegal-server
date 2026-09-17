@@ -1,3 +1,4 @@
 - Fix stutter when searching large galleries
 - Cleanup backend
 - Automatically quickly sync previously synced galleries on startup
+- Add new large very slow model
