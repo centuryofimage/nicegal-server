@@ -54,4 +54,4 @@ jobs:
           uv pip install --python .venv-webgpu -r requirements-webgpu.txt
       - name: Check workspace
         shell: bash
-        run: dev.cmd check --locked --workspace --all-targets --exclude nicegal-cli
+        run: cargo check --locked --workspace --all-targets --exclude nicegal-cli
