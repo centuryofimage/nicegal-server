@@ -473,6 +473,11 @@ Version 1 routes:
 - `POST /v1/jobs` starts a typed background job and returns `202 Accepted`. Types are
   `modelPrepare`, `ocrModelLoad`, `libraryIndex`, `catalogSync`, `thumbnailGenerate`, `textEmbed`, `imageEmbed`,
   `pruneMissing`, and `libraryPurge`
+- `catalogSync` accepts `{root, image?:boolean, scan?:{recursive?,exclude?,debugLimit?,newOnly?}}`.
+  `newOnly:true` still enumerates directory entries to find new paths, but skips filesystem
+  metadata reads and catalog writes for paths already stored. It never reconciles missing files
+  or updates changed existing files. With `image:true`, newly cataloged images are passed to CLIP
+  in the same job without another directory scan; no OCR or text embedding runs.
 - `GET /v1/jobs` lists the active and retained recent jobs
 - `GET /v1/jobs/<job-id>` returns one job's current state and progress
 - `GET /v1/jobs/<job-id>/events` streams `snapshot` server-sent events whenever job state changes

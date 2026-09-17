@@ -41,11 +41,14 @@ pub(crate) struct CatalogSyncRequest {
     root: PathBuf,
     #[serde(default)]
     scan: CatalogScanOptions,
+    #[serde(default)]
+    image: bool,
 }
 
 pub(crate) struct CatalogSyncSpec {
     root: PathBuf,
     options: IndexOptions,
+    image: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -63,6 +66,8 @@ struct ScanOptions {
     cleanup: bool,
     max_dimensions: Option<MaxDimensions>,
     debug_limit: Option<usize>,
+    #[serde(default)]
+    new_only: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -74,6 +79,8 @@ struct CatalogScanOptions {
     exclude: Vec<String>,
     /// Debug guardrail. Production callers should omit this and catalog the whole root.
     debug_limit: Option<usize>,
+    #[serde(default)]
+    new_only: bool,
 }
 
 impl Default for ScanOptions {
@@ -86,6 +93,7 @@ impl Default for ScanOptions {
             cleanup: false,
             max_dimensions: None,
             debug_limit: None,
+            new_only: false,
         }
     }
 }
@@ -96,6 +104,7 @@ impl Default for CatalogScanOptions {
             recursive: true,
             exclude: default_excludes(),
             debug_limit: None,
+            new_only: false,
         }
     }
 }
@@ -131,6 +140,7 @@ pub(crate) fn prepare_catalog_sync(
     Ok(CatalogSyncSpec {
         root,
         options: catalog_sync_options(request.scan)?,
+        image: request.image,
     })
 }
 
@@ -196,6 +206,15 @@ pub(crate) fn run_catalog_sync(
 }
 
 impl CatalogSyncSpec {
+    pub(crate) fn embeds_images(&self) -> bool {
+        self.image
+    }
+    pub(crate) fn root(&self) -> &PathBuf {
+        &self.root
+    }
+    pub(crate) fn debug_limit(&self) -> Option<usize> {
+        self.options.limit
+    }
     pub(super) fn reconciliation(&self) -> ReconcileScope {
         ReconcileScope::new(self.root.clone(), &self.options)
     }
@@ -242,6 +261,7 @@ fn index_options(scan: ScanOptions) -> Result<IndexOptions, ApiError> {
         ));
     }
     options.limit = scan.debug_limit;
+    options.new_only = scan.new_only;
     options.max_dimensions = scan
         .max_dimensions
         .map(|dimensions| {
@@ -264,6 +284,7 @@ fn catalog_sync_options(scan: CatalogScanOptions) -> Result<IndexOptions, ApiErr
         ));
     }
     options.limit = scan.debug_limit;
+    options.new_only = scan.new_only;
     Ok(options)
 }
 
@@ -359,11 +380,26 @@ mod tests {
         assert!(!options.cleanup);
         assert_eq!(options.limit, None);
         assert_eq!(options.exclude.len(), 2);
+        assert!(!options.new_only);
+        assert!(!request.image);
 
         let unsupported = serde_json::from_str::<CatalogSyncRequest>(
             r#"{"root":"/gallery","scan":{"force":true}}"#,
         );
         assert!(unsupported.is_err());
+    }
+
+    #[test]
+    fn quick_catalog_sync_accepts_new_only_with_image_embedding() {
+        let request: CatalogSyncRequest = serde_json::from_str(
+            r#"{"root":"/gallery","image":true,"scan":{"newOnly":true}}"#,
+        )
+        .unwrap();
+        assert!(request.image);
+        let options = catalog_sync_options(request.scan).unwrap();
+        assert!(options.new_only);
+        assert!(!options.rescan);
+        assert!(!options.cleanup);
     }
 
     #[test]

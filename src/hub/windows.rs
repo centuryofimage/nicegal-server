@@ -1,5 +1,5 @@
 //! Windows PowerShell is a second HTTP transport; the Hub cache format stays unchanged.
-use super::ModelSource;
+use super::{DownloadCancelled, ModelSource};
 use anyhow::{Context, Result, bail};
 use hf_hub::Cache;
 use std::{
@@ -42,7 +42,7 @@ pub(super) fn fallback(
     source: &ModelSource,
     cache: &Cache,
     original: anyhow::Error,
-    progress: impl FnMut(usize, usize),
+    progress: impl FnMut(usize, usize) -> bool,
 ) -> Result<PathBuf> {
     tracing::warn!(model_id = %source.model_id, filename = %source.filename,
         error_chain = %format!("{original:#}"), "Retrying Hugging Face download with powershell.exe");
@@ -60,13 +60,13 @@ fn safe_relative(value: &str) -> bool {
 
 #[cfg(test)]
 pub(super) fn download(source: &ModelSource, cache: &Cache) -> Result<PathBuf> {
-    download_with_progress(source, cache, |_, _| {})
+    download_with_progress(source, cache, |_, _| true)
 }
 
 fn download_with_progress(
     source: &ModelSource,
     cache: &Cache,
-    mut progress: impl FnMut(usize, usize),
+    mut progress: impl FnMut(usize, usize) -> bool,
 ) -> Result<PathBuf> {
     let revision = source.revision.as_deref().unwrap_or("main");
     if !safe_relative(&source.model_id)
@@ -111,7 +111,9 @@ fn download_with_progress(
                 let downloaded: usize =
                     fields.next().context("missing downloaded bytes")?.parse()?;
                 let total: usize = fields.next().context("missing total bytes")?.parse()?;
-                progress(downloaded, total);
+                if !progress(downloaded, total) {
+                    return Err(DownloadCancelled.into());
+                }
             }
         }
         Ok(())

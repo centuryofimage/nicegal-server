@@ -252,6 +252,10 @@ impl ModelDownloadProgress {
 }
 
 impl Progress for ModelDownloadProgress {
+    fn is_cancelled(&self) -> bool {
+        DownloadObserver::download_cancelled(self.job.as_ref())
+    }
+
     async fn init(&mut self, size: usize, _filename: &str) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.downloaded = 0;

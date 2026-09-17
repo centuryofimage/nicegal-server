@@ -17,13 +17,14 @@ Build a deployable server with `build-server.cmd` on Windows or `./build-server.
 
 ## Image search models
 
-MetaCLIP2 B/32 is the default. The model selector offers these five choices:
+MetaCLIP2 B/32 is the default. The model selector offers these six choices:
 
 | Model | Input | Dimensions | Model license |
 | --- | --- | --- | --- |
 | [MetaCLIP2 B/32](https://huggingface.co/bep256/metaclip-2-worldwide-b32-ONNX) | 224 | 512 | [CC-BY-NC-4.0](https://creativecommons.org/licenses/by-nc/4.0/) |
 | [MetaCLIP2 B/16](https://huggingface.co/bep256/metaclip-2-worldwide-b16-ONNX) | 224 | 512 | [CC-BY-NC-4.0](https://creativecommons.org/licenses/by-nc/4.0/) |
 | [SigLIP2 Base B/16](https://huggingface.co/bep256/siglip2-base-patch16-256-ONNX) | 256 | 768 | Apache-2.0 |
+| [MetaCLIP2 L/14](https://huggingface.co/bep256/metaclip-2-worldwide-l14-ONNX) | 224 | 768 | [CC-BY-NC-4.0](https://creativecommons.org/licenses/by-nc/4.0/) |
 | [SigLIP beta SwinV2 Base (experimental)](https://huggingface.co/deepghs/siglip_beta/tree/main/smilingwolf/siglip_swinv2_base_2025_02_22_18h56m54s) | 448 | 1024 | Apache-2.0 |
 | [DINOv3 B/16 (experimental)](https://huggingface.co/bep256/dinov3-vitb16-pretrain-lvd1689m-ONNX) | 224 | 768 | [DINOv3 License](https://ai.meta.com/resources/models-and-libraries/dinov3-license) |
 

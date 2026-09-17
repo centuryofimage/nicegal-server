@@ -600,6 +600,20 @@ impl AssetCatalog {
             .context("listing assets under root")
     }
 
+    /// Read cataloged paths for a discovery pass without loading full media metadata.
+    pub fn paths_under_root(&self, root: &Path) -> Result<Vec<PathBuf>> {
+        if !root.is_absolute() {
+            bail!("asset root must be absolute: {root}");
+        }
+        let mut statement = self.conn.prepare_cached(
+            "SELECT path FROM assets WHERE media_kind = 'image' AND path LIKE ?1 ESCAPE '#'",
+        )?;
+        let rows = statement.query_map([path_prefix_like(root)], |row| row.get::<_, String>(0))?;
+        rows.map(|row| row.map(PathBuf::from))
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("listing cataloged paths under root")
+    }
+
     /// Return catalog rows under `root` that were not present in a completed filesystem scan.
     /// The scan set lives only on this connection and never rewrites persistent asset rows.
     pub fn unseen_under_root(

@@ -57,6 +57,9 @@ members = [".", "nicegal-cli", "nicegal-server"]
 default-members = [".", "nicegal-cli", "nicegal-server"]
 resolver = "2"
 
+[patch.crates-io]
+hf-hub = { path = "vendor/hf-hub" }
+
 [profile.release]
 opt-level = 3
 strip = false

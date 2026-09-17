@@ -24,6 +24,7 @@ pub enum ImageEmbeddingModel {
     #[default]
     MetaClip2B32,
     MetaClip2B16,
+    MetaClip2L14,
     SigLip2Base256,
     LaionClipB32,
     SigLipBetaSwinV2Frozen,
@@ -45,6 +46,17 @@ struct ModelSpec {
 const PAIRED_MODEL_FILES: &[&str] = &[
     "image.onnx",
     "text.onnx",
+    "manifest.json",
+    "preprocessor_config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "config.json",
+];
+const PAIRED_MODEL_FILES_WITH_TEXT_DATA: &[&str] = &[
+    "image.onnx",
+    "text.onnx",
+    "text.onnx_data",
     "manifest.json",
     "preprocessor_config.json",
     "tokenizer.json",
@@ -94,6 +106,18 @@ impl ImageEmbeddingModel {
                     "33cd628449b4e87dfc3f348d9843b32d32713860",
                 )),
                 required_files: PAIRED_MODEL_FILES,
+            },
+            Self::MetaClip2L14 => ModelSpec {
+                id: "facebook/metaclip-2-worldwide-l14",
+                name: "MetaCLIP2 L/14 224",
+                dimensions: 768,
+                license: "CC-BY-NC-4.0",
+                context_length: 77,
+                published_export: Some((
+                    "bep256/metaclip-2-worldwide-l14-ONNX",
+                    "c7193980d96e63812a6f70f8ef3feb934549326f",
+                )),
+                required_files: PAIRED_MODEL_FILES_WITH_TEXT_DATA,
             },
             Self::SigLip2Base256 => ModelSpec {
                 id: "google/siglip2-base-patch16-256",
@@ -168,11 +192,12 @@ impl ImageEmbeddingModel {
         self.spec().dimensions
     }
 
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::ClipVitB32,
         Self::MetaClip2B32,
         Self::MetaClip2B16,
         Self::SigLip2Base256,
+        Self::MetaClip2L14,
         Self::LaionClipB32,
         Self::SigLipBetaSwinV2Frozen,
         Self::SigLipBetaSwinV2,
@@ -182,10 +207,11 @@ impl ImageEmbeddingModel {
 
     /// Search-model choices offered to users. Retired spaces remain parseable and their
     /// databases stay readable for previously saved selections and existing indexes.
-    pub const SELECTABLE: [Self; 5] = [
+    pub const SELECTABLE: [Self; 6] = [
         Self::MetaClip2B32,
         Self::MetaClip2B16,
         Self::SigLip2Base256,
+        Self::MetaClip2L14,
         Self::SigLipBetaSwinV2Frozen,
         Self::DinoV3B16,
     ];
@@ -850,7 +876,8 @@ mod tests {
             assert_eq!(
                 model.dimensions(),
                 match model {
-                    ImageEmbeddingModel::SigLip2Base256
+                    ImageEmbeddingModel::MetaClip2L14
+                    | ImageEmbeddingModel::SigLip2Base256
                     | ImageEmbeddingModel::SigLipBetaEva02
                     | ImageEmbeddingModel::DinoV3B16 => 768,
                     ImageEmbeddingModel::SigLipBetaSwinV2Frozen
@@ -860,7 +887,7 @@ mod tests {
             );
         }
         assert!("../unknown".parse::<ImageEmbeddingModel>().is_err());
-        assert_eq!(ImageEmbeddingModel::SELECTABLE.len(), 5);
+        assert_eq!(ImageEmbeddingModel::SELECTABLE.len(), 6);
         assert!(!ImageEmbeddingModel::SELECTABLE.contains(&ImageEmbeddingModel::SigLipBetaSwinV2));
         assert!(!ImageEmbeddingModel::SELECTABLE.contains(&ImageEmbeddingModel::SigLipBetaEva02));
     }

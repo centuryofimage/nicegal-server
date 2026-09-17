@@ -10,11 +10,38 @@ use hf_hub::api::tokio::{Api, ApiBuilder, Progress};
 use hf_hub::{Cache, Repo, RepoType};
 use tracing::{debug, error, info};
 
+#[derive(Debug)]
+struct DownloadCancelled;
+
+impl std::fmt::Display for DownloadCancelled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("download cancelled")
+    }
+}
+
+impl std::error::Error for DownloadCancelled {}
+
+/// Distinguish an intentionally interrupted model transfer from a transport failure.
+pub fn is_cancellation(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<DownloadCancelled>().is_some()
+            || cause
+                .downcast_ref::<hf_hub::api::sync::ApiError>()
+                .is_some_and(|error| matches!(error, hf_hub::api::sync::ApiError::Cancelled))
+            || cause
+                .downcast_ref::<hf_hub::api::tokio::ApiError>()
+                .is_some_and(|error| matches!(error, hf_hub::api::tokio::ApiError::Cancelled))
+    })
+}
+
 /// Receives byte counts for the current file. A retry starts again at zero.
 /// Updates are emitted about every 100 ms, plus initial and final updates.
 pub trait DownloadObserver: Send + Sync {
     fn progress(&self, source: &ModelSource, downloaded: usize, total: usize);
     fn finish(&self) {}
+    fn download_cancelled(&self) -> bool {
+        false
+    }
 }
 
 impl DownloadObserver for () {
@@ -49,6 +76,10 @@ impl hf_hub::api::Progress for SyncProgress<'_> {
     fn finish(&mut self) {
         self.observer
             .progress(self.source, self.downloaded, self.total);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.observer.download_cancelled()
     }
 }
 
@@ -153,7 +184,8 @@ impl ModelSource {
                             }
                             progress.update(downloaded.saturating_sub(previous)).await;
                             previous = downloaded;
-                        });
+                            !progress.is_cancelled()
+                        })
                     })
                 })
                 .await
@@ -204,6 +236,7 @@ impl ModelSource {
             Err(original) if windows::is_connection_error(&original) => {
                 windows::fallback(self, &cache(), original, |downloaded, total| {
                     observer.progress(self, downloaded, total);
+                    !observer.download_cancelled()
                 })
             }
             other => other,

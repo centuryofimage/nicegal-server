@@ -53,7 +53,7 @@ pub(crate) fn cancel_if(cancelled: bool) -> anyhow::Result<()> {
 }
 
 pub(crate) fn is_cancelled(error: &anyhow::Error) -> bool {
-    error.downcast_ref::<JobCancelled>().is_some()
+    error.downcast_ref::<JobCancelled>().is_some() || nicegal_core::hub::is_cancellation(error)
 }
 
 fn reconcile_after_discovery(
@@ -251,6 +251,10 @@ impl DownloadObserver for Job {
         let mut data = self.data();
         data.progress.download = None;
         self.publish(&mut data);
+    }
+
+    fn download_cancelled(&self) -> bool {
+        self.cancel_requested.load(Ordering::Acquire)
     }
 }
 
@@ -726,8 +730,21 @@ impl JobManager {
                     }
                     JobSpec::CatalogSync(spec) => {
                         let reconciliation = spec.reconciliation();
+                        let embed_image = spec.embeds_images();
+                        let root = spec.root().clone();
+                        let debug_limit = spec.debug_limit();
                         let (summary, scanned) =
                             indexing::run_catalog_sync(spec, &databases.assets, job.as_ref())?;
+                        if embed_image && !summary.cancelled && !scanned.is_empty() {
+                            image_embeddings::run(
+                                image_embeddings::Spec::pending_for(root, false, debug_limit),
+                                &databases.assets,
+                                &databases.images,
+                                image_embedder.prepare_with_progress(job.as_ref())?.as_ref(),
+                                job.as_ref(),
+                                Some(&scanned),
+                            )?;
+                        }
                         reconcile_after_discovery(summary.cancelled, summary.scan_complete, || {
                             prune_jobs::reconcile(
                                 reconciliation,

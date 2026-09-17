@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -27,6 +28,8 @@ pub struct IndexOptions {
     /// Retry source revisions whose prior decode failed, while retaining current OCR results.
     pub retry_failed: bool,
     pub subdirs: bool,
+    /// Discover new paths only. Existing rows are left untouched, including changed files.
+    pub new_only: bool,
     pub commit_chunk_size: usize,
     pub cleanup: bool,
     pub max_dimensions: Option<(usize, usize)>,
@@ -41,6 +44,7 @@ impl Default for IndexOptions {
             rescan: false,
             retry_failed: false,
             subdirs: true,
+            new_only: false,
             commit_chunk_size: DEFAULT_COMMIT_CHUNK_SIZE,
             cleanup: false,
             max_dimensions: None,
@@ -182,7 +186,8 @@ fn catalog_snapshot(
     let summary = CatalogSummary {
         cataloged: catalog.len(),
         cancelled,
-        scan_complete,
+        // A new-only scan cannot prove that older catalog rows are still present.
+        scan_complete: scan_complete && !options.new_only,
     };
     let span = Span::current();
     span.record("cataloged", summary.cataloged);
@@ -315,7 +320,7 @@ impl IndexPipeline<'_> {
         if self.cancelled() {
             return Ok(None);
         }
-        let scan_complete = files.complete && catalog_complete;
+        let scan_complete = files.complete && catalog_complete && !self.options.new_only;
         // Legacy OCR-only mark/sweep cannot represent excluded or unvisited paths.
         self.options.cleanup &=
             scan_complete && self.options.subdirs && self.options.exclude.is_empty();
@@ -479,6 +484,11 @@ impl CatalogPipeline<'_> {
     #[instrument(name = "scan", skip_all, fields(files = field::Empty))]
     fn collect_files(&self, root: &Path) -> Result<DiscoveredFiles> {
         self.phase(IndexPhase::Scanning);
+        let existing: HashSet<PathBuf> = if self.options.new_only {
+            self.assets.paths_under_root(root)?.into_iter().collect()
+        } else {
+            HashSet::new()
+        };
         let mut walker = WalkDir::new(root).follow_links(true);
         if !self.options.subdirs {
             walker = walker.max_depth(1);
@@ -531,7 +541,7 @@ impl CatalogPipeline<'_> {
                     continue;
                 }
             };
-            if is_catalog_media(&source_path) {
+            if is_catalog_media(&source_path) && !existing.contains(&source_path) {
                 files.push(source_path);
                 self.observer
                     .on_event(IndexEvent::Discovered { count: files.len() });
@@ -1240,6 +1250,38 @@ mod tests {
         assert!(called);
         assert!(summary.scan_complete);
         assert_eq!(summary.cataloged, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn new_only_catalog_skips_existing_paths_and_preserves_their_rows() -> Result<()> {
+        let temp = TempDir::new()?;
+        let root = canonicalize_path(&PathBuf::try_from(temp.path().to_owned())?)?;
+        let assets = AssetCatalog::new(&root.join("assets.db"))?;
+        let existing = root.join("existing.png");
+        std::fs::write(&existing, b"original")?;
+        let original = assets.upsert(&existing, &existing.metadata()?)?;
+        std::fs::write(&existing, b"changed content")?;
+        let new_path = root.join("new.png");
+        std::fs::write(&new_path, b"new")?;
+
+        let options = IndexOptions {
+            new_only: true,
+            ..IndexOptions::default()
+        };
+        let observer = TestObserver { cancelled: false };
+        let mut passed = Vec::new();
+        let summary = catalog_dir_with_step(&assets, &root, options, &observer, |catalog| {
+            passed.extend(catalog.iter().map(|asset| asset.path.clone()));
+            Ok(false)
+        })?;
+        assert_eq!(passed, vec![new_path]);
+        assert_eq!(summary.cataloged, 1);
+        assert!(!summary.scan_complete);
+        assert_eq!(
+            assets.get_by_path(&existing)?.unwrap().fingerprint,
+            original.fingerprint
+        );
         Ok(())
     }
 
