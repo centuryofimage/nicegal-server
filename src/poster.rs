@@ -23,8 +23,8 @@ pub fn still_image(path: &Path, maximum_edge: u32) -> Result<StaticPoster> {
     }
     let span = debug_span!("poster", path = %path, maximum_edge);
     let _entered = span.enter();
-    let source = still_image_source(path)?;
-    let poster = resize_for_poster(path, &source, maximum_edge, maximum_edge)?;
+    let (source, dimensions) = still_image_source(path, maximum_edge)?;
+    let poster = resize_for_poster(path, &source, dimensions, maximum_edge, maximum_edge)?;
     encode_poster(path, poster)
 }
 
@@ -35,18 +35,19 @@ pub fn image_buckets(path: &Path, buckets: &[u16]) -> Result<Vec<StaticPoster>> 
     }
     let span = debug_span!("poster", path = %path, buckets = buckets.len());
     let _entered = span.enter();
-    let source = still_image_source(path)?;
+    let maximum_edge = u32::from(*buckets.iter().max().unwrap_or(&1));
+    let (source, dimensions) = still_image_source(path, maximum_edge)?;
     buckets
         .iter()
         .map(|bucket| {
             let maximum_edge = u32::from(*bucket);
-            let poster = resize_for_poster(path, &source, maximum_edge, maximum_edge)?;
+            let poster = resize_for_poster(path, &source, dimensions, maximum_edge, maximum_edge)?;
             encode_poster(path, poster)
         })
         .collect()
 }
 
-fn still_image_source(path: &Path) -> Result<Raster> {
+fn still_image_source(path: &Path, maximum_edge: u32) -> Result<(Raster, (u32, u32))> {
     let data = {
         let span = trace_span!(target: "nicegal_core::thumbs", "poster_open", path = %path);
         let _entered = span.enter();
@@ -54,12 +55,14 @@ fn still_image_source(path: &Path) -> Result<Raster> {
     };
     let decode = trace_span!(target: "nicegal_core::thumbs", "poster_decode", path = %path);
     let _entered = decode.enter();
-    imaging::decode(&data).with_context(|| format!("decoding image: {path}"))
+    imaging::decode_for_thumbnail(&data, maximum_edge)
+        .with_context(|| format!("decoding image: {path}"))
 }
 
 fn resize_for_poster(
     path: &Path,
     source: &Raster,
+    original_dimensions: (u32, u32),
     maximum_width: u32,
     maximum_height: u32,
 ) -> Result<Raster> {
@@ -73,8 +76,8 @@ fn resize_for_poster(
     );
     let _entered = resize.enter();
     let (width, height) = imaging::fit_within(
-        source.width(),
-        source.height(),
+        original_dimensions.0,
+        original_dimensions.1,
         maximum_width,
         maximum_height,
     );
@@ -177,6 +180,18 @@ mod tests {
         let poster = still_image(&path, 3)?;
 
         assert_eq!((poster.width, poster.height), (2, 3));
+        Ok(())
+    }
+
+    #[test]
+    fn scaled_jpeg_uses_original_dimensions_for_poster_geometry() -> Result<()> {
+        let temp = TempDir::new()?;
+        let path = PathBuf::try_from(temp.path().join("scaled.jpg"))?;
+        let pixels = vec![128; 1024 * 713 * 3];
+        std::fs::write(&path, imaging::encode_jpeg(1024, 713, &pixels, 85.0)?)?;
+
+        let poster = still_image(&path, 128)?;
+        assert_eq!((poster.width, poster.height), (128, 89));
         Ok(())
     }
 

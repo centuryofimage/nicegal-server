@@ -39,6 +39,7 @@ pub enum ExecutionProvider {
     OpenVino,
     Directml,
     Webgpu,
+    CoreML,
 }
 
 fn unsupported_execution_provider(provider: &str) -> ParseExecutionProviderError {
@@ -170,6 +171,9 @@ pub fn initialize_bundled_runtime(execution_provider: ExecutionProvider) -> Resu
         ExecutionProvider::Webgpu => {
             bail!("{execution_provider} is only supported on Linux")
         }
+        ExecutionProvider::CoreML => {
+            bail!("{execution_provider} is only supported on macOS")
+        }
     };
     let executable = std::env::current_exe().context("resolving the executable path")?;
     let executable_directory = executable
@@ -210,6 +214,7 @@ pub fn initialize_bundled_runtime(execution_provider: ExecutionProvider) -> Resu
         ExecutionProvider::Cpu | ExecutionProvider::OpenVino => "openvino",
         ExecutionProvider::Webgpu => "webgpu",
         ExecutionProvider::Directml => bail!("directml is only supported on Windows"),
+        ExecutionProvider::CoreML => bail!("coreml is only supported on macOS"),
     };
     let executable = std::env::current_exe().context("resolving the executable path")?;
     let directory = executable
@@ -239,7 +244,34 @@ pub fn initialize_bundled_runtime(execution_provider: ExecutionProvider) -> Resu
     Ok(())
 }
 
-#[cfg(not(any(windows, target_os = "linux")))]
+/// Select the bundled macOS ONNX Runtime distribution. The regular 1.30 wheel ships CoreML and
+/// CPU together, so both choices load the same library.
+#[cfg(target_os = "macos")]
+pub fn initialize_bundled_runtime(execution_provider: ExecutionProvider) -> Result<()> {
+    match execution_provider {
+        ExecutionProvider::CoreML | ExecutionProvider::Cpu => {}
+        ExecutionProvider::OpenVino | ExecutionProvider::Directml | ExecutionProvider::Webgpu => {
+            bail!("{execution_provider} is not supported on macOS")
+        }
+    }
+    let executable = std::env::current_exe().context("resolving the executable path")?;
+    let directory = executable
+        .parent()
+        .context("executable path has no parent directory")?;
+    let runtime_directory = directory.join("onnxruntime/coreml");
+    let dylib = runtime_directory.join("libonnxruntime.dylib");
+    if !dylib.is_file() {
+        bail!(
+            "the coreml ONNX Runtime distribution is missing: expected {}",
+            dylib.display()
+        );
+    }
+    initialize_from_dylib(&dylib)?;
+    tracing::info!(%execution_provider, runtime_distribution = "coreml", path = %dylib.display(), "initialized ONNX Runtime");
+    Ok(())
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 pub fn initialize_bundled_runtime(_execution_provider: ExecutionProvider) -> Result<()> {
     Ok(())
 }
@@ -288,6 +320,7 @@ pub(crate) fn fallback_chain(
         ExecutionProvider::OpenVino | ExecutionProvider::Webgpu | ExecutionProvider::Cpu => {
             &[ExecutionProvider::Cpu]
         }
+        ExecutionProvider::CoreML => &[ExecutionProvider::Cpu],
     }
 }
 
@@ -346,6 +379,11 @@ pub(crate) fn configure_provider(
         }),
         #[cfg(not(feature = "ort-webgpu"))]
         ExecutionProvider::Webgpu => provider_unavailable(execution_provider, "ort-webgpu"),
+
+        #[cfg(feature = "ort-coreml")]
+        ExecutionProvider::CoreML => coreml_provider(intra_threads),
+        #[cfg(not(feature = "ort-coreml"))]
+        ExecutionProvider::CoreML => provider_unavailable(execution_provider, "ort-coreml"),
     }
 }
 
@@ -444,9 +482,25 @@ fn directml_provider(intra_threads: NonZeroUsize) -> Result<ConfiguredProvider> 
     })
 }
 
+#[cfg(feature = "ort-coreml")]
+fn coreml_provider(intra_threads: NonZeroUsize) -> Result<ConfiguredProvider> {
+    use ort::ep::CoreML;
+
+    let provider = CoreML::default();
+    ensure_available(&provider, ExecutionProvider::CoreML)?;
+    Ok(ConfiguredProvider {
+        dispatch: provider.build().error_on_failure(),
+        intra_threads,
+    })
+}
+
 /// Refuse a provider whose `ort` feature was not compiled into this build.
 #[cfg_attr(
-    any(feature = "ort-openvino", feature = "ort-directml",),
+    any(
+        feature = "ort-openvino",
+        feature = "ort-directml",
+        feature = "ort-coreml"
+    ),
     allow(dead_code)
 )]
 fn provider_unavailable(
@@ -461,7 +515,11 @@ fn provider_unavailable(
 /// An `ort` provider feature only compiles in the Rust side of registration; whether the provider
 /// exists belongs to the library loaded at runtime. Unchecked, such a session commits silently on
 /// CPU and everything measured from it is mislabelled.
-#[cfg(any(feature = "ort-openvino", feature = "ort-directml",))]
+#[cfg(any(
+    feature = "ort-openvino",
+    feature = "ort-directml",
+    feature = "ort-coreml"
+))]
 fn ensure_available(
     provider: &impl ort::ep::ExecutionProvider,
     name: ExecutionProvider,
@@ -488,13 +546,17 @@ mod tests {
     use std::{num::NonZeroUsize, str::FromStr};
 
     #[test]
-    fn directml_falls_back_through_openvino_before_cpu() {
+    fn providers_use_their_declared_fallback_chains() {
         assert_eq!(
             fallback_chain(ExecutionProvider::Directml),
             [ExecutionProvider::OpenVino, ExecutionProvider::Cpu]
         );
         assert_eq!(
             fallback_chain(ExecutionProvider::OpenVino),
+            [ExecutionProvider::Cpu]
+        );
+        assert_eq!(
+            fallback_chain(ExecutionProvider::CoreML),
             [ExecutionProvider::Cpu]
         );
     }
@@ -506,6 +568,7 @@ mod tests {
             ("openvino", ExecutionProvider::OpenVino),
             ("directml", ExecutionProvider::Directml),
             ("webgpu", ExecutionProvider::Webgpu),
+            ("coreml", ExecutionProvider::CoreML),
         ] {
             assert_eq!(ExecutionProvider::from_str(value).unwrap(), expected);
             assert_eq!(expected.to_string(), value);

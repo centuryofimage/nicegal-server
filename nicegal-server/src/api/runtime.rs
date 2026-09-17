@@ -152,6 +152,7 @@ fn runtime_distribution(execution_provider: ExecutionProvider) -> &'static str {
     match execution_provider {
         ExecutionProvider::OpenVino => "openvino",
         ExecutionProvider::Webgpu => "webgpu",
+        ExecutionProvider::CoreML => "coreml",
         ExecutionProvider::Cpu | ExecutionProvider::Directml => {
             if cfg!(target_os = "linux") {
                 if cfg!(feature = "ort-webgpu") {
@@ -159,8 +160,12 @@ fn runtime_distribution(execution_provider: ExecutionProvider) -> &'static str {
                 } else {
                     "openvino"
                 }
-            } else {
+            } else if cfg!(windows) {
                 "directml"
+            } else if cfg!(target_os = "macos") {
+                "coreml"
+            } else {
+                "cpu"
             }
         }
     }
@@ -181,6 +186,12 @@ fn available_execution_providers() -> &'static [ExecutionProvider] {
             ExecutionProvider::Directml,
             #[cfg(feature = "ort-openvino")]
             ExecutionProvider::OpenVino,
+            ExecutionProvider::Cpu,
+        ]
+    } else if cfg!(target_os = "macos") {
+        &[
+            #[cfg(feature = "ort-coreml")]
+            ExecutionProvider::CoreML,
             ExecutionProvider::Cpu,
         ]
     } else {
@@ -534,7 +545,7 @@ mod tests {
     fn saved_unavailable_providers_migrate_but_explicit_overrides_fail() {
         let temp = TempDir::new().unwrap();
         let path = PathBuf::try_from(temp.path().join("runtime.json")).unwrap();
-        for saved in ["cuda", "migraphx", "webgpu", "openvino", "directml"] {
+        for saved in ["cuda", "migraphx", "webgpu", "openvino", "directml", "coreml"] {
             if saved.parse().is_ok_and(provider_available) {
                 continue;
             }

@@ -18,6 +18,7 @@ ort-openvino = ["ort/openvino"]
 ort-webgpu = ["ort/webgpu", "fastembed/webgpu"]
 ort-profiling = ["ort/api-25", "fastembed/ort-profiling"]
 ort-directml = ["ort/directml", "fastembed/directml"]
+ort-coreml = ["ort/coreml"]
 
 [dependencies]
 anyhow = "1.0.104"
@@ -36,7 +37,7 @@ kdam = { version = "0.6.4", features = ["rayon"] }
 mozjpeg = "0.10.13"
 ndarray = { version = "0.17.2", default-features = false }
 nom-exif = "3.7.0"
-ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "tracing", "load-dynamic", "api-24"] }
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "tracing", "load-dynamic", "api-23"] }
 png = "0.18.1"
 rayon = "1.12.0"
 regex = { version = "1.13.1", optional = true }

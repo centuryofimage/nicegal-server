@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "scope": "Cargo workspace dependencies, including transitive, build, development, and target-specific crates resolved by cargo metadata --locked. License expressions are package-author metadata, not a legal compatibility assessment or complete attribution bundle. Available root license/notice files and declared license files are retained as text. Native runtimes are listed separately; downloaded model weights are not included.",
-  "lockfileSha256": "28279507e28b6d6eecabeffcbb57d6fa2016019dba2267f3ae44781670228a64",
+  "lockfileSha256": "b3b0d2ec7fe30dc3d55f6724874794bdd5a877a60b1156612bc04be91a9a0c48",
   "packages": [
     {
       "name": "adler2",
@@ -641,7 +641,7 @@
     },
     {
       "name": "cfg-if",
-      "version": "1.0.4",
+      "version": "1.0.5",
       "license": "MIT OR Apache-2.0",
       "url": "https://github.com/rust-lang/cfg-if",
       "notices": [
@@ -3172,10 +3172,6 @@
         {
           "file": "LICENSE",
           "text": "MIT License\n\nCopyright (c) 2024 Min Deng\n\nPermission is hereby granted, free of charge, to any person obtaining a copy\nof this software and associated documentation files (the \"Software\"), to deal\nin the Software without restriction, including without limitation the rights\nto use, copy, modify, merge, publish, distribute, sublicense, and/or sell\ncopies of the Software, and to permit persons to whom the Software is\nfurnished to do so, subject to the following conditions:\n\nThe above copyright notice and this permission notice shall be included in all\ncopies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\nIMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,\nFITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE\nAUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER\nLIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,\nOUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE\nSOFTWARE.\n"
-        },
-        {
-          "file": "LICENSE",
-          "text": "MIT License\n\nCopyright (c) 2024 Min Deng\n\nPermission is hereby granted, free of charge, to any person obtaining a copy\nof this software and associated documentation files (the \"Software\"), to deal\nin the Software without restriction, including without limitation the rights\nto use, copy, modify, merge, publish, distribute, sublicense, and/or sell\ncopies of the Software, and to permit persons to whom the Software is\nfurnished to do so, subject to the following conditions:\n\nThe above copyright notice and this permission notice shall be included in all\ncopies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\nIMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,\nFITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE\nAUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER\nLIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,\nOUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE\nSOFTWARE.\n"
         }
       ]
     },
@@ -3984,7 +3980,7 @@
     },
     {
       "name": "redox_users",
-      "version": "0.5.2",
+      "version": "0.5.3",
       "license": "MIT",
       "url": "https://gitlab.redox-os.org/redox-os/users",
       "notices": [
@@ -4111,7 +4107,7 @@
     },
     {
       "name": "rustix",
-      "version": "1.1.4",
+      "version": "1.1.5",
       "license": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
       "url": "https://github.com/bytecodealliance/rustix",
       "notices": [
@@ -4693,7 +4689,7 @@
     },
     {
       "name": "syn",
-      "version": "3.0.5",
+      "version": "3.0.6",
       "license": "MIT OR Apache-2.0",
       "url": "https://github.com/dtolnay/syn",
       "notices": [
@@ -4721,7 +4717,7 @@
     },
     {
       "name": "synstructure",
-      "version": "0.13.2",
+      "version": "0.14.0",
       "license": "MIT",
       "url": "https://github.com/mystor/synstructure",
       "notices": [
@@ -5213,7 +5209,7 @@
     },
     {
       "name": "unicode-ident",
-      "version": "1.0.24",
+      "version": "1.0.26",
       "license": "(MIT OR Apache-2.0) AND Unicode-3.0",
       "url": "https://github.com/dtolnay/unicode-ident",
       "notices": [
@@ -5337,7 +5333,7 @@
     },
     {
       "name": "ureq-proto",
-      "version": "0.6.3",
+      "version": "0.6.4",
       "license": "MIT OR Apache-2.0",
       "url": "https://github.com/algesten/ureq-proto",
       "notices": [
@@ -6110,7 +6106,7 @@
     },
     {
       "name": "yoke-derive",
-      "version": "0.8.2",
+      "version": "0.8.3",
       "license": "Unicode-3.0",
       "url": "https://github.com/unicode-org/icu4x",
       "notices": [
@@ -6174,7 +6170,7 @@
     },
     {
       "name": "zerofrom-derive",
-      "version": "0.1.7",
+      "version": "0.1.8",
       "license": "Unicode-3.0",
       "url": "https://github.com/unicode-org/icu4x",
       "notices": [

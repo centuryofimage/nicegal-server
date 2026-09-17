@@ -18,7 +18,7 @@ use crate::poster;
 
 pub const SIZE_BUCKETS: [u16; 4] = [128, 256, 512, 1024];
 pub const EAGER_SIZE_BUCKETS: [u16; 3] = [128, 256, 512];
-pub const GENERATOR_VERSION: u32 = 2;
+pub const GENERATOR_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThumbnailEncoding {
