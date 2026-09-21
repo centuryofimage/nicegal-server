@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "scope": "Cargo workspace dependencies, including transitive, build, development, and target-specific crates resolved by cargo metadata --locked. License expressions are package-author metadata, not a legal compatibility assessment or complete attribution bundle. Available root license/notice files and declared license files are retained as text. Native runtimes are listed separately; downloaded model weights are not included.",
-  "lockfileSha256": "b3b0d2ec7fe30dc3d55f6724874794bdd5a877a60b1156612bc04be91a9a0c48",
+  "lockfileSha256": "a60223ed7d10470c6fd7b681cf881bd19b829433c7699e6153dd59ea142051e2",
   "packages": [
     {
       "name": "adler2",
@@ -625,7 +625,7 @@
     },
     {
       "name": "cc",
-      "version": "1.4.6",
+      "version": "1.4.7",
       "license": "MIT OR Apache-2.0",
       "url": "https://github.com/rust-lang/cc-rs",
       "notices": [
@@ -1501,7 +1501,7 @@
     },
     {
       "name": "find-msvc-tools",
-      "version": "0.1.12",
+      "version": "0.1.13",
       "license": "MIT OR Apache-2.0",
       "url": "https://github.com/rust-lang/cc-rs",
       "notices": [

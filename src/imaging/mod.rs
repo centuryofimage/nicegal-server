@@ -54,26 +54,6 @@ pub fn decode(data: &[u8]) -> Result<Raster> {
     Ok(raster.orient(orientation))
 }
 
-/// Decode JPEGs at reduced resolution when producing a bounded thumbnail.
-/// Other formats and general image callers retain their normal decode behavior.
-pub fn decode_for_thumbnail(data: &[u8], maximum_edge: u32) -> Result<(Raster, (u32, u32))> {
-    let format = Format::detect(data)?;
-    if format == Format::Jpeg {
-        let (raster, (width, height)) = jpeg::decode_for_thumbnail(data, maximum_edge)?;
-        let orientation = orientation_from_jpeg(data);
-        let dimensions = if orientation.swaps_dimensions() {
-            (height, width)
-        } else {
-            (width, height)
-        };
-        Ok((raster.orient(orientation), dimensions))
-    } else {
-        let raster = decode(data)?;
-        let dimensions = (raster.width(), raster.height());
-        Ok((raster, dimensions))
-    }
-}
-
 /// Decode with accurate JPEG IDCT/chroma upsampling for model preprocessing parity.
 pub fn decode_accurate(data: &[u8]) -> Result<Raster> {
     if Format::detect(data)? == Format::Jpeg {

@@ -43,6 +43,7 @@ fn main() {
 #[cfg(not(windows))]
 fn main() {}
 
+
 /// Copy both provider-specific ONNX Runtime distributions into namespaced directories. `ort`
 /// dynamically loads precisely one at startup, so the DLLs must never overwrite each other.
 #[cfg(windows)]
@@ -128,7 +129,7 @@ fn copy_crt(profile_dir: &Path) -> io::Result<()> {
             )?;
             vc.join("Redist/MSVC").join(version.trim())
         };
-        redist.join(platform).join("Microsoft.VC143.CRT")
+        redist.join(platform).join("Microsoft.VC145.CRT")
     };
     for required in [
         "vcruntime140.dll",
@@ -178,11 +179,16 @@ fn copy_distribution(
 #[cfg(windows)]
 fn copy_dll_directory(env_var: &str, default: PathBuf, destinations: &[PathBuf]) -> io::Result<()> {
     let library_dir = env::var_os(env_var).map(PathBuf::from).unwrap_or(default);
+    copy_dlls_from(env_var, library_dir, destinations)
+}
+
+#[cfg(windows)]
+fn copy_dlls_from(source_name: &str, library_dir: PathBuf, destinations: &[PathBuf]) -> io::Result<()> {
     if !library_dir.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!(
-                "{env_var} does not name a directory: {} (create the provider venv with build-server.cmd or set {env_var} explicitly)",
+                "{source_name} does not name a directory: {}",
                 library_dir.display()
             ),
         ));
@@ -222,7 +228,7 @@ fn copy_dll_directory(env_var: &str, default: PathBuf, destinations: &[PathBuf])
     if !found_dll {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!("{env_var} contains no DLL files: {}", library_dir.display()),
+            format!("{source_name} contains no DLL files: {}", library_dir.display()),
         ));
     }
     Ok(())

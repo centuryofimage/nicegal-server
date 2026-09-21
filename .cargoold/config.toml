@@ -1,0 +1,18 @@
+[profile.release]
+lto = "thin"
+
+[profile.debug]
+lto = "thin"
+
+[target.'cfg(windows)']
+# linker = "clang"
+rustflags = [
+  "-C",
+  "link-args=/opt:lldltojobs=0 /opt:lldlto=1 /opt:lldltocgo=1",
+  "-C",
+  "linker-plugin-lto",
+  "-C",
+  "linker-flavor=lld-link",
+  "-C",
+  "prefer-dynamic=off"
+]

@@ -1,0 +1,4 @@
+[submodule "vendor/fastembed"]
+	path = vendor/fastembed
+	url = https://github.com/centuryofimage/fastembed-rs.git
+	branch = 6.0.0
