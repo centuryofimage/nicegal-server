@@ -1,0 +1,55 @@
+name: Check Rust
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: rust-check-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libssl-dev libclang-dev cmake nasm libvulkan1
+
+
+      - name: Setup Rust with cache
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          cache: true
+          build-warnings: warn
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          enable-cache: true
+
+      # Cargo check runs build.rs, which stages the default providers' DLLs.
+      - name: Prepare native runtime dependencies
+        shell: bash
+        run: |
+          uv venv --python 3.13 .venv-webgpu
+          uv pip install --python .venv-webgpu -r requirements-webgpu.txt
+      - name: Check workspace
+        shell: bash
+        run: cargo check --locked --workspace --all-targets --exclude nicegal-cli

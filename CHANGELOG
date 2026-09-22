@@ -1,0 +1,5 @@
+- Clean out dead code
+- Upgrade electron to 44.4.3 to fix a bug
+- Cleanup onboarding and hide app internals
+- Refactor internals
+- Add shortcuts for search and info panel

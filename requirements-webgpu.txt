@@ -1,0 +1,2 @@
+onnxruntime==1.30.0
+onnxruntime-ep-webgpu==0.3.0

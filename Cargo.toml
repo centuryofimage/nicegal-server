@@ -1,0 +1,77 @@
+[package]
+name = "nicegal-core"
+version = "0.3.0"
+build = "build.rs"
+authors = ["bep"]
+license = "AGPL-3.0-only"
+edition = "2024"
+description = "Library for indexing and searching images with OCR (optical character recognition)"
+repository = "https://github.com/centuryofimage/nicegal-server"
+keywords = ["ocr", "image", "paddleocr"]
+categories = ["multimedia::images"]
+
+[features]
+default = ["regex"]
+regex = ["dep:regex", "rusqlite/functions"]
+logging = ["dep:tracing-subscriber", "dep:tracing-appender"]
+ort-openvino = ["ort/openvino"]
+ort-webgpu = ["ort/webgpu", "fastembed/webgpu"]
+ort-profiling = ["ort/api-25"]
+ort-directml = ["ort/directml", "fastembed/directml"]
+ort-coreml = ["ort/coreml"]
+
+[dependencies]
+anyhow = "1.0.104"
+camino = "1.2.5"
+crossbeam-channel = "0.5.16"
+fastembed = { path = "vendor/fastembed", version = "7.1.0", default-features = false, features = ["hf-hub-native-tls", "image-models"] }
+fast_image_resize = { version = "6.1.0", default-features = false, features = ["std"] }
+gif = { version = "0.14.2", default-features = false, features = ["std"] }
+glob = "0.3.4"
+hf-hub = { version = "0.5.0", default-features = false, features = ["native-tls", "tokio", "ureq"] }
+imagesize = "0.15.0"
+image = { version = "0.25.10", default-features = false, features = ["bmp"] }
+image-webp = "0.2.4"
+itertools = "0.15.0"
+libc = "0.2"
+kdam = { version = "0.6.4", features = ["rayon"] }
+mozjpeg = "0.10.13"
+ndarray = { version = "0.17.2", default-features = false }
+nom-exif = "3.7.0"
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "tracing", "load-dynamic", "api-23"] }
+png = "0.18.1"
+rayon = "1.12.0"
+regex = { version = "1.13.1", optional = true }
+rusqlite = { version = "0.40.2", features = ["bundled", "hooks"] }
+sqlite-vec = "0.1.9"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+strum = { version = "0.28.0", features = ["derive"] }
+time = { version = "0.3.55", features = ["parsing"] }
+tracing = { version = "0.1.44", default-features = false, features = ["std", "attributes"] }
+tracing-appender = { version = "0.2.3", optional = true }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["std", "fmt", "ansi", "env-filter", "time", "tracing-log", "json", "registry"], optional = true }
+walkdir = "2.5.0"
+yaml_serde = "0.10.7"
+
+[workspace]
+members = [".", "nicegal-cli", "nicegal-server"]
+default-members = [".", "nicegal-cli", "nicegal-server"]
+resolver = "2"
+
+[patch.crates-io]
+hf-hub = { path = "vendor/hf-hub" }
+
+[profile.release]
+opt-level = 3
+strip = false
+debug = 1     # for perf analysis
+lto = "thin"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["std", "fmt", "ansi", "env-filter", "json", "registry"] }
+
+[target.'cfg(windows)'.dependencies]
+ffmpeg-the-third = { path = "vendor/ffmpeg-the-third", version = "6.0.0", default-features = false, features = ["format", "filter", "software-scaling", "static"] }
+tokio = { version = "1.53.1", features = ["rt"] }

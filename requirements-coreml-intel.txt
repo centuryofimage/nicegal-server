@@ -1,0 +1,2 @@
+# ONNX Runtime 1.23.2 is the last PyPI release with a macOS x86_64 wheel.
+onnxruntime==1.23.2

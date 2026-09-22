@@ -1,0 +1,13 @@
+/target
+/testdata/video/
+/.deps/
+/libs/*/target
+test.db*
+vcpkg/
+.vscode
+onnxruntime_openvino-1.24.1-cp313-cp313-win_amd64/
+.venv-ort-openvino/
+.venv-openvino/
+.venv-cuda/
+.venv-migraphx/
+.venv-webgpu/

@@ -1,0 +1,24 @@
+# Line endings are decided here, not by whatever tool happened to write a file.
+#
+# `text=auto` normalizes every detected text file to LF *in the repository* on commit, so a tool
+# that writes CRLF (Python's open(..., 'w') translates \n to \r\n on Windows) can no longer produce
+# a whole-file diff. `eol=lf` keeps the working tree LF as well, which matters because dev.sh and
+# scripts/*.sh are run through bash: a CRLF shell script fails with `$'\r': command not found`.
+* text=auto eol=lf
+
+# Windows batch files are read by cmd.exe, which is the one consumer that wants CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Binary fixtures vendored under libs/. `text=auto` already detects these by their NUL bytes, but
+# saying so explicitly keeps a future rule from corrupting them.
+*.png binary
+*.tiff binary
+*.tif binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.gif binary
+*.ico binary
+*.traineddata binary
