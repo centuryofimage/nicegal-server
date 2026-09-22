@@ -111,10 +111,7 @@ impl RuntimeSettings {
             );
         }
         if let Some(model) = model {
-            anyhow::ensure!(
-                ImageEmbeddingModel::SELECTABLE.contains(&model) && model.available(),
-                "image model is unavailable or retired"
-            );
+            anyhow::ensure!(model.available(), "image model is unavailable");
         }
         let mut configured = self
             .configured
@@ -188,14 +185,12 @@ fn available_execution_providers() -> &'static [ExecutionProvider] {
             ExecutionProvider::OpenVino,
             ExecutionProvider::Cpu,
         ]
-    } else if cfg!(target_os = "macos") {
+    } else {
         &[
-            #[cfg(feature = "ort-coreml")]
+            #[cfg(all(target_os = "macos", feature = "ort-coreml"))]
             ExecutionProvider::CoreML,
             ExecutionProvider::Cpu,
         ]
-    } else {
-        &[ExecutionProvider::Cpu]
     }
 }
 
@@ -269,15 +264,10 @@ async fn update(
     if state.jobs.has_active_job() {
         return Err(ApiError::job_busy());
     }
-    if let Some(model) = model {
-        if !nicegal_core::embedding::ImageEmbeddingModel::SELECTABLE.contains(&model) {
-            return Err(ApiError::bad_request(
-                "This model is retired from the model selector",
-            ));
-        }
-        if !model.available() {
-            return Err(ApiError::bad_request("Image model is unavailable"));
-        }
+    if let Some(model) = model
+        && !model.available()
+    {
+        return Err(ApiError::bad_request("Image model is unavailable"));
     }
     let runtime = Arc::clone(&state.runtime);
     tokio::task::spawn_blocking(move || -> Result<()> {

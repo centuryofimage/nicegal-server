@@ -364,12 +364,12 @@ mod tests {
         let source = ModelSource {
             model_id: "deepghs/siglip_beta".into(),
             revision: Some("03aa79c8a4a6c41e06ca87aa6e44fee563b2491d".into()),
-            filename: "smilingwolf/siglip_eva02_base_2025_05_02_21h53m54s/meta.json".into(),
+            filename: "smilingwolf/siglip_swinv2_base_2025_02_22_18h56m54s/meta.json".into(),
         };
         let path = source.get_sync().unwrap();
         let metadata: serde_json::Value =
             serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-        assert_eq!(metadata["image_embedding_width"], 768);
+        assert_eq!(metadata["image_embedding_width"], 1024);
         assert!(source.cached().is_some());
     }
 }

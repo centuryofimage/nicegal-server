@@ -550,16 +550,11 @@ mod tests {
             ImageEmbeddingModel::MetaClip2B32.id()
         );
         let models = body["imageModel"]["models"].as_array().unwrap();
-        assert_eq!(models.len(), ImageEmbeddingModel::SELECTABLE.len());
+        assert_eq!(models.len(), ImageEmbeddingModel::ALL.len());
         assert!(
             models
                 .iter()
                 .any(|model| model["id"] == ImageEmbeddingModel::SigLipBetaSwinV2Frozen.id())
-        );
-        assert!(
-            !models
-                .iter()
-                .any(|model| model["id"] == ImageEmbeddingModel::ClipVitB32.id())
         );
         let (status, body) = send_json(
             &router,
@@ -574,12 +569,7 @@ mod tests {
             body["imageModel"]["selectedModel"],
             ImageEmbeddingModel::MetaClip2B16.id()
         );
-        for request in [
-            r#"{}"#,
-            r#"{"imageModel":"unknown"}"#,
-            r#"{"imageModel":"Qdrant/clip-ViT-B-32"}"#,
-            r#"{"imageModel":"deepghs/siglip_beta/smilingwolf/siglip_eva02_base_2025_05_02_21h53m54s"}"#,
-        ] {
+        for request in [r#"{}"#, r#"{"imageModel":"unknown"}"#] {
             let (status, _) = send_json(&router, Method::PUT, "/v1/runtime", request).await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
         }

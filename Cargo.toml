@@ -16,7 +16,7 @@ regex = ["dep:regex", "rusqlite/functions"]
 logging = ["dep:tracing-subscriber", "dep:tracing-appender"]
 ort-openvino = ["ort/openvino"]
 ort-webgpu = ["ort/webgpu", "fastembed/webgpu"]
-ort-profiling = ["ort/api-25", "fastembed/ort-profiling"]
+ort-profiling = ["ort/api-25"]
 ort-directml = ["ort/directml", "fastembed/directml"]
 ort-coreml = ["ort/coreml"]
 
@@ -24,7 +24,7 @@ ort-coreml = ["ort/coreml"]
 anyhow = "1.0.104"
 camino = "1.2.5"
 crossbeam-channel = "0.5.16"
-fastembed = { path = "vendor/fastembed", version = "6.0.0", default-features = false, features = ["hf-hub-native-tls", "image-models"] }
+fastembed = { path = "vendor/fastembed", version = "7.0.1", default-features = false, features = ["hf-hub-native-tls", "image-models"] }
 fast_image_resize = { version = "6.1.0", default-features = false, features = ["std"] }
 gif = { version = "0.14.2", default-features = false, features = ["std"] }
 glob = "0.3.4"

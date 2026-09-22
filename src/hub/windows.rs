@@ -270,10 +270,7 @@ mod tests {
             },
             RuntimeOptions::default(),
         )?;
-        for model in [
-            fastembed::EmbeddingModel::BGESmallENV15,
-            fastembed::EmbeddingModel::ClipVitB32,
-        ] {
+        for model in [fastembed::EmbeddingModel::BGESmallENV15] {
             let info = fastembed::TextEmbedding::get_model_info(&model)?;
             for file in [
                 info.model_file.as_str(),
@@ -290,18 +287,6 @@ mod tests {
             .expect("fallback files must be discoverable offline");
             assert_eq!(loaded.embed(vec!["a photo of a cat"], None)?.len(), 1);
         }
-        let info =
-            fastembed::ImageEmbedding::get_model_info(&fastembed::ImageEmbeddingModel::ClipVitB32);
-        for file in [info.model_file.as_str(), "preprocessor_config.json"] {
-            download(&source(&info.model_code, file), &cache)?;
-        }
-        assert!(
-            fastembed::ImageEmbedding::try_new_cached(
-                fastembed::ImageInitOptions::new(fastembed::ImageEmbeddingModel::ClipVitB32)
-                    .with_cache_dir(cache.path().clone())
-            )?
-            .is_some()
-        );
         Ok(())
     }
 }

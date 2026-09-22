@@ -1,6 +1,2 @@
-- Added macOS builds with coreml
-- Improved automatic updates, except on mac, where they remain manual
-- Made search more responsive on large libraries (it turns out you dont want to filter 70k items on render thread)
-- Added quick catalog sync on startup with clearer progress and completion handling
-- Improved gallery resizing, image crops
-- Added Ctrl/Cmd+L to focus the search field
+- Clean out dead code
+- Upgrade electron to 44.4.3 to fix a bug

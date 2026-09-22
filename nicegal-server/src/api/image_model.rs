@@ -28,7 +28,7 @@ impl ImageModelSettings {
             selected_model: selected.id(),
             supports_text_queries: self.active.supports_text_queries(),
             restart_required: self.active != selected,
-            models: ImageEmbeddingModel::SELECTABLE
+            models: ImageEmbeddingModel::ALL
                 .into_iter()
                 .map(|model| ModelInfo {
                     id: model.id(),
@@ -89,17 +89,9 @@ mod tests {
             overridden.status().selected_model,
             ImageEmbeddingModel::SigLip2Base256.id()
         );
-        assert!(
-            runtime
-                .update(None, Some(ImageEmbeddingModel::LaionClipB32))
-                .is_err()
-        );
-        assert!(
-            !overridden
-                .status()
-                .models
-                .iter()
-                .any(|model| model.id == ImageEmbeddingModel::LaionClipB32.id())
+        assert_eq!(
+            overridden.status().models.len(),
+            ImageEmbeddingModel::ALL.len()
         );
         Ok(())
     }

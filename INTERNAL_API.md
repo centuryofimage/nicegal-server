@@ -279,14 +279,14 @@ is downloaded into the standard Hugging Face cache on first use and reused on su
 Its 384-dimensional normalized vectors are stored with the stable model identifier
 `BAAI/bge-small-en-v1.5`.
 
-### CLIP image index (version 1)
+### Image embedding index (version 1)
 
-CLIP image ingestion and search are independent of OCR and use a model-specific database. The
-initial image model is `Qdrant/clip-ViT-B-32`, stored in `qdrant-clip-vit-b-32.db`; its vectors are
-normalized and 512-wide. Text requests to `type=image` use its paired FastEmbed CLIP text encoder,
-`Qdrant/clip-ViT-B-32-text`, in that same 512-dimensional space. It is deliberately loaded on CPU:
-an image query is one short text forward pass, while the configured accelerator remains available
-for OCR and image-indexing work.
+Image ingestion and search are independent of OCR and use one database per model. MetaCLIP2 B/32
+is the default; its normalized 512-wide vectors are stored in
+`facebook-metaclip-2-worldwide-b32.db`. Text requests to `type=image` use the active model's paired
+text encoder in the same vector space. It is deliberately loaded on CPU: an image query is one
+short text forward pass, while the configured accelerator remains available for OCR and
+image-indexing work.
 
 `GET /v1/search` keeps `type=image` text-only through `q`. `POST /v1/search` additionally supports
 signed asset-ID and text components; see [Composite image queries](#composite-image-queries).
@@ -438,8 +438,8 @@ Version 1 routes:
   250,000. `rank` is the 1-based position in this mode's own ranking. `distance` is present only for
   `type=vector` and `type=image` and is a cosine distance (0 identical, 1 orthogonal, 2 opposite)
   in that mode's distinct vector space. `type=vector` searches OCR-text vectors; `type=image`
-  embeds `q` with the CPU `Qdrant/clip-ViT-B-32-text` encoder and searches current
-  `Qdrant/clip-ViT-B-32` image vectors. Image hits have an empty `snippet` and no `highlights`;
+  embeds `q` with the active image model's paired CPU text encoder and searches that model's current
+  image vectors. Image hits have an empty `snippet` and no `highlights`;
   resolve their image metadata through `POST /v1/assets`. Simple and match text modes retain FTS
   rank order; glob ranks assets by matching-token count, then recency. For
   `type=glob`, `q` is matched case-insensitively against each complete OCR word token: `*` matches
@@ -581,7 +581,7 @@ one. `weight` must be positive and defaults to 1. Omitting `fuse` returns the pe
 ```json
 {
   "model": { "model": "BAAI/bge-small-en-v1.5", "dimensions": 384 },
-  "imageModel": { "model": "Qdrant/clip-ViT-B-32", "dimensions": 512 },
+  "imageModel": { "model": "facebook/metaclip-2-worldwide-b32", "dimensions": 512 },
   "queries": [
     { "key": "semantic", "type": "vector", "total": 812,
       "results": [{ "assetId": 41, "snippet": "...", "rank": 1, "distance": 0.21,
@@ -602,8 +602,8 @@ one. `weight` must be positive and defaults to 1. Omitting `fuse` returns the pe
 
 `model` is the model the *stored OCR-text* vectors belong to, null before the first backfill, so a
 client can tell an empty OCR vector result from an unembedded library without a second request.
-`imageModel` is always the restart-scoped image encoder whose 512-wide CLIP vectors `type=image`
-searches. Each block's `total` is that mode's match count before its `limit`, exactly as the
+`imageModel` is always the restart-scoped image encoder whose vectors `type=image` searches. Each
+block's `total` is that mode's match count before its `limit`, exactly as the
 single-mode route reports it. `fused.total` is the number of distinct assets any mode returned,
 before `fuse.limit`.
 
@@ -1174,8 +1174,8 @@ when a model preparation or indexing request requires them.
 
 `GET /v1/runtime` includes `imageModel: {activeModel, selectedModel, restartRequired,
 models}`. Top-level `restartRequired` covers both the provider and model. Each catalog entry contains `id`, `name`, `dimensions`, `license`,
-`url`, and `available`. The original model can download normally; evaluation
-models require local export files under `NICEGAL_LOCAL_MODELS_DIR`.
+`url`, and `available`. Published exports download normally; local development overrides can be
+placed under `NICEGAL_LOCAL_MODELS_DIR`.
 
 `PUT /v1/runtime` accepts `{"imageModel":"facebook/metaclip-2-worldwide-b32"}`
 and returns runtime status. `executionProvider` and `imageModel` are optional,

@@ -322,7 +322,6 @@ fn decode_sources(
         });
         let outcome = match prepare_image(
             &asset.path,
-            embedder.model() != crate::embedding::ImageEmbeddingModel::ClipVitB32,
             embedder.model().is_deepghs(),
             |image| embedder.preprocess_image(image),
         ) {
@@ -359,14 +358,10 @@ fn decode_sources(
     skip_all,
     fields(path = %path)
 )]
-fn decode_image(path: &Path, accurate: bool, white_background: bool) -> Result<RgbImage> {
+fn decode_image(path: &Path, white_background: bool) -> Result<RgbImage> {
     let data = std::fs::read(path).with_context(|| format!("opening image: {path}"))?;
-    let raster = if accurate {
-        crate::imaging::decode_accurate(&data)
-    } else {
-        crate::imaging::decode(&data)
-    }
-    .with_context(|| format!("decoding image: {path}"))?;
+    let raster = crate::imaging::decode_accurate(&data)
+        .with_context(|| format!("decoding image: {path}"))?;
     let (width, height) = (raster.width(), raster.height());
     let pixels = if white_background {
         raster.flatten_rgb([255, 255, 255])
@@ -383,11 +378,10 @@ enum PreparationError {
 
 fn prepare_image(
     path: &Path,
-    accurate: bool,
     white_background: bool,
     preprocess: impl FnOnce(RgbImage) -> Result<ndarray::Array3<f32>>,
 ) -> Result<ndarray::Array3<f32>, PreparationError> {
-    let image = decode_image(path, accurate, white_background).map_err(PreparationError::Decode)?;
+    let image = decode_image(path, white_background).map_err(PreparationError::Decode)?;
     // A model-specific transform failure says nothing about whether OCR can decode the file.
     preprocess(image).map_err(PreparationError::Preprocess)
 }
@@ -524,14 +518,14 @@ mod tests {
             crate::imaging::test_support::jpeg_with_orientation(1)?,
         )?;
         assert!(matches!(
-            prepare_image(&path, false, false, |_| anyhow::bail!(
+            prepare_image(&path, false, |_| anyhow::bail!(
                 "model transform failed"
             )),
             Err(PreparationError::Preprocess(_))
         ));
         std::fs::write(&path, b"invalid image")?;
         assert!(matches!(
-            prepare_image(&path, false, false, |_| panic!(
+            prepare_image(&path, false, |_| panic!(
                 "invalid pixels cannot reach the preprocessor"
             )),
             Err(PreparationError::Decode(_))
