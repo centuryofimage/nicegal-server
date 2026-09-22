@@ -93,7 +93,7 @@ impl<T, O> LazyModel<T, O> {
                 Err(anyhow::anyhow!("Model loader panicked: {message}"))
             }).with_context(|| {
             format!(
-                "Preparing {} failed. Check your connection and available disk space, then retry model preparation in Settings",
+                "Preparing {} failed. Check your connection and available disk space, then retry preparing search in Libraries",
                 self.name
             )
         });
@@ -148,7 +148,7 @@ impl<T, O> LazyModel<T, O> {
     pub(super) fn ready(&self) -> Result<Arc<T>, ApiError> {
         self.session.get().map(Arc::clone).ok_or_else(|| {
             ApiError::models_not_ready(format!(
-                "{} is not ready. Start indexing or prepare search models in Settings.",
+                "{} is not ready. Open Libraries and choose Prepare search to continue.",
                 self.name
             ))
         })
