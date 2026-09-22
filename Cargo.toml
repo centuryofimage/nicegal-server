@@ -24,6 +24,7 @@ ort-coreml = ["ort/coreml"]
 anyhow = "1.0.104"
 camino = "1.2.5"
 crossbeam-channel = "0.5.16"
+ffmpeg-the-third = { path = "vendor/ffmpeg-the-third", version = "6.0.0", default-features = false, features = ["format", "filter", "software-scaling", "static"] }
 fastembed = { path = "vendor/fastembed", version = "7.1.0", default-features = false, features = ["hf-hub-native-tls", "image-models"] }
 fast_image_resize = { version = "6.1.0", default-features = false, features = ["std"] }
 gif = { version = "0.14.2", default-features = false, features = ["std"] }
@@ -73,5 +74,4 @@ tempfile = "3.27.0"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["std", "fmt", "ansi", "env-filter", "json", "registry"] }
 
 [target.'cfg(windows)'.dependencies]
-ffmpeg-the-third = { path = "vendor/ffmpeg-the-third", version = "6.0.0", default-features = false, features = ["format", "filter", "software-scaling", "static"] }
 tokio = { version = "1.53.1", features = ["rt"] }
