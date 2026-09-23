@@ -167,6 +167,26 @@ pub(crate) fn run(
     }
 }
 
+pub(crate) fn has_pending(
+    spec: &Spec,
+    ocr_database: &PathBuf,
+    model: &str,
+    dimensions: usize,
+) -> anyhow::Result<bool> {
+    let ocr = DB::new(ocr_database)?;
+    let filters = SearchFilters::new(&spec.root);
+    let stored = ocr.text_embedding_model(SPACE)?;
+    if stored
+        .as_ref()
+        .is_some_and(|stored| stored.model != model || stored.dimensions != dimensions)
+    {
+        return Ok(ocr.text_embedding_coverage(SPACE, &filters)?.indexed > 0);
+    }
+    Ok(!ocr
+        .pending_text_embeddings(SPACE, &filters, 1, MAX_CONTENT_BYTES)?
+        .is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

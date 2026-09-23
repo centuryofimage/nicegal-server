@@ -25,6 +25,7 @@ pub(crate) fn configure_writer(conn: &Connection) -> Result<()> {
 /// Perform bounded, low-impact maintenance after a resource-intensive job releases its
 /// transactions. Incremental vacuuming only visits free pages already tracked by SQLite, while a
 /// passive checkpoint never waits for readers or writers to leave the WAL.
+#[tracing::instrument(level = "debug", skip(conn))]
 pub(crate) fn maintain(conn: &Connection) -> Result<()> {
     conn.execute_batch("PRAGMA optimize; PRAGMA incremental_vacuum(1000);")?;
     conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()))?;

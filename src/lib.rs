@@ -16,3 +16,4 @@ pub mod runtime;
 mod schema;
 mod storage;
 pub mod thumbs;
+pub mod video;

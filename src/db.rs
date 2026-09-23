@@ -369,6 +369,7 @@ impl DB {
     }
 
     /// Remove OCR rows and vectors whose owning catalog asset no longer exists.
+    #[tracing::instrument(level = "debug", skip(self))]
     pub fn prune_orphans(&mut self, catalog: &Path) -> Result<usize> {
         self.conn
             .execute(
@@ -397,6 +398,7 @@ impl DB {
         result
     }
 
+    #[tracing::instrument(level = "debug", skip(self))]
     pub fn maintain(&self) -> Result<()> {
         maintain(&self.conn).context("maintaining OCR database")
     }

@@ -15,10 +15,11 @@ use tracing::{Span, debug_span};
 use crate::assets::{Asset, MediaKind, SourceFingerprint};
 use crate::imaging;
 use crate::poster;
+use crate::video;
 
 pub const SIZE_BUCKETS: [u16; 4] = [128, 256, 512, 1024];
 pub const EAGER_SIZE_BUCKETS: [u16; 3] = [128, 256, 512];
-pub const GENERATOR_VERSION: u32 = 2;
+pub const GENERATOR_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThumbnailEncoding {
@@ -71,17 +72,28 @@ pub struct DecodedThumbnail {
 }
 
 mod storage;
-pub use storage::ThumbnailDb;
+pub use storage::{EncodedVideoSamples, ThumbnailDb, encode_video_samples};
 
-/// Decode all requested variants for one image in one source pass. The caller persists them.
+/// Decode all requested variants for one asset in one source pass. The caller persists them.
 pub fn decode_asset_variants(
     asset: &Asset,
     buckets: &[u16],
     generator_version: u32,
 ) -> Result<Vec<DecodedThumbnail>> {
-    if asset.media_kind != MediaKind::Image {
-        bail!("asset {} is not an image", asset.asset_id);
-    }
+    decode_asset_variants_with_video_output(
+        asset,
+        buckets,
+        generator_version,
+        video::VideoOutputOptions::default(),
+    )
+}
+
+pub fn decode_asset_variants_with_video_output(
+    asset: &Asset,
+    buckets: &[u16],
+    generator_version: u32,
+    video_output: video::VideoOutputOptions,
+) -> Result<Vec<DecodedThumbnail>> {
     for bucket in buckets {
         validate_key(asset.asset_id, *bucket, generator_version)?;
     }
@@ -98,7 +110,23 @@ pub fn decode_asset_variants(
         buckets = ?buckets,
     );
     let _entered = span.enter();
-    let posters = poster::image_buckets(&asset.path, buckets)?;
+    let posters = match asset.media_kind {
+        MediaKind::Image => poster::image_buckets(&asset.path, buckets)?,
+        MediaKind::Video => {
+            let samples = video::samples(&asset.path, video::SAMPLE_MAX_EDGE, || false)?;
+            let first = samples
+                .first()
+                .context("video has no decodable sample frame")?;
+            let span = debug_span!("video_poster_encode", path = %asset.path, buckets = ?buckets);
+            let _entered = span.enter();
+            poster::raster_buckets_with_output_at(
+                &asset.path,
+                &first.raster,
+                buckets,
+                video_output,
+            )?
+        }
+    };
     Ok(buckets
         .iter()
         .copied()
@@ -278,6 +306,14 @@ pub struct ThumbnailService {
     inner: Arc<ServiceInner>,
 }
 
+impl std::fmt::Debug for ThumbnailService {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ThumbnailService")
+            .finish_non_exhaustive()
+    }
+}
+
 /// One request for the writer thread, with a command-specific reply channel.
 enum WriterCommand {
     Current {
@@ -286,6 +322,11 @@ enum WriterCommand {
     },
     Store {
         variants: Vec<DecodedThumbnail>,
+        reply: mpsc::Sender<Result<(), Arc<str>>>,
+    },
+    StoreVideoSamples {
+        asset: Asset,
+        encoded: EncodedVideoSamples,
         reply: mpsc::Sender<Result<(), Arc<str>>>,
     },
     Put {
@@ -315,7 +356,7 @@ enum WriterCommand {
 struct Waiter {
     asset: Asset,
     flights: Vec<Arc<Flight>>,
-    /// Buckets skipped before any flight existed (non-image assets never get one).
+    /// Buckets skipped before any flight existed.
     skipped: usize,
 }
 
@@ -489,15 +530,6 @@ impl ThumbnailService {
         let mut waiters = Vec::with_capacity(chunk.len());
         let mut claimed = Vec::new();
         for asset in chunk {
-            // Non-image assets (video, audio) never had thumbnail flights to begin with.
-            if asset.media_kind != MediaKind::Image {
-                waiters.push(Waiter {
-                    asset: asset.clone(),
-                    flights: Vec::new(),
-                    skipped: buckets.len(),
-                });
-                continue;
-            }
             let mut flights = Vec::with_capacity(buckets.len());
             let mut variants = Vec::new();
             for &size_bucket in buckets {
@@ -668,6 +700,19 @@ impl ThumbnailService {
         self.request(|reply| WriterCommand::Put { variant, reply })
     }
 
+    /// Persist samples encoded by an indexing worker on the shared thumbnail writer.
+    pub fn store_encoded_video_samples(
+        &self,
+        asset: Asset,
+        encoded: EncodedVideoSamples,
+    ) -> Result<()> {
+        self.request(|reply| WriterCommand::StoreVideoSamples {
+            asset,
+            encoded,
+            reply,
+        })
+    }
+
     pub fn delete_asset(&self, asset_id: i64) -> Result<usize> {
         self.delete_assets(vec![asset_id])
     }
@@ -779,6 +824,15 @@ fn thumbnail_writer(path: camino::Utf8PathBuf, receiver: mpsc::Receiver<WriterCo
                     database.store_batch(&variants)
                 }));
             }
+            WriterCommand::StoreVideoSamples {
+                asset,
+                encoded,
+                reply,
+            } => {
+                let _ = reply.send(respond(&mut database, &path, |database| {
+                    database.store_encoded_video_samples(&asset, &encoded)
+                }));
+            }
             WriterCommand::Put { variant, reply } => {
                 let _ = reply.send(respond(&mut database, &path, |database| {
                     database.store_batch(&[variant])
@@ -867,6 +921,102 @@ mod tests {
             encoding: ThumbnailEncoding::Png,
             data: data.to_vec(),
         })
+    }
+
+    #[test]
+    fn video_samples_are_exact_and_refresh_the_gallery_poster() -> Result<()> {
+        let temp = TempDir::new()?;
+        let db = test_db(&temp)?;
+        let asset = Asset {
+            asset_id: 42,
+            path: PathBuf::from("sample.mp4"),
+            fingerprint: CURRENT,
+            source_created_ns: None,
+            exif_taken_ns: None,
+            media_kind: MediaKind::Video,
+            media_format: "mp4".into(),
+            width: Some(2),
+            height: Some(2),
+            is_animated: false,
+            frame_count: None,
+            duration_ms: Some(2000),
+            metadata_version: 1,
+        };
+        let sample = |timestamp_ms, color| video::VideoSample {
+            timestamp_ms,
+            raster: imaging::Raster::Rgb {
+                width: 2,
+                height: 2,
+                pixels: vec![color; 12],
+            },
+        };
+        db.store_video_samples(&asset, &[sample(100, 20), sample(1500, 220)])?;
+        assert_eq!(
+            db.get_video_sample(42, 1500, 200, CURRENT)?
+                .unwrap()
+                .size_bucket,
+            256
+        );
+        assert!(db.get_video_sample(42, 1499, 200, CURRENT)?.is_none());
+        assert!(
+            db.get_video_sample(
+                42,
+                1500,
+                200,
+                SourceFingerprint {
+                    size: CURRENT.size + 1,
+                    ..CURRENT
+                }
+            )?
+            .is_none()
+        );
+        let poster = db.get(42, 200, GENERATOR_VERSION, CURRENT)?.unwrap();
+        let frame = imaging::decode(&poster.data)?;
+        assert!(
+            frame.pixels()[0] < 100,
+            "gallery poster must use the first frame"
+        );
+        db.store_video_samples(&asset, &[sample(700, 100)])?;
+        assert!(db.get_video_sample(42, 1500, 200, CURRENT)?.is_none());
+        assert!(db.get_video_sample(42, 700, 200, CURRENT)?.is_some());
+        db.delete_asset(42)?;
+        assert!(db.get_video_sample(42, 700, 200, CURRENT)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn service_writes_preencoded_video_samples_and_gallery_poster() -> Result<()> {
+        let temp = TempDir::new()?;
+        let service = service(&temp)?;
+        let asset = Asset {
+            asset_id: 42,
+            path: PathBuf::from("sample.mp4"),
+            fingerprint: CURRENT,
+            source_created_ns: None,
+            exif_taken_ns: None,
+            media_kind: MediaKind::Video,
+            media_format: "mp4".into(),
+            width: Some(2),
+            height: Some(2),
+            is_animated: false,
+            frame_count: None,
+            duration_ms: Some(2000),
+            metadata_version: 1,
+        };
+        let samples = [video::VideoSample {
+            timestamp_ms: 700,
+            raster: imaging::Raster::Rgb {
+                width: 2,
+                height: 2,
+                pixels: vec![100; 12],
+            },
+        }];
+        let encoded = encode_video_samples(&asset, &samples)?;
+        service.store_encoded_video_samples(asset.clone(), encoded)?;
+        let db = test_db(&temp)?;
+        assert!(db.get_video_sample(42, 700, 200, CURRENT)?.is_some());
+        assert!(db.get(42, 200, GENERATOR_VERSION, CURRENT)?.is_some());
+        Ok(())
     }
 
     #[test]
@@ -992,6 +1142,74 @@ mod tests {
         assert_eq!(db.get(42, 128, 1, CURRENT)?, None);
         assert_eq!(db.get(42, 256, 2, CURRENT)?, None);
         assert_eq!(db.get(7, 128, 1, CURRENT)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn orphan_pruning_preserves_cataloged_assets_and_deletes_all_orphan_variants() -> Result<()> {
+        let temp = TempDir::new()?;
+        let asset = service_asset(&temp, "source.png")?;
+        let catalog_path = PathBuf::try_from(temp.path().join("assets.db"))?;
+        let db = test_db(&temp)?;
+        put(&db, 128, 1, CURRENT)?;
+        put(&db, 256, 1, CURRENT)?;
+        db.put(DecodedThumbnail {
+            asset_id: asset.asset_id,
+            size_bucket: 128,
+            generator_version: 1,
+            fingerprint: asset.fingerprint,
+            width: 1,
+            height: 1,
+            encoding: ThumbnailEncoding::Png,
+            data: png()?,
+        })?;
+
+        assert_eq!(db.prune_orphans(&catalog_path)?, 2);
+        assert_eq!(db.prune_orphans(&catalog_path)?, 0);
+        assert!(db.get(asset.asset_id, 128, 1, asset.fingerprint)?.is_some());
+        assert_eq!(db.get(42, 128, 1, CURRENT)?, None);
+        assert_eq!(db.get(42, 256, 1, CURRENT)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn orphan_pruning_removes_video_variants_by_asset_id() -> Result<()> {
+        let temp = TempDir::new()?;
+        let cataloged = service_asset(&temp, "source.png")?;
+        let catalog_path = PathBuf::try_from(temp.path().join("assets.db"))?;
+        let db = test_db(&temp)?;
+        let mut kept = cataloged.clone();
+        kept.media_kind = MediaKind::Video;
+        let mut orphan = kept.clone();
+        orphan.asset_id = 42;
+        let sample = video::VideoSample {
+            timestamp_ms: 100,
+            raster: imaging::Raster::Rgb {
+                width: 2,
+                height: 2,
+                pixels: vec![42; 12],
+            },
+        };
+        db.store_video_samples(&kept, std::slice::from_ref(&sample))?;
+        db.store_video_samples(&orphan, &[sample])?;
+
+        // Existing version-4 databases predate the narrow pruning index.
+        let thumbnail_path = PathBuf::try_from(temp.path().join("thumbnails.db"))?;
+        drop(db);
+        rusqlite::Connection::open(&thumbnail_path)?
+            .execute_batch("DROP INDEX video_thumbnail_assets_idx")?;
+        let db = ThumbnailDb::new(&thumbnail_path)?;
+
+        assert_eq!(db.prune_orphans(&catalog_path)?, 8);
+        assert_eq!(db.prune_orphans(&catalog_path)?, 0);
+        assert!(
+            db.get_video_sample(kept.asset_id, 100, 128, kept.fingerprint)?
+                .is_some()
+        );
+        assert!(
+            db.get_video_sample(orphan.asset_id, 100, 128, orphan.fingerprint)?
+                .is_none()
+        );
         Ok(())
     }
 

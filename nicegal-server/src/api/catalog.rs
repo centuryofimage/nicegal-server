@@ -161,6 +161,7 @@ struct FileMetadataResponse {
     source_state: &'static str,
     attributes: Vec<&'static str>,
     exif: Vec<MetadataField>,
+    video: Vec<MetadataField>,
     error: Option<String>,
 }
 
@@ -182,6 +183,14 @@ impl From<FileMetadata> for FileMetadataResponse {
             attributes: file.attributes,
             exif: file
                 .exif
+                .into_iter()
+                .map(|field| MetadataField {
+                    label: field.label,
+                    value: field.value,
+                })
+                .collect(),
+            video: file
+                .video
                 .into_iter()
                 .map(|field| MetadataField {
                     label: field.label,
@@ -229,8 +238,7 @@ async fn metadata(
             let image_indexed = state
                 .databases
                 .open_images_read_only(state.image_embedder.dimensions())?
-                .current_vector(asset.asset_id)?
-                .is_some();
+                .is_asset_indexed(asset.asset_id)?;
             let file = nicegal_core::metadata::inspect(&asset).into();
             Ok(MetadataResponse {
                 asset: asset.into(),

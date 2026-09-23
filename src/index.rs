@@ -1,6 +1,9 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -12,7 +15,8 @@ use tracing::{Span, debug, error, field, info, instrument};
 use walkdir::WalkDir;
 
 use crate::assets::{
-    Asset, AssetCatalog, CatalogUpsertTimings, canonicalize_path, is_catalog_media, is_ocr_image,
+    Asset, AssetCatalog, CatalogScanEntry, CatalogUpsertTimings, canonicalize_path,
+    is_catalog_media, is_ocr_image,
 };
 use crate::db::{DB, OcrResult};
 use crate::ocr::{PaddleOcrModels, PaddleOcrOptions, PaddleOcrPool};
@@ -28,8 +32,6 @@ pub struct IndexOptions {
     /// Retry source revisions whose prior decode failed, while retaining current OCR results.
     pub retry_failed: bool,
     pub subdirs: bool,
-    /// Discover new paths only. Existing rows are left untouched, including changed files.
-    pub new_only: bool,
     pub commit_chunk_size: usize,
     pub cleanup: bool,
     pub max_dimensions: Option<(usize, usize)>,
@@ -44,7 +46,6 @@ impl Default for IndexOptions {
             rescan: false,
             retry_failed: false,
             subdirs: true,
-            new_only: false,
             commit_chunk_size: DEFAULT_COMMIT_CHUNK_SIZE,
             cleanup: false,
             max_dimensions: None,
@@ -65,6 +66,15 @@ pub struct IndexSummary {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CatalogSummary {
     pub cataloged: usize,
+    pub cancelled: bool,
+    pub scan_complete: bool,
+}
+
+/// Work found by one directory walk. Only new or changed rows enter derived indexing;
+/// unseen paths are candidates for verified deletion after a complete walk.
+pub struct CatalogDelta {
+    pub cataloged: Vec<Asset>,
+    pub unseen_paths: Vec<PathBuf>,
     pub cancelled: bool,
     pub scan_complete: bool,
 }
@@ -127,6 +137,11 @@ pub trait IndexObserver: Send + Sync {
         false
     }
 
+    /// Shared cancellation flag for blocking decoders that must stop inside native calls.
+    fn cancellation_token(&self) -> Option<Arc<AtomicBool>> {
+        None
+    }
+
     fn on_event(&self, _event: IndexEvent) {}
 }
 
@@ -158,6 +173,33 @@ pub fn catalog_dir_with_step(
     Ok(summary)
 }
 
+/// Discover new, changed, and missing catalog paths without probing unchanged media.
+pub fn catalog_delta_dir_observed(
+    assets: &AssetCatalog,
+    path: &Path,
+    options: IndexOptions,
+    observer: &dyn IndexObserver,
+) -> Result<CatalogDelta> {
+    let root = canonicalize_path(path).context("canonicalizing catalog path")?;
+    let pipeline = CatalogPipeline {
+        assets,
+        options: &options,
+        observer,
+    };
+    let files = pipeline.collect_files(&root, ScanSelection::Delta)?;
+    let (cataloged, catalog_complete) = if pipeline.cancelled() {
+        (Vec::new(), false)
+    } else {
+        pipeline.catalog_files(&files.paths)?
+    };
+    Ok(CatalogDelta {
+        cataloged,
+        unseen_paths: files.unseen_paths,
+        cancelled: pipeline.cancelled(),
+        scan_complete: files.complete && catalog_complete && !pipeline.cancelled(),
+    })
+}
+
 #[instrument(
     name = "catalog_sync",
     skip_all,
@@ -175,7 +217,7 @@ fn catalog_snapshot(
         options: &options,
         observer,
     };
-    let files = pipeline.collect_files(&root)?;
+    let files = pipeline.collect_files(&root, ScanSelection::All)?;
     let (catalog, catalog_complete) = if pipeline.cancelled() {
         (Vec::new(), false)
     } else {
@@ -186,8 +228,7 @@ fn catalog_snapshot(
     let summary = CatalogSummary {
         cataloged: catalog.len(),
         cancelled,
-        // A new-only scan cannot prove that older catalog rows are still present.
-        scan_complete: scan_complete && !options.new_only,
+        scan_complete,
     };
     let span = Span::current();
     span.record("cataloged", summary.cataloged);
@@ -305,7 +346,7 @@ impl IndexPipeline<'_> {
             options: &self.options,
             observer: self.observer,
         }
-        .collect_files(root)?;
+        .collect_files(root, ScanSelection::All)?;
         if self.cancelled() {
             return Ok(None);
         }
@@ -320,7 +361,7 @@ impl IndexPipeline<'_> {
         if self.cancelled() {
             return Ok(None);
         }
-        let scan_complete = files.complete && catalog_complete && !self.options.new_only;
+        let scan_complete = files.complete && catalog_complete;
         // Legacy OCR-only mark/sweep cannot represent excluded or unvisited paths.
         self.options.cleanup &=
             scan_complete && self.options.subdirs && self.options.exclude.is_empty();
@@ -411,7 +452,10 @@ impl IndexPipeline<'_> {
             indexed = field::Empty
         )
     )]
-    fn run_ocr(&mut self, sources: Vec<Asset>) -> Result<usize> {
+    fn run_ocr(&mut self, mut sources: Vec<Asset>) -> Result<usize> {
+        // Keep the OCR boundary explicit even if a caller bypasses normal selection during a
+        // forced rescan or a retry of a failed source.
+        sources.retain(is_ocr_image);
         BoundedOcrPipeline {
             assets: self.assets,
             db: self.db,
@@ -477,17 +521,23 @@ struct CatalogPipeline<'a> {
 
 struct DiscoveredFiles {
     paths: Vec<PathBuf>,
+    unseen_paths: Vec<PathBuf>,
     complete: bool,
+}
+
+#[derive(Clone, Copy)]
+enum ScanSelection {
+    All,
+    Delta,
 }
 
 impl CatalogPipeline<'_> {
     #[instrument(name = "scan", skip_all, fields(files = field::Empty))]
-    fn collect_files(&self, root: &Path) -> Result<DiscoveredFiles> {
+    fn collect_files(&self, root: &Path, selection: ScanSelection) -> Result<DiscoveredFiles> {
         self.phase(IndexPhase::Scanning);
-        let existing: HashSet<PathBuf> = if self.options.new_only {
-            self.assets.paths_under_root(root)?.into_iter().collect()
-        } else {
-            HashSet::new()
+        let mut existing: Option<HashMap<PathBuf, CatalogScanEntry>> = match selection {
+            ScanSelection::All => None,
+            ScanSelection::Delta => Some(self.assets.scan_entries_under_root(root)?),
         };
         let mut walker = WalkDir::new(root).follow_links(true);
         if !self.options.subdirs {
@@ -525,7 +575,7 @@ impl CatalogPipeline<'_> {
             if entry.file_type().is_dir() {
                 continue;
             }
-            let source_path = match PathBuf::try_from(entry.into_path()) {
+            let source_path = match PathBuf::try_from(entry.path().to_owned()) {
                 Ok(path) => path,
                 Err(error) => {
                     complete = false;
@@ -541,17 +591,49 @@ impl CatalogPipeline<'_> {
                     continue;
                 }
             };
-            if is_catalog_media(&source_path) && !existing.contains(&source_path) {
-                files.push(source_path);
-                self.observer
-                    .on_event(IndexEvent::Discovered { count: files.len() });
+            if !is_catalog_media(&source_path) {
+                continue;
             }
+            // Removing every visited path leaves only possible deletions at the end of the walk.
+            if let Some(existing) = &mut existing
+                && let Some(known) = existing.remove(&source_path)
+            {
+                // WalkDir reuses directory-entry metadata on Windows for ordinary files.
+                let current = (|| -> Result<bool> { known.is_current(&entry.metadata()?) })();
+                match current {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(error) => {
+                        complete = false;
+                        self.report_item_error(
+                            Some(source_path),
+                            format!("checking catalog source metadata failed: {error}"),
+                        );
+                        self.progress(IndexProgressDelta {
+                            failed: 1,
+                            ..IndexProgressDelta::default()
+                        });
+                        continue;
+                    }
+                }
+            }
+            files.push(source_path);
+            self.observer
+                .on_event(IndexEvent::Discovered { count: files.len() });
         }
         self.observer
             .on_event(IndexEvent::DiscoveryComplete { total: files.len() });
         Span::current().record("files", files.len());
         Ok(DiscoveredFiles {
             paths: files,
+            // An incomplete walk cannot establish absence, so never expose deletion candidates.
+            unseen_paths: if complete {
+                existing
+                    .map(|entries| entries.into_keys().collect())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            },
             complete: complete && !self.cancelled(),
         })
     }
@@ -1228,7 +1310,7 @@ mod tests {
             options: &options,
             observer: &observer,
         }
-        .collect_files(&root)?
+        .collect_files(&root, ScanSelection::All)?
         .paths;
         for path in expected.iter().rev() {
             assets.upsert(path, &path.metadata()?)?;
@@ -1254,7 +1336,7 @@ mod tests {
     }
 
     #[test]
-    fn new_only_catalog_skips_existing_paths_and_preserves_their_rows() -> Result<()> {
+    fn delta_catalog_classifies_new_changed_unchanged_and_unseen_paths() -> Result<()> {
         let temp = TempDir::new()?;
         let root = canonicalize_path(&PathBuf::try_from(temp.path().to_owned())?)?;
         let assets = AssetCatalog::new(&root.join("assets.db"))?;
@@ -1262,26 +1344,32 @@ mod tests {
         std::fs::write(&existing, b"original")?;
         let original = assets.upsert(&existing, &existing.metadata()?)?;
         std::fs::write(&existing, b"changed content")?;
+        let unchanged = root.join("unchanged.png");
+        std::fs::write(&unchanged, b"unchanged")?;
+        assets.upsert(&unchanged, &unchanged.metadata()?)?;
+        let missing = root.join("missing.png");
+        std::fs::write(&missing, b"removed")?;
+        assets.upsert(&missing, &missing.metadata()?)?;
+        std::fs::remove_file(&missing)?;
         let new_path = root.join("new.png");
         std::fs::write(&new_path, b"new")?;
 
-        let options = IndexOptions {
-            new_only: true,
-            ..IndexOptions::default()
-        };
         let observer = TestObserver { cancelled: false };
-        let mut passed = Vec::new();
-        let summary = catalog_dir_with_step(&assets, &root, options, &observer, |catalog| {
-            passed.extend(catalog.iter().map(|asset| asset.path.clone()));
-            Ok(false)
-        })?;
-        assert_eq!(passed, vec![new_path]);
-        assert_eq!(summary.cataloged, 1);
-        assert!(!summary.scan_complete);
-        assert_eq!(
+        let delta = catalog_delta_dir_observed(&assets, &root, IndexOptions::default(), &observer)?;
+        let mut passed = delta
+            .cataloged
+            .iter()
+            .map(|asset| asset.path.clone())
+            .collect::<Vec<_>>();
+        passed.sort();
+        assert_eq!(passed, vec![existing.clone(), new_path]);
+        assert_eq!(delta.unseen_paths, vec![missing]);
+        assert!(delta.scan_complete);
+        assert_ne!(
             assets.get_by_path(&existing)?.unwrap().fingerprint,
             original.fingerprint
         );
+        assert!(assets.get_by_path(&unchanged)?.is_some());
         Ok(())
     }
 
@@ -1297,8 +1385,12 @@ mod tests {
             options: &options,
             observer: &observer,
         };
-        assert!(scan.collect_files(&root)?.complete);
-        assert!(!scan.collect_files(&root.join("unavailable"))?.complete);
+        assert!(scan.collect_files(&root, ScanSelection::All)?.complete);
+        assert!(
+            !scan
+                .collect_files(&root.join("unavailable"), ScanSelection::All)?
+                .complete
+        );
         let limited = IndexOptions {
             limit: Some(100),
             ..IndexOptions::default()
@@ -1308,13 +1400,34 @@ mod tests {
                 options: &limited,
                 ..scan
             }
-            .collect_files(&root)?
+            .collect_files(&root, ScanSelection::All)?
             .complete
         );
         let cancelled = TestObserver { cancelled: true };
         let summary = catalog_dir_observed(&assets, &root, options, &cancelled)?;
         assert!(summary.cancelled);
         assert!(!summary.scan_complete);
+        Ok(())
+    }
+
+    #[test]
+    fn incomplete_delta_does_not_offer_paths_for_deletion() -> Result<()> {
+        let temp = TempDir::new()?;
+        let root = canonicalize_path(&PathBuf::try_from(temp.path().to_owned())?)?;
+        let assets = AssetCatalog::new(&root.join("assets.db"))?;
+        let missing = root.join("missing.png");
+        std::fs::write(&missing, b"removed")?;
+        assets.upsert(&missing, &missing.metadata()?)?;
+        std::fs::remove_file(&missing)?;
+        let observer = TestObserver { cancelled: false };
+        let options = IndexOptions {
+            limit: Some(1),
+            ..IndexOptions::default()
+        };
+        let delta = catalog_delta_dir_observed(&assets, &root, options, &observer)?;
+        assert!(!delta.scan_complete);
+        assert!(delta.unseen_paths.is_empty());
+        assert!(assets.get_by_path(&missing)?.is_some());
         Ok(())
     }
 

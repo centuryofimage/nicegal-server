@@ -10,6 +10,7 @@ pub struct FileMetadata {
     pub source_state: SourceState,
     pub attributes: Vec<&'static str>,
     pub exif: Vec<MetadataField>,
+    pub video: Vec<MetadataField>,
     pub error: Option<String>,
 }
 
@@ -74,7 +75,8 @@ fn apply_source_recheck(result: &mut FileMetadata, source: SourceCheck) {
     result.source_state = source.state;
     if result.source_state != SourceState::Current {
         result.exif.clear();
-        // EXIF and its errors describe a source we can no longer verify. Prefer the stat error,
+        result.video.clear();
+        // Probe fields and errors describe a source we can no longer verify. Prefer the stat error,
         // if any, so disappearance stays Missing and an unreadable source stays Unavailable.
         result.error = source.error;
     }
@@ -86,6 +88,7 @@ pub fn inspect(asset: &Asset) -> FileMetadata {
         source_state: source.state,
         attributes: Vec::new(),
         exif: Vec::new(),
+        video: Vec::new(),
         error: source.error,
     };
     let Some(metadata) = source.metadata else {
@@ -113,7 +116,43 @@ pub fn inspect(asset: &Asset) -> FileMetadata {
         }
     }
     // Do not combine EXIF from a changed source with dimensions/dates from the catalog.
-    if result.source_state != SourceState::Current || asset.media_kind != MediaKind::Image {
+    if result.source_state != SourceState::Current {
+        return result;
+    }
+    if asset.media_kind == MediaKind::Video {
+        match crate::video::probe(&asset.path) {
+            Ok(video) => {
+                result.video.push(MetadataField {
+                    label: "Video codec",
+                    value: video.codec,
+                });
+                result.video.push(MetadataField {
+                    label: "HDR",
+                    value: if video.is_hdr { "Yes" } else { "No" }.to_owned(),
+                });
+                for (label, value) in [
+                    (
+                        "Frame rate",
+                        video.frame_rate.map(|value| format!("{value:.3} fps")),
+                    ),
+                    (
+                        "Bit rate",
+                        video.bit_rate.map(|value| format!("{value} bit/s")),
+                    ),
+                    ("Creation time (container)", video.creation_time),
+                    ("Title", video.title),
+                ] {
+                    if let Some(value) = value.filter(|value| !value.is_empty()) {
+                        result.video.push(MetadataField { label, value });
+                    }
+                }
+            }
+            Err(error) => result.error = Some(error.to_string()),
+        }
+        apply_source_recheck(
+            &mut result,
+            check_source(asset.fingerprint, fs::metadata(&asset.path)),
+        );
         return result;
     }
     match read_exif(asset.path.as_std_path()) {
@@ -174,6 +213,7 @@ mod tests {
                 label: "Camera make",
                 value: "camera".to_owned(),
             }],
+            video: Vec::new(),
             error: Some("EXIF warning".to_owned()),
         };
         apply_source_recheck(&mut result, check_source(expected, fs::metadata(&path)));
@@ -185,6 +225,7 @@ mod tests {
         apply_source_recheck(&mut result, check_source(expected, fs::metadata(&path)));
         assert_eq!(result.source_state, SourceState::Changed);
         assert!(result.exif.is_empty());
+        assert!(result.video.is_empty());
         assert!(result.error.is_none());
         Ok(())
     }
@@ -210,6 +251,7 @@ mod tests {
                     label: "Camera make",
                     value: "old camera".to_owned(),
                 }],
+                video: Vec::new(),
                 error: Some("old EXIF error".to_owned()),
             };
             apply_source_recheck(
@@ -244,6 +286,27 @@ mod tests {
         assert_eq!(inspect(&asset).source_state, SourceState::Changed);
         fs::remove_file(&path)?;
         assert_eq!(inspect(&asset).source_state, SourceState::Missing);
+        Ok(())
+    }
+
+    #[test]
+    fn video_inspector_keeps_video_fields_separate_from_exif() -> anyhow::Result<()> {
+        let temp = tempfile::TempDir::new()?;
+        let root = Utf8PathBuf::try_from(temp.path().to_path_buf())?;
+        let path = root.join("broken.mp4");
+        fs::write(&path, b"invalid video")?;
+        let catalog = AssetCatalog::new(&root.join("assets.db"))?;
+        let asset = catalog.upsert(&path, &fs::metadata(&path)?)?;
+        let info = inspect(&asset);
+        assert_eq!(info.source_state, SourceState::Current);
+        assert!(info.exif.is_empty());
+        assert!(info.video.is_empty());
+        assert!(info.error.is_some());
+        fs::write(&path, b"replaced invalid video")?;
+        let changed = inspect(&asset);
+        assert_eq!(changed.source_state, SourceState::Changed);
+        assert!(changed.video.is_empty());
+        assert!(changed.error.is_none());
         Ok(())
     }
 }

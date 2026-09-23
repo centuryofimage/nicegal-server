@@ -27,6 +27,7 @@ dirs = "7.0.0"
 glob = "0.3.4"
 hf-hub = { version = "0.5.0", default-features = false, features = ["native-tls", "tokio", "ureq"] }
 nicegal-core = { path = "..", default-features = false, features = ["logging"] }
+parking_lot = "0.12.4"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["io-std", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }

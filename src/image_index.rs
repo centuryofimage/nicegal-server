@@ -5,7 +5,10 @@
 //! no bearing on image-vector coverage.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 
 use anyhow::{Context, Result, bail};
 use camino::{Utf8Path as Path, Utf8PathBuf as PathBuf};
@@ -13,7 +16,7 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 use image::RgbImage;
 #[cfg(test)]
 use rusqlite::Connection;
-use tracing::{debug, info, instrument};
+use tracing::{debug, debug_span, info, instrument};
 
 #[cfg(test)]
 use crate::assets::SourceFingerprint;
@@ -29,14 +32,31 @@ mod storage;
 use storage::StoredImageEmbedding;
 pub use storage::{ImageIndexDb, ImageIndexReadSnapshot, ImageVectorHit, ImageVectorSearchOptions};
 
-const MAX_DECODE_WORKERS: usize = 4;
-
 /// Flags for an incremental image-indexing pass.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone)]
 pub struct ImageIndexOptions {
     pub force: bool,
     pub retry_failed: bool,
     pub limit: Option<usize>,
+    /// Whether video frames are eligible for this pass.
+    pub index_videos: bool,
+    /// Used to check whether indexed videos already have complete thumbnails.
+    pub thumbnail_database: Option<PathBuf>,
+    /// Shared writer used to persist indexed video samples and their gallery poster.
+    pub thumbnail_service: Option<crate::thumbs::ThumbnailService>,
+}
+
+impl Default for ImageIndexOptions {
+    fn default() -> Self {
+        Self {
+            force: false,
+            retry_failed: false,
+            limit: None,
+            index_videos: true,
+            thumbnail_database: None,
+            thumbnail_service: None,
+        }
+    }
 }
 
 /// Incrementally embed cataloged images beneath `root`.
@@ -90,28 +110,108 @@ fn index_catalog_images(
         force,
         retry_failed,
         limit,
+        index_videos,
+        thumbnail_database,
+        thumbnail_service,
     } = options;
     observer.on_event(IndexEvent::PhaseChanged(IndexPhase::ImageEmbedding));
+    let sources = pending_catalog_images(
+        catalog,
+        db,
+        assets,
+        &ImageIndexOptions {
+            force,
+            retry_failed,
+            limit,
+            index_videos,
+            thumbnail_database: thumbnail_database.clone(),
+            thumbnail_service: thumbnail_service.clone(),
+        },
+    )?;
+    tracing::Span::current().record("sources", sources.len());
+    observer.on_event(IndexEvent::Discovered {
+        count: sources.len(),
+    });
+    observer.on_event(IndexEvent::DiscoveryComplete {
+        total: sources.len(),
+    });
+    if sources.is_empty() {
+        return Ok(observer.is_cancelled());
+    }
+
+    if sources
+        .iter()
+        .any(|asset| asset.media_kind == MediaKind::Video)
+    {
+        thumbnail_service
+            .as_ref()
+            .context("video indexing requires a thumbnail service")?;
+    }
+
+    BoundedImagePipeline {
+        catalog,
+        db,
+        embedder,
+        observer,
+        thumbnails: thumbnail_service.as_ref(),
+    }
+    .run(sources)
+}
+
+/// Check the exact incremental selection before loading an image model.
+pub fn has_pending_catalog_images(
+    catalog: &AssetCatalog,
+    db: &ImageIndexDb,
+    assets: &[Asset],
+    options: &ImageIndexOptions,
+) -> Result<bool> {
+    Ok(!pending_catalog_images(catalog, db, assets, options)?.is_empty())
+}
+
+fn pending_catalog_images(
+    catalog: &AssetCatalog,
+    db: &ImageIndexDb,
+    assets: &[Asset],
+    options: &ImageIndexOptions,
+) -> Result<Vec<Asset>> {
     let images = assets
         .iter()
-        .filter(|asset| is_embedding_image(asset))
+        .filter(|asset| is_embedding_candidate(asset, options.index_videos))
         .cloned()
         .collect::<Vec<_>>();
-    let current = if force {
-        let asset_ids = images
-            .iter()
-            .map(|asset| asset.asset_id)
-            .collect::<Vec<_>>();
-        db.delete_assets(&asset_ids)?;
+    let current = if options.force {
+        // Retain the old complete set until its replacement is ready.
         HashSet::new()
     } else {
         let fingerprints = images
             .iter()
+            .filter(|asset| asset.media_kind == MediaKind::Image)
             .map(|asset| (asset.asset_id, asset.fingerprint))
             .collect::<Vec<_>>();
-        db.current_asset_ids(&fingerprints)?
+        let mut current = db.current_asset_ids(&fingerprints)?;
+        let videos = images
+            .iter()
+            .filter(|asset| asset.media_kind == MediaKind::Video)
+            .map(|asset| (asset.asset_id, asset.fingerprint))
+            .collect::<Vec<_>>();
+        let video_current = db.current_video_asset_ids(&videos)?;
+        if !video_current.is_empty() {
+            let cache = crate::thumbs::ThumbnailDb::new_read_only(
+                options
+                    .thumbnail_database
+                    .as_deref()
+                    .context("video indexing requires a thumbnail database")?,
+            )?;
+            current.extend(videos_with_complete_thumbnails(
+                db,
+                &cache,
+                &images,
+                &video_current,
+            )?);
+        }
+        current
     };
-    let decode_failed = if force || retry_failed {
+    let decode_failed = if options.force || options.retry_failed {
         HashSet::new()
     } else {
         let fingerprints = images
@@ -126,35 +226,45 @@ fn index_catalog_images(
             !current.contains(&asset.asset_id) && !decode_failed.contains(&asset.asset_id)
         })
         .collect::<Vec<_>>();
-    if let Some(limit) = limit {
+    if let Some(limit) = options.limit {
         sources.truncate(limit);
     }
-    tracing::Span::current().record("sources", sources.len());
-    observer.on_event(IndexEvent::Discovered {
-        count: sources.len(),
-    });
-    observer.on_event(IndexEvent::DiscoveryComplete {
-        total: sources.len(),
-    });
-    if sources.is_empty() {
-        return Ok(observer.is_cancelled());
-    }
-
-    BoundedImagePipeline {
-        catalog,
-        db,
-        embedder,
-        observer,
-    }
-    .run(sources)
+    Ok(sources)
 }
 
 fn is_embedding_image(asset: &Asset) -> bool {
-    asset.media_kind == MediaKind::Image
-        && matches!(
-            asset.media_format.as_str(),
-            "png" | "jpeg" | "gif" | "webp" | "bmp"
-        )
+    asset.media_kind == MediaKind::Video
+        || (asset.media_kind == MediaKind::Image
+            && matches!(
+                asset.media_format.as_str(),
+                "png" | "jpeg" | "gif" | "webp" | "bmp"
+            ))
+}
+
+fn is_embedding_candidate(asset: &Asset, index_videos: bool) -> bool {
+    is_embedding_image(asset) && (index_videos || asset.media_kind != MediaKind::Video)
+}
+
+fn videos_with_complete_thumbnails(
+    db: &ImageIndexDb,
+    cache: &crate::thumbs::ThumbnailDb,
+    assets: &[Asset],
+    vector_current: &HashSet<i64>,
+) -> Result<HashSet<i64>> {
+    let mut complete = HashSet::new();
+    let mut timestamps_by_asset = db.video_sample_timestamps_for_assets(vector_current)?;
+    for asset in assets
+        .iter()
+        .filter(|asset| vector_current.contains(&asset.asset_id))
+    {
+        let timestamps = timestamps_by_asset
+            .remove(&asset.asset_id)
+            .unwrap_or_default();
+        if cache.has_current_video_samples(asset, &timestamps)? {
+            complete.insert(asset.asset_id);
+        }
+    }
+    Ok(complete)
 }
 
 struct BoundedImagePipeline<'a> {
@@ -162,6 +272,7 @@ struct BoundedImagePipeline<'a> {
     db: &'a mut ImageIndexDb,
     embedder: &'a ImageEmbedder,
     observer: &'a dyn IndexObserver,
+    thumbnails: Option<&'a crate::thumbs::ThumbnailService>,
 }
 
 impl BoundedImagePipeline<'_> {
@@ -170,8 +281,8 @@ impl BoundedImagePipeline<'_> {
         let decode_workers = decode_worker_count().min(sources.len());
         // One normalized batch may wait while one batch is inferred. Decode workers use the
         // model-owned FastEmbed preprocessor, then discard their full-resolution source image.
-        let (outcome_sender, outcome_receiver) = bounded::<DecodeOutcome>(batch_size);
         let (abort_sender, abort_receiver) = bounded::<()>(1);
+        let abort_flag = Arc::new(AtomicBool::new(false));
         let next = AtomicUsize::new(0);
         let mut pending = Vec::with_capacity(batch_size);
         let mut fatal = None;
@@ -179,43 +290,55 @@ impl BoundedImagePipeline<'_> {
         let mut cancelled = false;
 
         std::thread::scope(|scope| {
-            let mut workers = Vec::with_capacity(decode_workers);
+            let (outcome_receiver, workers) = {
+                let (outcome_sender, outcome_receiver) = bounded::<DecodeOutcome>(batch_size);
+                let mut workers = Vec::with_capacity(decode_workers);
+                for _ in 0..decode_workers {
+                    let outcomes = outcome_sender.clone();
+                    let abort = abort_receiver.clone();
+                    let abort_flag = Arc::clone(&abort_flag);
+                    let sources = &sources;
+                    let next = &next;
+                    workers.push(scope.spawn(move || {
+                        guard_decode_worker(&outcomes, &abort, || {
+                            decode_sources(
+                                sources,
+                                next,
+                                self.embedder,
+                                self.observer,
+                                &outcomes,
+                                &abort,
+                                &abort_flag,
+                            );
+                        });
+                    }));
+                }
+                (outcome_receiver, workers)
+            };
             let mut abort_sender = Some(abort_sender);
-            for _ in 0..decode_workers {
-                let outcomes = outcome_sender.clone();
-                let abort = abort_receiver.clone();
-                let sources = &sources;
-                let next = &next;
-                workers.push(scope.spawn(move || {
-                    guard_decode_worker(&outcomes, &abort, || {
-                        decode_sources(
-                            sources,
-                            next,
-                            self.embedder,
-                            self.observer,
-                            &outcomes,
-                            &abort,
-                        );
-                    });
-                }));
-            }
-            drop(outcome_sender);
 
             while let Ok(outcome) = outcome_receiver.recv() {
                 if !cancelled && self.observer.is_cancelled() {
                     cancelled = true;
                     pending.clear();
+                    abort_flag.store(true, Ordering::Release);
                     abort_sender.take();
                 }
                 let stopping = cancelled || write_error.is_some() || fatal.is_some();
                 match outcome {
                     DecodeOutcome::Success(decoded) if !stopping => {
                         pending.push(decoded);
-                        if pending.len() == batch_size
-                            && let Err(error) =
-                                flush_batch(self.db, self.embedder, self.observer, &mut pending)
+                        if pending.iter().map(|item| item.pixels.len()).sum::<usize>() >= batch_size
+                            && let Err(error) = flush_batch(
+                                self.db,
+                                self.thumbnails,
+                                self.embedder,
+                                self.observer,
+                                &mut pending,
+                            )
                         {
                             write_error = Some(error);
+                            abort_flag.store(true, Ordering::Release);
                             abort_sender.take();
                         }
                     }
@@ -237,19 +360,20 @@ impl BoundedImagePipeline<'_> {
                             Ok(()) => report_failure(self.observer, asset.path, message),
                             Err(error) => {
                                 write_error = Some(error);
+                                abort_flag.store(true, Ordering::Release);
                                 abort_sender.take();
                             }
                         }
                     }
                     DecodeOutcome::Fatal(message) => {
                         fatal.get_or_insert(message);
+                        abort_flag.store(true, Ordering::Release);
                         abort_sender.take();
                     }
                     DecodeOutcome::Success(_) | DecodeOutcome::Failure { .. } => {}
                 }
             }
 
-            drop(abort_sender);
             for worker in workers {
                 if worker.join().is_err() {
                     fatal.get_or_insert_with(|| "an image decode worker panicked".to_owned());
@@ -265,7 +389,13 @@ impl BoundedImagePipeline<'_> {
         }
         cancelled |= self.observer.is_cancelled();
         if !cancelled {
-            flush_batch(self.db, self.embedder, self.observer, &mut pending)?;
+            flush_batch(
+                self.db,
+                self.thumbnails,
+                self.embedder,
+                self.observer,
+                &mut pending,
+            )?;
         }
         info!(
             decode_workers,
@@ -279,7 +409,9 @@ impl BoundedImagePipeline<'_> {
 
 struct DecodedImage {
     asset: Asset,
-    pixels: ndarray::Array3<f32>,
+    pixels: Vec<ndarray::Array3<f32>>,
+    sample_timestamps: Vec<i64>,
+    encoded_samples: Option<crate::thumbs::EncodedVideoSamples>,
 }
 
 enum DecodeOutcome {
@@ -296,8 +428,7 @@ fn decode_worker_count() -> usize {
     std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(1)
-        .saturating_sub(1)
-        .clamp(1, MAX_DECODE_WORKERS)
+        .div_ceil(2)
 }
 
 fn decode_sources(
@@ -307,6 +438,7 @@ fn decode_sources(
     observer: &dyn IndexObserver,
     outcomes: &Sender<DecodeOutcome>,
     abort: &Receiver<()>,
+    abort_flag: &Arc<AtomicBool>,
 ) {
     loop {
         if observer.is_cancelled() || aborted(abort) {
@@ -320,15 +452,30 @@ fn decode_sources(
             path: asset.path.clone(),
             active: true,
         });
-        let outcome = match prepare_image(
-            &asset.path,
-            embedder.model().is_deepghs(),
-            |image| embedder.preprocess_image(image),
-        ) {
-            Ok(pixels) => DecodeOutcome::Success(DecodedImage {
+        let preparation = if asset.media_kind == MediaKind::Video {
+            prepare_video(
+                asset,
+                embedder,
+                observer.cancellation_token(),
+                Arc::clone(abort_flag),
+                || observer.is_cancelled() || aborted(abort),
+            )
+        } else {
+            prepare_image(&asset.path, embedder.model().is_deepghs(), |image| {
+                embedder.preprocess_image(image)
+            })
+            .map(|pixels| DecodedImage {
                 asset: asset.clone(),
-                pixels,
-            }),
+                pixels: vec![pixels],
+                sample_timestamps: Vec::new(),
+                encoded_samples: None,
+            })
+        };
+        if observer.is_cancelled() || aborted(abort) {
+            break;
+        }
+        let outcome = match preparation {
+            Ok(decoded) => DecodeOutcome::Success(decoded),
             Err(PreparationError::Decode(error))
                 if crate::index::is_missing_source_error(&error) =>
             {
@@ -338,7 +485,9 @@ fn decode_sources(
             Err(PreparationError::Decode(error)) => DecodeOutcome::Failure {
                 asset: asset.clone(),
                 message: format!("decoding image for embedding failed: {error:#}"),
-                cache_decode_failure: true,
+                // Video timeouts and codec limitations must remain retryable, and must
+                // never poison the shared still-image/OCR decode-failure cache.
+                cache_decode_failure: asset.media_kind == MediaKind::Image,
             },
             Err(PreparationError::Preprocess(error)) => DecodeOutcome::Failure {
                 asset: asset.clone(),
@@ -386,8 +535,53 @@ fn prepare_image(
     preprocess(image).map_err(PreparationError::Preprocess)
 }
 
+fn prepare_video(
+    asset: &Asset,
+    embedder: &ImageEmbedder,
+    cancellation_token: Option<Arc<AtomicBool>>,
+    abort_flag: Arc<AtomicBool>,
+    cancelled: impl Fn() -> bool,
+) -> Result<DecodedImage, PreparationError> {
+    let span = debug_span!("video_prepare", asset_id = asset.asset_id, path = %asset.path);
+    let _entered = span.enter();
+    let samples = crate::video::samples_with_token(
+        &asset.path,
+        crate::video::SAMPLE_MAX_EDGE,
+        cancellation_token.unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
+        abort_flag,
+        cancelled,
+    )
+    .map_err(PreparationError::Decode)?;
+    let pixels = {
+        let span = debug_span!("video_preprocess", path = %asset.path, samples = samples.len());
+        let _entered = span.enter();
+        samples
+            .iter()
+            .map(|sample| {
+                let image = RgbImage::from_raw(
+                    sample.raster.width(),
+                    sample.raster.height(),
+                    sample.raster.pixels().to_vec(),
+                )
+                .context("assembling video sample for inference")?;
+                embedder.preprocess_image(image)
+            })
+            .collect::<Result<Vec<_>>>()
+            .map_err(PreparationError::Preprocess)?
+    };
+    let encoded_samples = crate::thumbs::encode_video_samples(asset, &samples)
+        .map_err(PreparationError::Preprocess)?;
+    Ok(DecodedImage {
+        asset: asset.clone(),
+        pixels,
+        sample_timestamps: samples.iter().map(|sample| sample.timestamp_ms).collect(),
+        encoded_samples: Some(encoded_samples),
+    })
+}
+
 fn flush_batch(
     db: &mut ImageIndexDb,
+    thumbnails: Option<&crate::thumbs::ThumbnailService>,
     embedder: &ImageEmbedder,
     observer: &dyn IndexObserver,
     pending: &mut Vec<DecodedImage>,
@@ -395,46 +589,95 @@ fn flush_batch(
     if pending.is_empty() {
         return Ok(());
     }
-    let batch = std::mem::take(pending);
-    let (assets, pixels): (Vec<_>, Vec<_>) = batch
-        .into_iter()
-        .map(|decoded| (decoded.asset, decoded.pixels))
-        .unzip();
-    let vectors = match embedder.embed_preprocessed_images(pixels) {
+    let mut batch = std::mem::take(pending);
+    let counts = batch
+        .iter()
+        .map(|decoded| decoded.pixels.len())
+        .collect::<Vec<_>>();
+    let pixels = batch
+        .iter_mut()
+        .flat_map(|decoded| std::mem::take(&mut decoded.pixels))
+        .collect::<Vec<_>>();
+    // Never exceed the model's batch limit even when a video yields several inputs.
+    let vectors = match embed_sample_batches(embedder, observer, pixels) {
         Ok(vectors) => vectors,
         Err(error) => {
             let message = format!("image embedding inference failed: {error:#}");
-            for asset in assets {
+            for decoded in &batch {
+                let asset = &decoded.asset;
                 observer.on_event(IndexEvent::ActiveAsset {
                     path: asset.path.clone(),
                     active: false,
                 });
-                report_failure(observer, asset.path, message.clone());
+                report_failure(observer, asset.path.clone(), message.clone());
             }
             return Err(error).context("running the image embedding batch");
         }
     };
-    let attempted = assets.len();
-    let active_paths = assets
+    let attempted = batch.len();
+    let active_paths = batch
         .iter()
-        .map(|asset| asset.path.clone())
+        .map(|decoded| decoded.asset.path.clone())
         .collect::<Vec<_>>();
-    let items = assets
-        .into_iter()
-        .zip(vectors)
-        .map(|(asset, vector)| StoredImageEmbedding {
-            asset_id: asset.asset_id,
-            path: asset.path,
-            fingerprint: asset.fingerprint,
-            vector,
-        })
-        .collect();
-    let stored = db.save_embeddings(items)?;
+    let mut vectors = vectors.into_iter();
+    let mut images = Vec::new();
+    let mut stored = 0;
+    let mut reported_failures = 0;
+    for (decoded, count) in batch.into_iter().zip(counts) {
+        let asset = decoded.asset;
+        let sample_vectors = vectors.by_ref().take(count).collect::<Vec<_>>();
+        if observer.is_cancelled() {
+            break;
+        }
+        let current = std::fs::metadata(&asset.path)
+            .ok()
+            .and_then(|metadata| crate::assets::SourceFingerprint::from_metadata(&metadata).ok());
+        if current != Some(asset.fingerprint) {
+            reported_failures += 1;
+            report_failure(
+                observer,
+                asset.path,
+                "source changed during visual indexing; retry on next scan".to_owned(),
+            );
+            continue;
+        }
+        if asset.media_kind == MediaKind::Video {
+            thumbnails
+                .context("video indexing requires thumbnail storage")?
+                .store_encoded_video_samples(
+                    asset.clone(),
+                    decoded
+                        .encoded_samples
+                        .context("video samples were not encoded")?,
+                )?;
+            let samples = decoded
+                .sample_timestamps
+                .into_iter()
+                .zip(sample_vectors)
+                .collect();
+            db.save_video_embeddings(&asset, samples)?;
+            stored += 1;
+        } else {
+            let vector = sample_vectors
+                .into_iter()
+                .next()
+                .context("image inference returned no vector")?;
+            images.push(StoredImageEmbedding {
+                asset_id: asset.asset_id,
+                path: asset.path,
+                fingerprint: asset.fingerprint,
+                vector,
+            });
+        }
+    }
+    if !observer.is_cancelled() {
+        stored += db.save_embeddings(images)?;
+    }
     observer.on_event(IndexEvent::Progress(IndexProgressDelta {
-        processed: attempted,
-        phase_completed: attempted,
+        processed: attempted - reported_failures,
+        phase_completed: attempted - reported_failures,
         embedded: stored,
-        skipped: attempted - stored,
+        skipped: attempted - stored - reported_failures,
         ..IndexProgressDelta::default()
     }));
     for path in active_paths {
@@ -445,6 +688,29 @@ fn flush_batch(
     }
     debug!(stored, "saved an image embedding batch");
     Ok(())
+}
+
+fn embed_sample_batches(
+    embedder: &ImageEmbedder,
+    observer: &dyn IndexObserver,
+    pixels: Vec<ndarray::Array3<f32>>,
+) -> Result<Vec<Vec<f32>>> {
+    let mut pixels = pixels.into_iter();
+    let mut vectors = Vec::new();
+    loop {
+        if observer.is_cancelled() {
+            return Ok(Vec::new());
+        }
+        let chunk = pixels
+            .by_ref()
+            .take(embedder.max_batch_size())
+            .collect::<Vec<_>>();
+        if chunk.is_empty() {
+            break;
+        }
+        vectors.extend(embedder.embed_preprocessed_images(chunk)?);
+    }
+    Ok(vectors)
 }
 
 fn report_failure(observer: &dyn IndexObserver, path: PathBuf, message: String) {
@@ -466,6 +732,60 @@ fn guard_decode_worker(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn video_override_keeps_images_eligible_but_skips_video_frames() -> Result<()> {
+        let temp = TempDir::new()?;
+        let root = PathBuf::from("C:/gallery");
+        let rows = vec![
+            (1, root.join("photo.png"), 10, None, 100),
+            (2, root.join("movie.mp4"), 10, None, 100),
+        ];
+        let database = catalog_with_rows(&temp, &rows)?;
+        Connection::open(&database)?.execute(
+            "UPDATE assets SET media_kind = 'video' WHERE asset_id = 2",
+            [],
+        )?;
+        let catalog = AssetCatalog::new(&database)?;
+        let assets = catalog.under_root(&root)?;
+        assert_eq!(
+            assets
+                .iter()
+                .filter(|asset| is_embedding_candidate(asset, true))
+                .count(),
+            2
+        );
+        assert_eq!(
+            assets
+                .iter()
+                .filter(|asset| is_embedding_candidate(asset, false))
+                .count(),
+            1
+        );
+        let index = image_index_with_vectors(
+            &temp,
+            2,
+            &[(1, root.join("photo.png"), 10, 100, vec![1.0, 0.0])],
+        )?;
+        let images = ImageIndexDb::new(&index, 2)?;
+        let options = ImageIndexOptions {
+            index_videos: false,
+            ..ImageIndexOptions::default()
+        };
+        assert!(!has_pending_catalog_images(
+            &catalog, &images, &assets, &options
+        )?);
+        assert!(has_pending_catalog_images(
+            &catalog,
+            &images,
+            &assets,
+            &ImageIndexOptions {
+                index_videos: true,
+                ..ImageIndexOptions::default()
+            }
+        )?);
+        Ok(())
+    }
 
     #[test]
     fn coverage_excludes_stale_vectors_videos_and_other_roots() -> Result<()> {
@@ -501,7 +821,7 @@ mod tests {
         });
         let index = image_index_with_vectors(&temp, 2, &vectors)?;
         let db = ImageIndexDb::new_read_only(&index, 2, &catalog)?;
-        assert_eq!(db.coverage(&SearchFilters::new(&root))?, (4, 1));
+        assert_eq!(db.coverage(&SearchFilters::new(&root))?, (5, 1));
         assert_eq!(
             db.coverage(&SearchFilters::new(Path::new("C:/empty")))?,
             (0, 0)
@@ -518,9 +838,7 @@ mod tests {
             crate::imaging::test_support::jpeg_with_orientation(1)?,
         )?;
         assert!(matches!(
-            prepare_image(&path, false, |_| anyhow::bail!(
-                "model transform failed"
-            )),
+            prepare_image(&path, false, |_| anyhow::bail!("model transform failed")),
             Err(PreparationError::Preprocess(_))
         ));
         std::fs::write(&path, b"invalid image")?;

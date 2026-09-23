@@ -1,6 +1,6 @@
 //! Image embedding jobs.
 
-use super::{AppState, extract::ApiQuery, run_blocking};
+use super::{AppState, Databases, extract::ApiQuery, run_blocking};
 use crate::api::jobs::cancel_if;
 use axum::{
     Json,
@@ -12,9 +12,11 @@ use nicegal_core::assets::{Asset, AssetCatalog};
 use nicegal_core::db::SearchFilters;
 use nicegal_core::embedding::ImageEmbedder;
 use nicegal_core::image_index::{
-    ImageIndexDb, ImageIndexOptions, index_catalog_images_observed, index_images_observed,
+    ImageIndexDb, ImageIndexOptions, has_pending_catalog_images, index_catalog_images_observed,
+    index_images_observed,
 };
 use nicegal_core::index::IndexObserver;
+use nicegal_core::thumbs::ThumbnailService;
 use serde::{Deserialize, Serialize};
 
 use super::error::ApiError;
@@ -64,6 +66,7 @@ pub(crate) struct Spec {
     force: bool,
     retry_failed: bool,
     debug_limit: Option<usize>,
+    index_videos: bool,
 }
 
 impl Spec {
@@ -71,12 +74,14 @@ impl Spec {
         root: PathBuf,
         retry_failed: bool,
         debug_limit: Option<usize>,
+        index_videos: bool,
     ) -> Self {
         Self {
             root,
             force: false,
             retry_failed,
             debug_limit,
+            index_videos,
         }
     }
 }
@@ -93,23 +98,27 @@ pub(crate) fn prepare(request: Request) -> Result<Spec, ApiError> {
         force: request.force,
         retry_failed: false,
         debug_limit: request.debug_limit,
+        index_videos: true,
     })
 }
 
 pub(crate) fn run(
     spec: Spec,
-    asset_database: &PathBuf,
-    image_database: &PathBuf,
+    databases: &Databases,
+    thumbnails: &ThumbnailService,
     embedder: &ImageEmbedder,
     observer: &dyn IndexObserver,
     catalog: Option<&[Asset]>,
 ) -> anyhow::Result<()> {
-    let assets = AssetCatalog::new(asset_database)?;
-    let mut images = ImageIndexDb::new(image_database, embedder.dimensions())?;
+    let assets = AssetCatalog::new(&databases.assets)?;
+    let mut images = ImageIndexDb::new(&databases.images, embedder.dimensions())?;
     let options = ImageIndexOptions {
         force: spec.force,
         retry_failed: spec.retry_failed,
+        index_videos: spec.index_videos,
         limit: spec.debug_limit,
+        thumbnail_database: Some(databases.thumbnails.clone()),
+        thumbnail_service: Some(thumbnails.clone()),
     };
     match catalog {
         Some(catalog) => index_catalog_images_observed(
@@ -131,6 +140,42 @@ pub(crate) fn run(
         ),
     }
     .and_then(cancel_if)
+}
+
+/// Use the same candidate selection as the embedding pass before preparing its model.
+pub(crate) fn has_pending(
+    spec: &Spec,
+    databases: &Databases,
+    dimensions: usize,
+    catalog: Option<&[Asset]>,
+) -> anyhow::Result<bool> {
+    tracing::debug!("checking pending image embeddings");
+    let assets = AssetCatalog::new_read_only(&databases.assets)?;
+    let images = ImageIndexDb::new_read_only(&databases.images, dimensions, &databases.assets)?;
+    tracing::debug!("opened read-only embedding selection databases");
+    let owned;
+    let catalog = match catalog {
+        Some(catalog) => catalog,
+        None => {
+            owned = assets.under_root(&spec.root)?;
+            &owned
+        }
+    };
+    let pending = has_pending_catalog_images(
+        &assets,
+        &images,
+        catalog,
+        &ImageIndexOptions {
+            force: spec.force,
+            retry_failed: spec.retry_failed,
+            index_videos: spec.index_videos,
+            limit: spec.debug_limit,
+            thumbnail_database: Some(databases.thumbnails.clone()),
+            thumbnail_service: None,
+        },
+    )?;
+    tracing::debug!(pending, "checked pending image embeddings");
+    Ok(pending)
 }
 
 #[cfg(test)]

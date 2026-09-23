@@ -104,12 +104,18 @@ def runtime_packages() -> list[dict]:
             raise ValueError(f"Missing pinned runtime notice snapshot: {snapshot.name}")
         entry["notices"] = collect_notices(snapshot)
         packages.append(entry)
-    packages.append({
+    packages.extend([{
         "name": "Microsoft DirectML",
         "version": "Bundled with onnxruntime-directml (Windows)",
         "license": "Microsoft Software License Terms (DirectML)",
         "url": "https://www.nuget.org/packages/Microsoft.AI.DirectML/1.15.4/License",
-    })
+    }, {
+        "name": "FFmpeg",
+        "version": "9.0.1",
+        "license": " LGPL-2.1-or-later",
+        "url": "https://ffmpeg.org/",
+        "notices": collect_notices(ROOT / "third-party-notices" / "ffmpeg-9.0.1"),
+    }])
     return packages
 
 
@@ -121,7 +127,9 @@ def main() -> None:
     result = subprocess.run(
         command, cwd=ROOT, check=True, capture_output=True, text=True, encoding="utf-8"
     )
-    metadata = json.loads(result.stdout)
+    # The Windows build wrapper prints the Visual Studio environment banner before
+    # forwarding Cargo's JSON output.
+    metadata = json.loads(result.stdout[result.stdout.index("{"):])
     own_packages = {"nicegal-core", "nicegal-cli", "nicegal-server"}
     packages = []
     for package in metadata["packages"]:

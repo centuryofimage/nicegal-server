@@ -25,6 +25,13 @@ pub(super) struct ReconcileScope {
     limited: bool,
 }
 
+pub(super) enum ReconcileInput<'a> {
+    /// A full catalog pass returns every visited asset.
+    Scanned(&'a [nicegal_core::assets::Asset]),
+    /// A delta pass returns only paths that the completed walk did not visit.
+    UnseenPaths(&'a [PathBuf]),
+}
+
 impl ReconcileScope {
     pub(super) fn new(root: PathBuf, options: &IndexOptions) -> Self {
         Self {
@@ -57,7 +64,7 @@ pub(super) fn reconcile(
     databases: &super::Databases,
     image_dimensions: usize,
     thumbnails: &ThumbnailService,
-    scanned: &[nicegal_core::assets::Asset],
+    input: ReconcileInput<'_>,
     observer: &dyn IndexObserver,
 ) -> anyhow::Result<()> {
     cancel_if(observer.is_cancelled())?;
@@ -67,11 +74,19 @@ pub(super) fn reconcile(
     scope.root = nicegal_core::assets::canonicalize_path(&scope.root)?;
     ensure_root_available(&scope.root)?;
     let mut assets = AssetCatalog::new(&databases.assets)?;
-    let seen = scanned
-        .iter()
-        .map(|asset| asset.asset_id)
-        .collect::<Vec<_>>();
-    let candidates = assets.unseen_under_root(&scope.root, seen)?;
+    let candidates = match input {
+        ReconcileInput::Scanned(scanned) => {
+            let seen = scanned.iter().map(|asset| asset.asset_id).collect::<Vec<_>>();
+            assets.unseen_under_root(&scope.root, seen)?
+        }
+        ReconcileInput::UnseenPaths(paths) => paths
+            .iter()
+            .map(|path| assets.get_by_path(path))
+            .collect::<anyhow::Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect(),
+    };
     let mut missing = Vec::new();
     // Complete all filesystem checks before deleting any row. An inaccessible subtree must not
     // turn a partial check into a partial automatic purge.
@@ -460,7 +475,7 @@ mod tests {
                 &self.databases,
                 512,
                 &self.thumbnails,
-                &[],
+                ReconcileInput::Scanned(&[]),
                 observer,
             )
             .map(|()| false)

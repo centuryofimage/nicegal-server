@@ -1,5 +1,3 @@
-- Clean out dead code
-- Upgrade electron to 44.4.3 to fix a bug
-- Cleanup onboarding and hide app internals
-- Refactor internals
-- Add shortcuts for search and info panel
+- Add videos to the gallery with thumbnails, metadata, playback, visual search, an Images/Videos filter, and a setting to control video indexing.
+- Simplify library syncing and make indexing progress clearer, including while videos are being processed.
+- Update Windows, Linux, and macOS builds to bundle FFmpeg for video support.

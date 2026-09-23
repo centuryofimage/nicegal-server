@@ -13,14 +13,14 @@ Electron owns the configured database paths. Rust owns catalog and metadata poli
 | --- | --- |
 | Enumerate/sort the library | `GET /v1/catalog?root=...&timeline=modified\|capture` |
 | Count a library | `GET /v1/catalog/count?root=...` |
-| Inspect a photo | `GET /v1/catalog/metadata?assetId=...` |
+| Inspect a photo or video | `GET /v1/catalog/metadata?assetId=...` |
 | Poll for catalog changes | `GET /v1/catalog/revision` |
 | Load thumbnail blobs | Read-only SQLite on `thumbnails.db`, normally behind `thumb://` |
 | Search OCR text or indexed images (one mode) | `GET /v1/search` |
 | Search several ways at once | `POST /v1/search` |
 | Underline what matched in an OCR result | `highlights`, see [Highlights](#highlights) |
 | Check vector-search coverage | `GET /v1/text-embeddings` |
-| Check image-search coverage | `GET /v1/image-embeddings?root=...` — `{total,indexed}`; cataloged images and current vectors for the active image model, excluding videos and stale fingerprints |
+| Check visual-search coverage | `GET /v1/image-embeddings?root=...` — `{total,indexed}`; cataloged images and videos with current vectors for the active image model, excluding stale fingerprints |
 | Start, monitor, and cancel work | `/v1/jobs` |
 | Backfill thumbnail variants | `POST /v1/thumbnails/generate`, then poll the returned job |
 | Explicitly backfill OCR text embeddings | `POST /v1/text-embeddings/generate`, then poll the returned job |
@@ -110,10 +110,10 @@ are part of the desktop read contract. Any table or column shape change requires
 bump; readers should reject versions they do not support.
 
 Writable startup connections apply supported migrations in one transaction. Asset catalog
-versions 2–4 upgrade to 5; OCR version 8 upgrades to 9. Read-only connections require the
+versions 2–5 upgrade to 6; OCR version 8 upgrades to 9. Read-only connections require the
 current version and never migrate. Unsupported versions are rejected without changes.
 
-## Asset catalog schema (version 5)
+## Asset catalog schema (version 6)
 
 The asset catalog owns canonical identity. `asset_id` is stable across rescans and source changes
 because updates conflict on the unique absolute path without replacing the row.
@@ -150,16 +150,15 @@ CREATE TABLE catalog_meta(
 );
 ```
 
-As of 2026-09-13, scans and catalog upserts accept images only (PNG, JPEG, GIF, WebP, BMP).
-This supersedes the earlier video-path cataloging behavior: video thumbnailing is unsupported,
-so videos are excluded rather than presented as broken tiles. Existing `video` rows remain on
-disk for compatibility but are omitted from catalog lookups, lists, timelines, and counts.
-No source files or catalog databases are deleted/rebuilt. `media_kind` returned by the catalog
-API is therefore `image`; the legacy database value `video` is still understood internally.
-Image dimensions, GIF frame count, and duration are
-best-effort. `exif_taken_ns` is Unix nanoseconds parsed from `DateTimeOriginal`, including
+Scans and catalog upserts accept PNG, JPEG, GIF, WebP, and BMP images, plus MP4, M4V, MOV, MKV,
+WebM, AVI, MPG, MPEG, TS, and M2TS videos. Lookups, listings, timelines, and counts include both
+media kinds. Image dimensions, GIF frame count, and duration are best-effort. Video dimensions,
+frame count, and duration are probed from the container; unsupported or corrupt videos remain in
+the catalog with unknown optional metadata. For images, `exif_taken_ns` is Unix nanoseconds parsed from `DateTimeOriginal`, including
 `SubSecTimeOriginal` and `OffsetTimeOriginal` when present; an absent EXIF offset deterministically
-means UTC. Probe failure leaves optional columns null and does not remove the image. GIF posters
+means UTC. For videos the same capture-timeline column holds container `creation_time` only when
+it parses as RFC 3339; the inspector labels this as video metadata, separate from EXIF. Probe
+failure leaves optional columns null and does not remove the asset. GIF posters
 are static PNGs produced from the first decoded/composited frame; original animated GIF bytes
 never belong in the thumbnail database.
 
@@ -184,7 +183,8 @@ transaction as every changed catalog row and does not change for an unchanged fi
 
 ## OCR schema (version 9)
 
-OCR is a derived store. It receives `asset_id` from the catalog and never allocates gallery IDs.
+OCR is a derived store for eligible images only. Videos are excluded even during force, rescan,
+and retry. It receives `asset_id` from the catalog and never allocates gallery IDs.
 `source_path` is denormalized only for directory filtering and cleanup.
 
 ```sql
@@ -279,9 +279,9 @@ is downloaded into the standard Hugging Face cache on first use and reused on su
 Its 384-dimensional normalized vectors are stored with the stable model identifier
 `BAAI/bge-small-en-v1.5`.
 
-### Image embedding index (version 1)
+### Image embedding index (version 3)
 
-Image ingestion and search are independent of OCR and use one database per model. MetaCLIP2 B/32
+Visual ingestion and search are independent of OCR and use one database per model. MetaCLIP2 B/32
 is the default; its normalized 512-wide vectors are stored in
 `facebook-metaclip-2-worldwide-b32.db`. Text requests to `type=image` use the active model's paired
 text encoder in the same vector space. It is deliberately loaded on CPU: an image query is one
@@ -297,20 +297,43 @@ CREATE TABLE image_embedding_state(
     asset_id INTEGER PRIMARY KEY,
     source_path TEXT NOT NULL,
     source_modified_ns INTEGER NOT NULL,
-    source_size INTEGER NOT NULL
+    source_size INTEGER NOT NULL,
+    sampling_version INTEGER NOT NULL DEFAULT 0
 );
 CREATE VIRTUAL TABLE image_embeddings USING vec0(
-    asset_id INTEGER PRIMARY KEY,
+    embedding_id INTEGER PRIMARY KEY,
+    asset_id INTEGER,
+    +timestamp_ms INTEGER,
     embedding FLOAT[512] distance_metric=cosine
 );
+CREATE TABLE image_embedding_samples(
+    embedding_id INTEGER PRIMARY KEY,
+    asset_id INTEGER NOT NULL,
+    timestamp_ms INTEGER
+);
+CREATE INDEX image_embedding_samples_asset_idx
+    ON image_embedding_samples(asset_id, timestamp_ms);
+CREATE INDEX image_embedding_video_samples_idx
+    ON image_embedding_samples(asset_id, timestamp_ms) WHERE timestamp_ms IS NOT NULL;
 ```
 
-The state fingerprint comes directly from the asset catalog. A small decode pool feeds one bounded
-batch of decoded RGB images ahead of a single FastEmbed/ONNX inference lane. FastEmbed applies the
-CLIP preprocessor and submits `[B, 3, 224, 224]`; full batches use `B = 8`, while the final partial
-batch may be smaller. ONNX Runtime owns model execution threading.
+The state fingerprint comes directly from the asset catalog. `sampling_version` is zero for still
+images and the current video sampling policy version for videos. Each still has one vector with
+null `timestamp_ms`; each video can have several vectors sharing its `asset_id`, each with the
+actual sampled presentation timestamp. `embedding_id` is the `vec0` row identifier. The ordinary
+sample table gives per-asset and video-timestamp reads indexed keys without scanning the vector
+table. A video's vectors, sample keys, and state are replaced together in one transaction. Search
+scores current samples, picks each asset's lowest-distance sample before
+applying the result limit or counting `total`, and returns one hit per asset with the winning
+`timestampMs` for videos. Coverage counts assets, not sample vectors.
 
-## Thumbnail schema (version 3)
+A small decode pool feeds bounded batches of RGB image and video samples ahead of a single
+FastEmbed/ONNX inference lane. FastEmbed applies the CLIP preprocessor and submits
+`[B, 3, 224, 224]`; full batches use `B = 8`, while the final partial batch may be smaller.
+ONNX Runtime owns model execution threading. Video samples are decoded by the shared bounded
+FFmpeg service described in [FFMPEG.md](FFMPEG.md); videos never enter OCR.
+
+## Thumbnail schema (version 4)
 
 Thumbnails are static derived artifacts. Fixed maximum-edge buckets are 128, 256, 512, and 1024
 physical pixels. `generator_version` invalidates generator changes independently from UI size
@@ -328,6 +351,19 @@ CREATE TABLE thumbnails(
     encoding TEXT NOT NULL CHECK(encoding IN ('image/jpeg', 'image/png', 'image/webp')),
     data BLOB NOT NULL,
     PRIMARY KEY(asset_id, size_bucket, generator_version)
+) WITHOUT ROWID;
+CREATE TABLE video_thumbnails(
+    asset_id INTEGER NOT NULL CHECK(asset_id > 0),
+    timestamp_ms INTEGER NOT NULL CHECK(timestamp_ms >= 0),
+    size_bucket INTEGER NOT NULL CHECK(size_bucket IN (128, 256, 512, 1024)),
+    sampling_version INTEGER NOT NULL CHECK(sampling_version > 0),
+    source_modified_ns INTEGER NOT NULL,
+    source_size INTEGER NOT NULL CHECK(source_size >= 0),
+    width INTEGER NOT NULL CHECK(width > 0),
+    height INTEGER NOT NULL CHECK(height > 0),
+    encoding TEXT NOT NULL CHECK(encoding IN ('image/jpeg', 'image/png', 'image/webp')),
+    data BLOB NOT NULL,
+    PRIMARY KEY(asset_id, timestamp_ms, size_bucket)
 ) WITHOUT ROWID;
 ```
 
@@ -349,10 +385,16 @@ LIMIT 1;
 
 This chooses the smallest adequate current bucket, then the largest current smaller fallback.
 Changing display size only changes `:requested_size`; it does not invalidate stored variants.
-Every thumbnail column shown above is a stable direct-read surface.
+Every `thumbnails` column shown above remains the stable direct-read surface for the desktop.
+Video embedding ingestion eagerly stores every sampled frame in `video_thumbnails` at every
+bucket, keyed by asset, actual timestamp, and bucket; reads also require the current source
+fingerprint and sampling version. The first sample is copied into `thumbnails` as the gallery
+poster, so the existing Electron reader still finds it. The matched frame is fetched separately
+with `GET /v1/thumbnails?timestampMs=...`. The two databases commit separately: thumbnails are
+stored before vectors, and a failed or interrupted indexing attempt can be retried.
 
-Generator version 1 creates variants lazily by default. A library index job catalogs and OCRs media
-without generating thumbnails; the gallery calls the synchronous ensure endpoint for its visible
+Generator version 1 creates still-image variants lazily by default. A library index job catalogs
+media and OCRs eligible images; the gallery calls the synchronous ensure endpoint for its visible
 image IDs. Full-library generation remains available through the thumbnail backfill job. Still images are
 decoded once per asset for all missing buckets; opaque results are JPEG quality 85 and alpha-bearing
 results are PNG. GIFs remain static PNG first-frame posters. A failed thumbnail decode is recorded
@@ -397,7 +439,8 @@ Version 1 routes:
   provider and model selections through its shared backend restart flow, leaving
   the app open. Updates are rejected while a job is active.
 - `GET /v1/catalog?root=<absolute-root>&timeline=modified|capture` returns the desktop gallery
-  array. `timeline` defaults to modified; capture falls back to modified when EXIF time is absent.
+  array, including videos. `timeline` defaults to modified; capture falls back to modified when
+  image EXIF or video container creation time is absent.
   Both sorts descend with asset ID as the descending tie-breaker. Root matching uses literal path
   boundaries (not SQL wildcards); trailing separators are accepted. Reads do not stat the root,
   so offline libraries still show saved rows. Each row has `id`, `path`, `displayName`, `extension`,
@@ -408,9 +451,11 @@ Version 1 routes:
   `GET /v1/catalog/revision` returns a decimal-string revision.
 - `GET /v1/catalog/metadata?assetId=<positive-id>` returns `{asset, file, ocrState, ocrText,
   textState, imageIndexed, decodeFailed}`. `asset` has the gallery shape above. `file` contains `sourceState`
-  (`current`, `changed`, `missing`, `unavailable`), Windows `attributes`, selected EXIF fields as
-  `{label,value}` pairs, and a nullable diagnostic `error`. Detailed file probing happens on demand;
-  changed sources omit EXIF instead of mixing live camera data with saved catalog dimensions.
+  (`current`, `changed`, `missing`, `unavailable`), Windows `attributes`, selected image `exif`
+  and video `video` fields as separate `{label,value}` arrays, and a nullable diagnostic `error`.
+  Video fields include codec, frame rate, bit rate, container creation time, title, and HDR indication
+  when available. Detailed file probing happens on demand; changed sources omit probe fields
+  instead of mixing live data with saved catalog dimensions.
   Unsupported/no EXIF is an empty list, not a failure. Field text is bounded to 4096 characters.
   `ocrText` is the complete OCR result for the current source fingerprint, or null when OCR has
   not indexed the current file; a successful image with no recognized text returns an empty string.
@@ -420,7 +465,7 @@ Version 1 routes:
   `decodeFailed` means this exact catalog fingerprint has a recorded decode failure. Other past
   job errors are not a durable per-asset error history. Index status describes the catalog snapshot;
   `file.sourceState` separately reports source changes since the last scan. No model is loaded.
-  Unknown IDs return `asset_not_found`. No database schema or migration is added.
+  Unknown IDs return `asset_not_found`.
 - `GET /v1/assets?path=<absolute-path>` resolves the path before lookup and returns the canonical
   catalog record. It includes the full `path` plus zero-I/O path derivatives (`displayName`,
   `folderPath`, and `extension`), media metadata, `exifTakenNs`, `sourceCreatedNs`, and the current
@@ -433,14 +478,17 @@ Version 1 routes:
   a root, so the renderer can resolve visible search/gallery rows in bounded batches.
 - `GET /v1/search?q=<query>&type=vector|image|simple|match|glob|regex&root=<absolute-path>&limit=<n>`
   runs **one** mode and returns
-  `{total, results: [{assetId, snippet, rank, distance?, highlights?}]}`. `total`
+  `{total, results: [{assetId, timestampMs?, snippet, rank, distance?, highlights?}]}`. `total`
   counts all matches before the requested result cap; the default cap is 100,000 and the maximum is
   250,000. `rank` is the 1-based position in this mode's own ranking. `distance` is present only for
   `type=vector` and `type=image` and is a cosine distance (0 identical, 1 orthogonal, 2 opposite)
   in that mode's distinct vector space. `type=vector` searches OCR-text vectors; `type=image`
   embeds `q` with the active image model's paired CPU text encoder and searches that model's current
-  image vectors. Image hits have an empty `snippet` and no `highlights`;
-  resolve their image metadata through `POST /v1/assets`. Simple and match text modes retain FTS
+  image and video sample vectors. Image hits have an empty `snippet` and no `highlights`; video
+  hits carry the best-matching sample's actual `timestampMs` (still-image hits omit it). There is
+  one hit per asset, and `total` counts assets after choosing each video's best sample. Resolve
+  metadata through `POST /v1/assets` and use the timestamp for an exact matched-frame thumbnail.
+  Simple and match text modes retain FTS
   rank order; glob ranks assets by matching-token count, then recency. For
   `type=glob`, `q` is matched case-insensitively against each complete OCR word token: `*` matches
   any number of characters and `?` matches one. Thus `dre*` is a word-prefix search (it does not
@@ -473,11 +521,13 @@ Version 1 routes:
 - `POST /v1/jobs` starts a typed background job and returns `202 Accepted`. Types are
   `modelPrepare`, `ocrModelLoad`, `libraryIndex`, `catalogSync`, `thumbnailGenerate`, `textEmbed`, `imageEmbed`,
   `pruneMissing`, and `libraryPurge`
-- `catalogSync` accepts `{root, image?:boolean, scan?:{recursive?,exclude?,debugLimit?,newOnly?}}`.
-  `newOnly:true` still enumerates directory entries to find new paths, but skips filesystem
-  metadata reads and catalog writes for paths already stored. It never reconciles missing files
-  or updates changed existing files. With `image:true`, newly cataloged images are passed to CLIP
+- `catalogSync` accepts `{root, image?:boolean, scan?:{recursive?,exclude?,debugLimit?}}`.
+  It walks the requested scope once, compares cataloged paths with filesystem metadata, and
+  catalogs only new or changed files. After a complete walk it verifies unseen catalog paths and
+  removes confirmed missing assets from the catalog and derived stores. An incomplete or limited
+  walk never deletes unseen assets. With `image:true`, new or changed images are passed to CLIP
   in the same job without another directory scan; no OCR or text embedding runs.
+  For older installed frontends, `scan.newOnly` is accepted but ignored.
 - `GET /v1/jobs` lists the active and retained recent jobs
 - `GET /v1/jobs/<job-id>` returns one job's current state and progress
 - `GET /v1/jobs/<job-id>/events` streams `snapshot` server-sent events whenever job state changes
@@ -501,6 +551,9 @@ Version 1 routes:
   generatorVersion}`. Clients then read the bytes directly from SQLite.
 - `PUT /v1/thumbnails?assetId=<id>&sizeBucket=<bucket>&generatorVersion=<version>&width=<actual-width>&height=<actual-height>&encoding=<mime-type>` with static encoded bytes. The server fully decodes the body, requires its decoded dimensions to equal `width` and `height`, and limits both edges to `sizeBucket`.
 - `GET /v1/thumbnails?assetId=<id>&requestedSize=<physical-pixels>&generatorVersion=<version>`
+  reads the standard gallery poster. For a video search hit, append `timestampMs=<nonnegative-ms>`
+  to read the exact cached frame from `video_thumbnails`; an image asset rejects `timestampMs`.
+  The matched frame is looked up by current source fingerprint and sampling version.
 - `DELETE /v1/thumbnails?assetId=<id>` deletes every bucket and generator version for the asset
 
 A successful GET uses the stored MIME type as `Content-Type` and returns
@@ -876,15 +929,17 @@ independently, so the existing direct SQLite readers can see a partial, internal
 catalog while the job is still running. Existing paths retain
 their stable `assetId`; unchanged fingerprints are no-ops and do not advance the revision.
 
-`catalogSync` never loads OCR models or generates OCR text, embeddings, or thumbnails. A completed
+`catalogSync` never loads OCR models or generates OCR text. With `image:true`, it embeds newly
+cataloged or changed visual assets; video embedding also writes their sampled thumbnails and
+gallery poster. Without `image:true`, it only catalogs and reconciles. A completed
 scan now automatically removes confirmed-deleted catalog entries and their OCR/text-vector,
 CLIP-vector, and thumbnail records. Unavailable roots, traversal errors,
 cancelled scans, and any `debugLimit` preserve existing entries. Recursive and exclusion scope also
 apply to reconciliation; an excluded folder's descendants are retained. Filesystem checks finish
 before deletion starts, with root and file availability checked again before each bounded batch.
-Reconciliation inserts the completed scan's stable asset IDs into a connection-local temporary
-`WITHOUT ROWID` table, so SQLite selects only unseen rows for those filesystem checks without
-rewriting persistent catalog rows. The table is cleared and reused on that catalog connection.
+The delta walk tracks paths it visits and looks up only the paths left unseen for deletion checks.
+Full library indexing uses a connection-local temporary `WITHOUT ROWID` table of visited asset IDs
+to select unseen rows without rewriting persistent catalog rows.
 Derived stores are deleted first, so an interrupted cross-database deletion retains the catalog
 entry for the next update to finish. Its worker phase order is
 `scanning` → `cataloging` → optional `pruning` → `finished`; it shares ordinary cooperative cancellation and the single
@@ -916,7 +971,8 @@ job first incrementally embeds pending CLIP image vectors and then
 pending `ocrText` vectors under the root. Both use fingerprint-aware backlogs and do not
 force-rebuild current vectors. Set `"embed": false` to finish after OCR. Embedding item failures
 are retained in this job's `errors` and increase its `failed` counter; they remain pending for a
-later retry. This does **not** generate thumbnails.
+later retry. Still-image thumbnails remain lazy; video embedding eagerly writes sampled
+thumbnails and the first-frame gallery poster.
 
 `scan` and all its fields are optional. `recursive` defaults to true and the two exclusions shown
 are the defaults. `force` defaults to false. When true, it re-runs OCR for every otherwise eligible

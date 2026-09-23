@@ -46,6 +46,72 @@ pub fn image_buckets(path: &Path, buckets: &[u16]) -> Result<Vec<StaticPoster>> 
         .collect()
 }
 
+/// Encode size variants directly from a decoded frame, without a JPEG round trip.
+pub fn raster_buckets(source: &Raster, buckets: &[u16]) -> Result<Vec<StaticPoster>> {
+    raster_buckets_with_output(source, buckets, crate::video::VideoOutputOptions::default())
+}
+
+pub fn raster_buckets_with_output(
+    source: &Raster,
+    buckets: &[u16],
+    options: crate::video::VideoOutputOptions,
+) -> Result<Vec<StaticPoster>> {
+    raster_buckets_with_output_at(Path::new("<raster>"), source, buckets, options)
+}
+
+/// Encode video frame variants with a source path on each profiling span.
+pub fn raster_buckets_with_output_at(
+    path: &Path,
+    source: &Raster,
+    buckets: &[u16],
+    options: crate::video::VideoOutputOptions,
+) -> Result<Vec<StaticPoster>> {
+    if options.encoding == ThumbnailEncoding::Jpeg && !(1.0..=100.0).contains(&options.jpeg_quality)
+    {
+        bail!("video JPEG quality must be between 1 and 100");
+    }
+    buckets
+        .iter()
+        .map(|bucket| {
+            if *bucket == 0 {
+                bail!("poster maximum edge must be greater than zero");
+            }
+            let edge = u32::from(*bucket);
+            let (width, height) = imaging::fit_within(source.width(), source.height(), edge, edge);
+            let raster = {
+                let span = trace_span!("video_poster_resize", path = %path, bucket, width, height);
+                let _entered = span.enter();
+                imaging::resize(source, width, height)?
+            };
+            let width = raster.width();
+            let height = raster.height();
+            let data = match options.encoding {
+                ThumbnailEncoding::Jpeg => {
+                    let rgb = raster.flatten_rgb(WHITE);
+                    let span =
+                        trace_span!("video_poster_jpeg", path = %path, bucket, width, height);
+                    let _entered = span.enter();
+                    imaging::encode_jpeg(width, height, &rgb, options.jpeg_quality)?
+                }
+                ThumbnailEncoding::Png => {
+                    let span = trace_span!("video_poster_png", path = %path, bucket, width, height);
+                    let _entered = span.enter();
+                    imaging::encode_png(width, height, &raster.into_rgba_bytes())?
+                }
+                ThumbnailEncoding::Webp => {
+                    bail!("WebP encoding is unavailable for video thumbnails")
+                }
+            };
+            Ok(StaticPoster {
+                width,
+                height,
+                encoding: options.encoding,
+                data,
+            })
+        })
+        .collect()
+}
+
 fn still_image_source(path: &Path) -> Result<Raster> {
     let data = {
         let span = trace_span!(target: "nicegal_core::thumbs", "poster_open", path = %path);
@@ -132,6 +198,36 @@ mod tests {
     use std::borrow::Cow;
     use std::fs::File;
     use tempfile::TempDir;
+
+    #[test]
+    fn video_output_options_select_png_or_jpeg_quality() -> Result<()> {
+        let raster = Raster::Rgb {
+            width: 2,
+            height: 2,
+            pixels: vec![64; 12],
+        };
+        let png = raster_buckets_with_output(
+            &raster,
+            &[128],
+            crate::video::VideoOutputOptions {
+                encoding: ThumbnailEncoding::Png,
+                jpeg_quality: 85.0,
+            },
+        )?;
+        assert_eq!(png[0].encoding, ThumbnailEncoding::Png);
+        assert_eq!(imaging::Format::detect(&png[0].data)?, imaging::Format::Png);
+        let jpeg = raster_buckets_with_output(
+            &raster,
+            &[128],
+            crate::video::VideoOutputOptions::default(),
+        )?;
+        assert_eq!(jpeg[0].encoding, ThumbnailEncoding::Jpeg);
+        assert_eq!(
+            imaging::Format::detect(&jpeg[0].data)?,
+            imaging::Format::Jpeg
+        );
+        Ok(())
+    }
 
     fn write_gif(path: &std::path::Path) -> Result<()> {
         let mut file = File::create(path)?;

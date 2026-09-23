@@ -25,6 +25,8 @@ pub(crate) struct Request {
     #[serde(default = "default_true")]
     ocr: bool,
     image: Option<bool>,
+    #[serde(default = "default_true")]
+    index_videos: bool,
 }
 
 pub(crate) struct Spec {
@@ -33,6 +35,7 @@ pub(crate) struct Spec {
     text: bool,
     ocr: bool,
     image: bool,
+    index_videos: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -43,12 +46,15 @@ pub(crate) struct CatalogSyncRequest {
     scan: CatalogScanOptions,
     #[serde(default)]
     image: bool,
+    #[serde(default = "default_true")]
+    index_videos: bool,
 }
 
 pub(crate) struct CatalogSyncSpec {
     root: PathBuf,
     options: IndexOptions,
     image: bool,
+    index_videos: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -66,8 +72,6 @@ struct ScanOptions {
     cleanup: bool,
     max_dimensions: Option<MaxDimensions>,
     debug_limit: Option<usize>,
-    #[serde(default)]
-    new_only: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -79,8 +83,9 @@ struct CatalogScanOptions {
     exclude: Vec<String>,
     /// Debug guardrail. Production callers should omit this and catalog the whole root.
     debug_limit: Option<usize>,
-    #[serde(default)]
-    new_only: bool,
+    /// Older desktop builds send this flag; delta classification now runs for either value.
+    #[serde(rename = "newOnly", default)]
+    _legacy_new_only: bool,
 }
 
 impl Default for ScanOptions {
@@ -93,7 +98,6 @@ impl Default for ScanOptions {
             cleanup: false,
             max_dimensions: None,
             debug_limit: None,
-            new_only: false,
         }
     }
 }
@@ -104,7 +108,7 @@ impl Default for CatalogScanOptions {
             recursive: true,
             exclude: default_excludes(),
             debug_limit: None,
-            new_only: false,
+            _legacy_new_only: false,
         }
     }
 }
@@ -130,6 +134,7 @@ pub(crate) fn prepare(request: Request) -> Result<Spec, ApiError> {
         text: request.ocr && request.embed.unwrap_or(true),
         ocr: request.ocr,
         image,
+        index_videos: request.index_videos,
     })
 }
 
@@ -141,6 +146,7 @@ pub(crate) fn prepare_catalog_sync(
         root,
         options: catalog_sync_options(request.scan)?,
         image: request.image,
+        index_videos: request.index_videos,
     })
 }
 
@@ -194,18 +200,15 @@ pub(crate) fn run_catalog_sync(
     spec: CatalogSyncSpec,
     asset_database: &PathBuf,
     observer: &dyn IndexObserver,
-) -> anyhow::Result<(index::CatalogSummary, Vec<Asset>)> {
+) -> anyhow::Result<index::CatalogDelta> {
     let assets = AssetCatalog::new(asset_database)?;
-    let mut scanned = Vec::new();
-    let summary =
-        index::catalog_dir_with_step(&assets, &spec.root, spec.options, observer, |catalog| {
-            scanned.extend_from_slice(catalog);
-            Ok(false)
-        })?;
-    Ok((summary, scanned))
+    index::catalog_delta_dir_observed(&assets, &spec.root, spec.options, observer)
 }
 
 impl CatalogSyncSpec {
+    pub(crate) fn indexes_videos(&self) -> bool {
+        self.index_videos
+    }
     pub(crate) fn embeds_images(&self) -> bool {
         self.image
     }
@@ -221,6 +224,9 @@ impl CatalogSyncSpec {
 }
 
 impl Spec {
+    pub(crate) fn indexes_videos(&self) -> bool {
+        self.index_videos
+    }
     pub(super) fn reconciliation(&self) -> ReconcileScope {
         ReconcileScope::new(self.root.clone(), &self.options)
     }
@@ -261,7 +267,6 @@ fn index_options(scan: ScanOptions) -> Result<IndexOptions, ApiError> {
         ));
     }
     options.limit = scan.debug_limit;
-    options.new_only = scan.new_only;
     options.max_dimensions = scan
         .max_dimensions
         .map(|dimensions| {
@@ -284,7 +289,6 @@ fn catalog_sync_options(scan: CatalogScanOptions) -> Result<IndexOptions, ApiErr
         ));
     }
     options.limit = scan.debug_limit;
-    options.new_only = scan.new_only;
     Ok(options)
 }
 
@@ -362,6 +366,7 @@ mod tests {
         assert_eq!(options.commit_chunk_size, OCR_COMMIT_CHUNK_SIZE);
         assert_eq!(options.exclude.len(), 2);
         assert!(request.embed.unwrap_or(true));
+        assert!(request.index_videos);
     }
 
     #[test]
@@ -369,6 +374,16 @@ mod tests {
         let request: Request =
             serde_json::from_str(r#"{"root":"/gallery","embed":false}"#).unwrap();
         assert!(!request.embed.unwrap_or(true));
+    }
+
+    #[test]
+    fn index_requests_can_disable_video_frames() {
+        let request: Request =
+            serde_json::from_str(r#"{"root":"/gallery","indexVideos":false}"#).unwrap();
+        assert!(!request.index_videos);
+        let sync: CatalogSyncRequest =
+            serde_json::from_str(r#"{"root":"/gallery","indexVideos":false}"#).unwrap();
+        assert!(!sync.index_videos);
     }
 
     #[test]
@@ -380,7 +395,6 @@ mod tests {
         assert!(!options.cleanup);
         assert_eq!(options.limit, None);
         assert_eq!(options.exclude.len(), 2);
-        assert!(!options.new_only);
         assert!(!request.image);
 
         let unsupported = serde_json::from_str::<CatalogSyncRequest>(
@@ -390,16 +404,19 @@ mod tests {
     }
 
     #[test]
-    fn quick_catalog_sync_accepts_new_only_with_image_embedding() {
-        let request: CatalogSyncRequest = serde_json::from_str(
-            r#"{"root":"/gallery","image":true,"scan":{"newOnly":true}}"#,
-        )
-        .unwrap();
+    fn catalog_sync_accepts_image_embedding_without_a_scan_mode() {
+        let request: CatalogSyncRequest =
+            serde_json::from_str(r#"{"root":"/gallery","image":true}"#).unwrap();
         assert!(request.image);
         let options = catalog_sync_options(request.scan).unwrap();
-        assert!(options.new_only);
         assert!(!options.rescan);
         assert!(!options.cleanup);
+        assert!(
+            serde_json::from_str::<CatalogSyncRequest>(
+                r#"{"root":"/gallery","scan":{"newOnly":true}}"#
+            )
+            .is_ok()
+        );
     }
 
     #[test]

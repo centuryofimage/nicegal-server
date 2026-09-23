@@ -1,6 +1,6 @@
 # nicegal-server
 
-The Rust library, local HTTP server, and search CLI for [Nicegal](https://github.com/centuryofimage/nicegal), a searchable desktop image gallery. The server provides OCR, text and image search, and thumbnails.
+The Rust library, local HTTP server, and search CLI for [Nicegal](https://github.com/centuryofimage/nicegal), a searchable desktop photo and video gallery. The server provides OCR, text and visual search, and thumbnails for photos and videos.
 
 Download the desktop app from [Nicegal releases](https://github.com/centuryofimage/nicegal/releases), or the standalone server from [backend releases](https://github.com/centuryofimage/nicegal-server/releases).
 

@@ -174,6 +174,9 @@ struct SearchResponse {
 #[serde(rename_all = "camelCase")]
 struct SearchHit {
     asset_id: i64,
+    /// Winning sample's presentation timestamp for image search video hits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timestamp_ms: Option<i64>,
     snippet: String,
     /// Position in this mode's own ranking, from 1. Present so a client can fuse two responses
     /// itself if it ever wants to, without re-deriving ranks from array order.
@@ -370,6 +373,8 @@ struct FusedResponse {
 #[serde(rename_all = "camelCase")]
 struct FusedHit {
     asset_id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timestamp_ms: Option<i64>,
     score: f64,
     rank: usize,
     /// The keys of the modes that returned this asset, in request order. A hit several modes agree
@@ -813,6 +818,7 @@ impl QueryPlan {
                     .into_iter()
                     .map(|hit| SearchHit {
                         asset_id: hit.asset_id,
+                        timestamp_ms: None,
                         snippet: hit.contents,
                         rank: 0,
                         distance: None,
@@ -840,6 +846,7 @@ impl QueryPlan {
                     .into_iter()
                     .map(|hit| SearchHit {
                         asset_id: hit.asset_id,
+                        timestamp_ms: None,
                         snippet: hit.contents,
                         rank: 0,
                         distance: Some(hit.distance),
@@ -874,6 +881,7 @@ impl QueryPlan {
             .into_iter()
             .map(|hit| SearchHit {
                 asset_id: hit.asset_id,
+                timestamp_ms: hit.timestamp_ms,
                 snippet: String::new(),
                 rank: 0,
                 distance: Some(hit.distance),
@@ -1053,6 +1061,7 @@ struct Fusion {
 struct FusedEntry {
     score: f64,
     sources: Vec<String>,
+    timestamp_ms: Option<i64>,
     snippet: String,
     highlights: Vec<HighlightResponse>,
 }
@@ -1079,9 +1088,13 @@ impl Fusion {
                 let entry = scores.entry(hit.asset_id).or_insert_with(|| FusedEntry {
                     score: 0.0,
                     sources: Vec::new(),
+                    timestamp_ms: hit.timestamp_ms,
                     snippet: hit.snippet.clone(),
                     highlights: hit.highlights.clone(),
                 });
+                if entry.timestamp_ms.is_none() {
+                    entry.timestamp_ms = hit.timestamp_ms;
+                }
                 entry.score += weight / (self.k + hit.rank as f64);
                 entry.sources.push(query.key.clone());
             }
@@ -1108,6 +1121,7 @@ impl Fusion {
                 .enumerate()
                 .map(|(index, (asset_id, entry))| FusedHit {
                     asset_id,
+                    timestamp_ms: entry.timestamp_ms,
                     score: entry.score,
                     rank: index + 1,
                     sources: entry.sources,
@@ -1404,6 +1418,7 @@ mod tests {
                 .enumerate()
                 .map(|(index, asset_id)| SearchHit {
                     asset_id: *asset_id,
+                    timestamp_ms: None,
                     snippet: format!("snippet {asset_id}"),
                     rank: index + 1,
                     distance: None,
@@ -1804,6 +1819,7 @@ mod tests {
     fn hit(asset_id: i64, rank: usize) -> SearchHit {
         SearchHit {
             asset_id,
+            timestamp_ms: None,
             snippet: format!("snippet {asset_id}"),
             rank,
             distance: None,

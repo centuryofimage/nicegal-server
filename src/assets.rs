@@ -70,6 +70,23 @@ impl SourceFingerprint {
     }
 }
 
+/// Metadata needed to classify a filesystem entry without opening its media bytes.
+pub(crate) struct CatalogScanEntry {
+    fingerprint: SourceFingerprint,
+    source_created_ns: Option<i64>,
+    metadata_version: i32,
+}
+
+impl CatalogScanEntry {
+    pub(crate) fn is_current(&self, metadata: &fs::Metadata) -> Result<bool> {
+        Ok(
+            self.fingerprint == SourceFingerprint::from_metadata(metadata)?
+                && self.source_created_ns == timestamp_ns(metadata.created().ok())
+                && self.metadata_version == METADATA_VERSION,
+        )
+    }
+}
+
 /// Resolve a filesystem path while retaining the normal Windows path spelling used by clients.
 pub fn canonicalize_path(path: &Path) -> Result<PathBuf> {
     let path = PathBuf::try_from(
@@ -107,7 +124,6 @@ fn normalize_windows_verbatim_path(path: PathBuf) -> PathBuf {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaKind {
     Image,
-    // Retained for legacy catalog compatibility only; videos are no longer admitted or listed.
     Video,
 }
 
@@ -291,6 +307,7 @@ impl AssetCatalog {
         Ok(Self { conn })
     }
 
+    #[tracing::instrument(level = "debug", skip(self))]
     pub fn maintain(&self) -> Result<()> {
         maintain(&self.conn).context("maintaining asset catalog")
     }
@@ -314,7 +331,7 @@ impl AssetCatalog {
             bail!("asset path must be absolute: {path}");
         }
         if !is_catalog_media(path) {
-            bail!("unsupported image format: {path}");
+            bail!("unsupported media format: {path}");
         }
         let mut timings = CatalogUpsertTimings::default();
         let started = Instant::now();
@@ -495,7 +512,7 @@ impl AssetCatalog {
     pub fn get(&self, asset_id: i64) -> Result<Option<Asset>> {
         self.conn
             .query_row(
-                &format!("SELECT {ASSET_COLUMNS} FROM assets WHERE media_kind = 'image' AND asset_id = ?1"),
+                &format!("SELECT {ASSET_COLUMNS} FROM assets WHERE asset_id = ?1"),
                 [asset_id],
                 asset_from_row,
             )
@@ -506,9 +523,7 @@ impl AssetCatalog {
     pub fn get_by_path(&self, path: &Path) -> Result<Option<Asset>> {
         self.conn
             .query_row(
-                &format!(
-                    "SELECT {ASSET_COLUMNS} FROM assets WHERE media_kind = 'image' AND path = ?1"
-                ),
+                &format!("SELECT {ASSET_COLUMNS} FROM assets WHERE path = ?1"),
                 [path.as_str()],
                 asset_from_row,
             )
@@ -535,7 +550,7 @@ impl AssetCatalog {
                 .join(",");
             let sql = format!(
                 "SELECT {ASSET_COLUMNS} FROM assets
-                 WHERE media_kind = 'image' AND asset_id IN ({placeholders})"
+                 WHERE asset_id IN ({placeholders})"
             );
             let mut statement = self.conn.prepare(&sql)?;
             let rows = statement.query_and_then(params_from_iter(asset_ids), asset_from_row)?;
@@ -553,7 +568,7 @@ impl AssetCatalog {
 
     pub fn all(&self) -> Result<Vec<Asset>> {
         let mut statement = self.conn.prepare_cached(&format!(
-            "SELECT {ASSET_COLUMNS} FROM assets WHERE media_kind = 'image' ORDER BY asset_id"
+            "SELECT {ASSET_COLUMNS} FROM assets ORDER BY asset_id"
         ))?;
         let rows = statement.query_and_then([], asset_from_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -579,7 +594,7 @@ impl AssetCatalog {
         let predicate = predicate.replace("{time}", &expression);
         let sql = format!(
             "SELECT {ASSET_COLUMNS} FROM assets
-             WHERE media_kind = 'image' {predicate} ORDER BY {expression}, asset_id"
+             WHERE 1 = 1 {predicate} ORDER BY {expression}, asset_id"
         );
         let mut statement = self.conn.prepare(&sql)?;
         let rows = statement.query_and_then(params_from_iter(parameters), asset_from_row)?;
@@ -593,25 +608,46 @@ impl AssetCatalog {
         }
         let mut statement = self.conn.prepare_cached(&format!(
             "SELECT {ASSET_COLUMNS} FROM assets
-             WHERE media_kind = 'image' AND path LIKE ?1 ESCAPE '#' ORDER BY asset_id"
+             WHERE path LIKE ?1 ESCAPE '#' ORDER BY asset_id"
         ))?;
         let rows = statement.query_and_then([path_prefix_like(root)], asset_from_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .context("listing assets under root")
     }
 
-    /// Read cataloged paths for a discovery pass without loading full media metadata.
-    pub fn paths_under_root(&self, root: &Path) -> Result<Vec<PathBuf>> {
+    /// Read the small catalog fields needed to classify a directory walk.
+    pub(crate) fn scan_entries_under_root(
+        &self,
+        root: &Path,
+    ) -> Result<HashMap<PathBuf, CatalogScanEntry>> {
         if !root.is_absolute() {
             bail!("asset root must be absolute: {root}");
         }
         let mut statement = self.conn.prepare_cached(
-            "SELECT path FROM assets WHERE media_kind = 'image' AND path LIKE ?1 ESCAPE '#'",
+            "SELECT path, source_modified_ns, source_size, source_created_ns, metadata_version
+             FROM assets WHERE path LIKE ?1 ESCAPE '#'",
         )?;
-        let rows = statement.query_map([path_prefix_like(root)], |row| row.get::<_, String>(0))?;
-        rows.map(|row| row.map(PathBuf::from))
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .context("listing cataloged paths under root")
+        let rows = statement.query_map([path_prefix_like(root)], |row| {
+            Ok((
+                PathBuf::from(row.get::<_, String>(0)?),
+                CatalogScanEntry {
+                    fingerprint: SourceFingerprint {
+                        modified_ns: row.get(1)?,
+                        size: row.get::<_, i64>(2)?.try_into().map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                2,
+                                rusqlite::types::Type::Integer,
+                                Box::new(error),
+                            )
+                        })?,
+                    },
+                    source_created_ns: row.get(3)?,
+                    metadata_version: row.get(4)?,
+                },
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<HashMap<_, _>>>()
+            .context("listing catalog scan entries under root")
     }
 
     /// Return catalog rows under `root` that were not present in a completed filesystem scan.
@@ -641,7 +677,7 @@ impl AssetCatalog {
         let unseen = {
             let mut statement = transaction.prepare(&format!(
                 "SELECT {ASSET_COLUMNS} FROM assets
-                 WHERE media_kind = 'image' AND {GALLERY_ROOT_PREDICATE}
+                 WHERE {GALLERY_ROOT_PREDICATE}
                    AND NOT EXISTS (
                        SELECT 1 FROM scan_seen_assets
                        WHERE scan_seen_assets.asset_id = assets.asset_id
@@ -663,7 +699,7 @@ impl AssetCatalog {
         let order = timeline.expression("assets");
         let mut statement = self.conn.prepare(&format!(
             "SELECT {ASSET_COLUMNS} FROM assets
-             WHERE media_kind = 'image' AND {GALLERY_ROOT_PREDICATE}
+             WHERE {GALLERY_ROOT_PREDICATE}
              ORDER BY {order} DESC, asset_id DESC"
         ))?;
         Ok(statement
@@ -676,7 +712,7 @@ impl AssetCatalog {
 
     pub fn count_gallery(&self, root: &Path) -> Result<i64> {
         Ok(self.conn.query_row(
-            &format!("SELECT COUNT(*) FROM assets WHERE media_kind = 'image' AND {GALLERY_ROOT_PREDICATE}"),
+            &format!("SELECT COUNT(*) FROM assets WHERE {GALLERY_ROOT_PREDICATE}"),
             [root.as_str().trim_end_matches(['/', '\\'])],
             |row| row.get(0),
         )?)
@@ -813,6 +849,35 @@ struct MediaProbeTimings {
 fn probe_media(path: &Path) -> (MediaProbe, MediaProbeTimings) {
     let mut timings = MediaProbeTimings::default();
     let extension = path.extension().unwrap_or_default().to_ascii_lowercase();
+
+    if is_video_extension(&extension) {
+        let span = tracing::debug_span!("video_catalog_probe", path = %path);
+        let _entered = span.enter();
+        let started = Instant::now();
+        // The catalog keeps the source even when its container or codec cannot be read.
+        let metadata = crate::video::probe(path).ok();
+        timings.dimensions = started.elapsed();
+        return (
+            MediaProbe {
+                kind: MediaKind::Video,
+                format: extension,
+                // The capture timeline uses this shared timestamp column. For videos it is the
+                // container creation time; the inspector reports it separately from EXIF.
+                exif_taken_ns: metadata.as_ref().and_then(|value| {
+                    value
+                        .creation_time
+                        .as_deref()
+                        .and_then(parse_video_creation_ns)
+                }),
+                width: metadata.as_ref().map(|value| value.width),
+                height: metadata.as_ref().map(|value| value.height),
+                is_animated: false,
+                frame_count: metadata.as_ref().and_then(|value| value.frame_count),
+                duration_ms: metadata.as_ref().and_then(|value| value.duration_ms),
+            },
+            timings,
+        );
+    }
 
     let started = Instant::now();
     let (sniffed_format, dimensions) = probe_image_header(path);
@@ -953,11 +1018,25 @@ fn probe_gif(path: &Path) -> Result<(u32, u64)> {
 
 pub fn is_catalog_media(path: &Path) -> bool {
     path.extension().is_some_and(|extension| {
+        let extension = extension.to_ascii_lowercase();
         matches!(
-            extension.to_ascii_lowercase().as_str(),
+            extension.as_str(),
             "png" | "jpeg" | "jpg" | "gif" | "webp" | "bmp"
-        )
+        ) || is_video_extension(&extension)
     })
+}
+
+fn is_video_extension(extension: &str) -> bool {
+    matches!(
+        extension,
+        "mp4" | "m4v" | "mov" | "mkv" | "webm" | "avi" | "mpg" | "mpeg" | "ts" | "m2ts"
+    )
+}
+
+fn parse_video_creation_ns(value: &str) -> Option<i64> {
+    let datetime =
+        time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).ok()?;
+    i64::try_from(datetime.unix_timestamp_nanos()).ok()
 }
 
 pub fn is_ocr_image(asset: &Asset) -> bool {
@@ -973,35 +1052,55 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn videos_are_not_admitted_and_legacy_rows_are_hidden_without_deletion() -> Result<()> {
+    fn videos_are_cataloged_and_visible_even_when_metadata_probe_fails() -> Result<()> {
         let temp = TempDir::new()?;
         let root = PathBuf::try_from(temp.path().to_path_buf())?;
         let catalog = AssetCatalog::new(&root.join("assets.db"))?;
-        for extension in ["mp4", "MOV", "avi", "mkv", "m4v", "webm"] {
+        let mut videos = Vec::new();
+        for extension in [
+            "mp4", "MOV", "avi", "mkv", "m4v", "webm", "mpg", "mpeg", "ts", "m2ts",
+        ] {
             let path = root.join(format!("clip.{extension}"));
             fs::write(&path, b"video placeholder")?;
-            assert!(!is_catalog_media(&path));
-            assert!(catalog.upsert(&path, &fs::metadata(&path)?).is_err());
+            assert!(is_catalog_media(&path));
+            let asset = catalog.upsert(&path, &fs::metadata(&path)?)?;
+            assert_eq!(asset.media_kind, MediaKind::Video);
+            assert_eq!(asset.media_format, extension.to_ascii_lowercase());
+            assert_eq!(
+                (asset.width, asset.height, asset.duration_ms),
+                (None, None, None)
+            );
+            assert!(!is_ocr_image(&asset));
+            videos.push(asset);
         }
+        let mut disguised_video = videos[0].clone();
+        disguised_video.media_format = "png".to_owned();
+        assert!(!is_ocr_image(&disguised_video));
         for extension in ["png", "JPG", "jpeg", "gif", "webp", "bmp"] {
             assert!(is_catalog_media(&root.join(format!("image.{extension}"))));
         }
-        let video = root.join("legacy.mp4");
-        catalog.conn.execute("INSERT INTO assets(asset_id, path, source_modified_ns, source_size, media_kind, media_format, is_animated) VALUES (1, ?1, 10, 0, 'video', 'mp4', 0)", [video.as_str()])?;
         let image = root.join("photo.png");
         fs::write(&image, b"malformed images remain catalogable")?;
         let asset = catalog.upsert(&image, &fs::metadata(&image)?)?;
-        assert!(catalog.get(1)?.is_none());
-        assert!(catalog.get_by_path(&video)?.is_none());
-        assert_eq!(catalog.get_many(&[1, asset.asset_id])?, vec![asset.clone()]);
-        assert_eq!(catalog.all()?, vec![asset.clone()]);
-        assert_eq!(catalog.under_root(&root)?, vec![asset.clone()]);
-        assert_eq!(catalog.count_gallery(&root)?, 1);
+        assert_eq!(catalog.get(videos[0].asset_id)?, Some(videos[0].clone()));
+        assert_eq!(
+            catalog.get_by_path(&videos[0].path)?,
+            Some(videos[0].clone())
+        );
+        assert_eq!(
+            catalog.get_many(&[videos[0].asset_id, asset.asset_id])?,
+            vec![videos[0].clone(), asset.clone()]
+        );
+        videos.push(asset.clone());
+        assert_eq!(catalog.all()?, videos);
+        assert_eq!(catalog.under_root(&root)?, videos);
+        assert_eq!(catalog.scan_entries_under_root(&root)?.len(), videos.len());
+        assert_eq!(catalog.count_gallery(&root)?, videos.len() as i64);
         for timeline in [Timeline::Modified, Timeline::Capture] {
-            assert_eq!(catalog.list_gallery(&root, timeline)?, vec![asset.clone()]);
+            assert_eq!(catalog.list_gallery(&root, timeline)?.len(), videos.len());
             assert_eq!(
-                catalog.timeline_range(timeline, None, None)?,
-                vec![asset.clone()]
+                catalog.timeline_range(timeline, None, None)?.len(),
+                videos.len()
             );
             assert!(
                 catalog
@@ -1009,14 +1108,20 @@ mod tests {
                     .is_empty()
             );
         }
-        let rows: i64 = catalog
-            .conn
-            .query_row("SELECT COUNT(*) FROM assets", [], |row| row.get(0))?;
-        assert_eq!(
-            rows, 2,
-            "legacy metadata is retained, not destructively migrated"
-        );
         Ok(())
+    }
+
+    #[test]
+    fn video_container_creation_time_parses_as_capture_time() {
+        assert_eq!(
+            parse_video_creation_ns("1970-01-01T00:00:01.123Z"),
+            Some(1_123_000_000)
+        );
+        assert_eq!(
+            parse_video_creation_ns("1970-01-01T01:00:00+01:00"),
+            Some(0)
+        );
+        assert_eq!(parse_video_creation_ns("not a timestamp"), None);
     }
 
     #[test]

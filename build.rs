@@ -14,6 +14,11 @@ const ACCELERATED_ORT_FEATURES: &[&str] =
 
 #[cfg(windows)]
 fn main() {
+    // FFMPEG_DIR bypasses ffmpeg-sys's vcpkg system-library discovery. These
+    // dependencies are listed by the custom static build's pkg-config files.
+    for library in ["ole32", "user32", "bcrypt"] {
+        println!("cargo:rustc-link-lib={library}");
+    }
     for feature in ACCELERATED_ORT_FEATURES {
         println!("cargo:rerun-if-env-changed={feature}");
     }
@@ -42,7 +47,6 @@ fn main() {
 
 #[cfg(not(windows))]
 fn main() {}
-
 
 /// Copy both provider-specific ONNX Runtime distributions into namespaced directories. `ort`
 /// dynamically loads precisely one at startup, so the DLLs must never overwrite each other.
@@ -183,7 +187,11 @@ fn copy_dll_directory(env_var: &str, default: PathBuf, destinations: &[PathBuf])
 }
 
 #[cfg(windows)]
-fn copy_dlls_from(source_name: &str, library_dir: PathBuf, destinations: &[PathBuf]) -> io::Result<()> {
+fn copy_dlls_from(
+    source_name: &str,
+    library_dir: PathBuf,
+    destinations: &[PathBuf],
+) -> io::Result<()> {
     if !library_dir.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -228,7 +236,10 @@ fn copy_dlls_from(source_name: &str, library_dir: PathBuf, destinations: &[PathB
     if !found_dll {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!("{source_name} contains no DLL files: {}", library_dir.display()),
+            format!(
+                "{source_name} contains no DLL files: {}",
+                library_dir.display()
+            ),
         ));
     }
     Ok(())

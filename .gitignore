@@ -1,4 +1,6 @@
 /target
+/testdata/video/
+/.deps/
 /libs/*/target
 test.db*
 vcpkg/

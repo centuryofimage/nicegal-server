@@ -9,7 +9,7 @@ use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodRouter, get as get_route, post};
-use nicegal_core::assets::{AssetCatalog, SourceFingerprint};
+use nicegal_core::assets::{AssetCatalog, MediaKind, SourceFingerprint};
 use nicegal_core::thumbs::{
     DecodedThumbnail, GENERATOR_VERSION, SIZE_BUCKETS, Thumbnail, ThumbnailEncoding,
     validate_static_thumbnail,
@@ -39,6 +39,7 @@ struct ThumbnailLookup {
     asset_id: i64,
     requested_size: u32,
     generator_version: u32,
+    timestamp_ms: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -264,21 +265,36 @@ async fn get(
         ));
     }
     validate_generator_version(request.generator_version)?;
+    validate_timestamp(request.timestamp_ms)?;
     let asset_id = request.asset_id;
     let databases = state.databases;
     let thumbnail = run_blocking(move || {
+        let catalog = databases.open_assets_read_only()?;
+        let Some(asset) = catalog
+            .get(asset_id)
+            .context("looking up thumbnail asset")?
+        else {
+            return Ok(None);
+        };
+        validate_timestamp_kind(request.timestamp_ms, asset.media_kind)?;
         let Some(fingerprint) = current_fingerprint(&databases, asset_id)? else {
             return Ok(None);
         };
         let db = databases.open_thumbnails_read_only()?;
-        Ok(db
-            .get(
+        let thumbnail = if let Some(timestamp_ms) = request.timestamp_ms {
+            if request.generator_version != GENERATOR_VERSION {
+                return Ok(None);
+            }
+            db.get_video_sample(asset_id, timestamp_ms, request.requested_size, fingerprint)
+        } else {
+            db.get(
                 asset_id,
                 request.requested_size,
                 request.generator_version,
                 fingerprint,
             )
-            .context("reading stored thumbnail")?)
+        };
+        Ok(thumbnail.context("reading stored thumbnail")?)
     })
     .await?
     .ok_or_else(ApiError::thumbnail_not_found)?;
@@ -403,6 +419,20 @@ fn validate_generator_version(generator_version: u32) -> Result<(), ApiError> {
     Ok(())
 }
 
+fn validate_timestamp(timestamp_ms: Option<i64>) -> Result<(), ApiError> {
+    if timestamp_ms.is_some_and(|timestamp| timestamp < 0) {
+        return Err(ApiError::bad_request("timestampMs must be nonnegative"));
+    }
+    Ok(())
+}
+
+fn validate_timestamp_kind(timestamp_ms: Option<i64>, kind: MediaKind) -> Result<(), ApiError> {
+    if timestamp_ms.is_some() && kind != MediaKind::Video {
+        return Err(ApiError::bad_request("timestampMs requires a video asset"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::error::ErrorCode;
@@ -444,5 +474,30 @@ mod tests {
             validate_generator_version(0).unwrap_err().code,
             ErrorCode::InvalidRequest
         );
+    }
+
+    #[test]
+    fn timestamp_lookup_requires_a_nonnegative_video_timestamp() {
+        let lookup: ThumbnailLookup = serde_json::from_str(
+            r#"{"assetId":42,"requestedSize":256,"generatorVersion":2,"timestampMs":1500}"#,
+        )
+        .unwrap();
+        assert_eq!(lookup.timestamp_ms, Some(1500));
+        assert!(validate_timestamp(lookup.timestamp_ms).is_ok());
+        assert!(validate_timestamp_kind(lookup.timestamp_ms, MediaKind::Video).is_ok());
+        assert_eq!(
+            validate_timestamp_kind(lookup.timestamp_ms, MediaKind::Image)
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRequest,
+        );
+        assert_eq!(
+            validate_timestamp(Some(-1)).unwrap_err().code,
+            ErrorCode::InvalidRequest
+        );
+        let ordinary: ThumbnailLookup =
+            serde_json::from_str(r#"{"assetId":42,"requestedSize":256,"generatorVersion":2}"#)
+                .unwrap();
+        assert_eq!(ordinary.timestamp_ms, None);
     }
 }

@@ -4,6 +4,7 @@ mod legacy;
 mod png;
 mod raster;
 mod resize;
+pub(crate) mod video;
 mod webp;
 
 pub(crate) use raster::ExifOrientation;

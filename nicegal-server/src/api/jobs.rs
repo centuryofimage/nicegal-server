@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -17,6 +17,7 @@ use camino::Utf8PathBuf as PathBuf;
 use nicegal_core::hub::{DownloadObserver, ModelSource};
 use nicegal_core::index::{IndexEvent, IndexObserver, IndexPhase, IndexProgressDelta};
 use nicegal_core::thumbs::ThumbnailService;
+use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tokio_stream::Stream;
@@ -315,7 +316,7 @@ struct JobListResponse {
 pub(super) struct Job {
     id: u64,
     kind: JobKind,
-    cancel_requested: AtomicBool,
+    cancel_requested: Arc<AtomicBool>,
     data: Mutex<JobData>,
     updates: watch::Sender<JobResponse>,
 }
@@ -337,14 +338,14 @@ impl Job {
         Self {
             id,
             kind,
-            cancel_requested: AtomicBool::new(false),
+            cancel_requested: Arc::new(AtomicBool::new(false)),
             data: Mutex::new(data),
             updates,
         }
     }
 
     fn data(&self) -> MutexGuard<'_, JobData> {
-        self.data.lock().unwrap_or_else(|error| error.into_inner())
+        self.data.lock()
     }
 
     pub(super) fn response(&self) -> JobResponse {
@@ -508,6 +509,10 @@ impl IndexObserver for Job {
         self.cancel_requested.load(Ordering::Acquire)
     }
 
+    fn cancellation_token(&self) -> Option<Arc<AtomicBool>> {
+        Some(Arc::clone(&self.cancel_requested))
+    }
+
     fn on_event(&self, event: IndexEvent) {
         let mut data = self.data();
         match event {
@@ -646,9 +651,7 @@ impl JobManager {
     }
 
     fn registry(&self) -> MutexGuard<'_, JobRegistry> {
-        self.registry
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
+        self.registry.lock()
     }
 
     pub(super) fn start(self: &Arc<Self>, spec: JobSpec) -> Result<Arc<Job>, ApiError> {
@@ -673,6 +676,14 @@ impl JobManager {
                     ocr: spec.recognizes_text(),
                     image: spec.embeds_images(),
                     text: spec.embeds_text(),
+                });
+                job.publish(&mut data);
+            } else if let JobSpec::CatalogSync(spec) = &spec {
+                let mut data = job.data();
+                data.index_stages = Some(IndexStages {
+                    ocr: false,
+                    image: spec.embeds_images(),
+                    text: false,
                 });
                 job.publish(&mut data);
             }
@@ -721,79 +732,115 @@ impl JobManager {
         let span = Span::current();
         tokio::task::spawn_blocking(move || {
             let _entered = span.enter();
-            let result = (|| {
-                manager.prepare_job_models(&spec, &job)?;
-                match spec {
-                    JobSpec::ModelPrepare => Ok(()),
-                    JobSpec::LibraryIndex(spec) => {
-                        manager.run_index_pipeline(spec, ocr_models.as_ref(), &job)
-                    }
-                    JobSpec::CatalogSync(spec) => {
-                        let reconciliation = spec.reconciliation();
-                        let embed_image = spec.embeds_images();
-                        let root = spec.root().clone();
-                        let debug_limit = spec.debug_limit();
-                        let (summary, scanned) =
-                            indexing::run_catalog_sync(spec, &databases.assets, job.as_ref())?;
-                        if embed_image && !summary.cancelled && !scanned.is_empty() {
+            let result = (|| match spec {
+                JobSpec::ModelPrepare => manager.prepare_job_models(&job),
+                JobSpec::LibraryIndex(spec) => {
+                    manager.run_index_pipeline(spec, ocr_models.as_ref(), &job)
+                }
+                JobSpec::CatalogSync(spec) => {
+                    let reconciliation = spec.reconciliation();
+                    let embed_image = spec.embeds_images();
+                    let index_videos = spec.indexes_videos();
+                    let root = spec.root().clone();
+                    let debug_limit = spec.debug_limit();
+                    let delta = indexing::run_catalog_sync(spec, &databases.assets, job.as_ref())?;
+                    reconcile_after_discovery(delta.cancelled, delta.scan_complete, || {
+                        prune_jobs::reconcile(
+                            reconciliation,
+                            &databases,
+                            image_embedder.dimensions(),
+                            &thumbnails,
+                            prune_jobs::ReconcileInput::UnseenPaths(&delta.unseen_paths),
+                            job.as_ref(),
+                        )
+                    })?;
+                    if embed_image && !delta.cancelled && !delta.cataloged.is_empty() {
+                        let image_spec = image_embeddings::Spec::pending_for(
+                            root,
+                            false,
+                            debug_limit,
+                            index_videos,
+                        );
+                        if image_embeddings::has_pending(
+                            &image_spec,
+                            &databases,
+                            image_embedder.dimensions(),
+                            Some(&delta.cataloged),
+                        )? {
+                            job.preparing_models(1);
+                            let model = image_embedder.prepare_with_progress(job.as_ref())?;
+                            job.models_loaded(1);
+                            job.check_cancelled()?;
                             image_embeddings::run(
-                                image_embeddings::Spec::pending_for(root, false, debug_limit),
-                                &databases.assets,
-                                &databases.images,
-                                image_embedder.prepare_with_progress(job.as_ref())?.as_ref(),
+                                image_spec,
+                                &databases,
+                                &thumbnails,
+                                model.as_ref(),
                                 job.as_ref(),
-                                Some(&scanned),
+                                Some(&delta.cataloged),
                             )?;
                         }
-                        reconcile_after_discovery(summary.cancelled, summary.scan_complete, || {
-                            prune_jobs::reconcile(
-                                reconciliation,
-                                &databases,
-                                image_embedder.dimensions(),
-                                &thumbnails,
-                                &scanned,
-                                job.as_ref(),
-                            )
-                        })
                     }
-                    JobSpec::ThumbnailGenerate(spec) => {
-                        thumbnails::job::run(spec, &databases.assets, &thumbnails, job.as_ref())
-                    }
-                    JobSpec::TextEmbed(spec) => text_embeddings::job::run(
-                        spec,
+                    Ok(())
+                }
+                JobSpec::ThumbnailGenerate(spec) => {
+                    thumbnails::job::run(spec, &databases.assets, &thumbnails, job.as_ref())
+                }
+                JobSpec::TextEmbed(spec) => {
+                    if !text_embeddings::job::has_pending(
+                        &spec,
                         &databases.ocr,
-                        embedder.prepare()?.as_ref(),
-                        job.as_ref(),
-                    ),
-                    JobSpec::ImageEmbed(spec) => image_embeddings::run(
+                        embedder.model().id(),
+                        embedder.dimensions(),
+                    )? {
+                        return Ok(());
+                    }
+                    job.preparing_models(1);
+                    let model = embedder.prepare_with_progress(job.as_ref())?;
+                    job.models_loaded(1);
+                    text_embeddings::job::run(spec, &databases.ocr, model.as_ref(), job.as_ref())
+                }
+                JobSpec::ImageEmbed(spec) => {
+                    if !image_embeddings::has_pending(
+                        &spec,
+                        &databases,
+                        image_embedder.dimensions(),
+                        None,
+                    )? {
+                        return Ok(());
+                    }
+                    job.preparing_models(1);
+                    let model = image_embedder.prepare_with_progress(job.as_ref())?;
+                    job.models_loaded(1);
+                    image_embeddings::run(
                         spec,
-                        &databases.assets,
-                        &databases.images,
-                        image_embedder.prepare()?.as_ref(),
+                        &databases,
+                        &thumbnails,
+                        model.as_ref(),
                         job.as_ref(),
                         None,
-                    ),
-                    JobSpec::PruneMissing(spec) => prune_jobs::run(
-                        spec,
-                        &databases.assets,
-                        &databases.ocr,
-                        &databases.images,
-                        image_embedder.dimensions(),
-                        &thumbnails,
-                        job.as_ref(),
-                    ),
-                    JobSpec::LibraryPurge(spec) => prune_jobs::run_library_purge(
-                        spec,
-                        &databases.assets,
-                        &databases.ocr,
-                        &databases.images,
-                        image_embedder.dimensions(),
-                        &thumbnails,
-                        job.as_ref(),
-                    ),
-                    JobSpec::OcrModelLoad(_) => {
-                        unreachable!("handled before the blocking job boundary")
-                    }
+                    )
+                }
+                JobSpec::PruneMissing(spec) => prune_jobs::run(
+                    spec,
+                    &databases.assets,
+                    &databases.ocr,
+                    &databases.images,
+                    image_embedder.dimensions(),
+                    &thumbnails,
+                    job.as_ref(),
+                ),
+                JobSpec::LibraryPurge(spec) => prune_jobs::run_library_purge(
+                    spec,
+                    &databases.assets,
+                    &databases.ocr,
+                    &databases.images,
+                    image_embedder.dimensions(),
+                    &thumbnails,
+                    job.as_ref(),
+                ),
+                JobSpec::OcrModelLoad(_) => {
+                    unreachable!("handled before the blocking job boundary")
                 }
             })();
             manager.maintain_databases();
@@ -805,6 +852,7 @@ impl JobManager {
 
     /// Jobs are already globally serialized, making their common epilogue the safe place to
     /// reconcile independently stored derived rows and perform bounded SQLite maintenance.
+    #[tracing::instrument(level = "debug", skip(self))]
     fn maintain_databases(&self) {
         let result = (|| -> anyhow::Result<(usize, usize, usize)> {
             let assets = nicegal_core::assets::AssetCatalog::new(&self.databases.assets)?;
@@ -837,31 +885,18 @@ impl JobManager {
         }
     }
 
-    fn prepare_job_models(&self, spec: &JobSpec, job: &Job) -> anyhow::Result<()> {
-        let needs_text = matches!(spec, JobSpec::TextEmbed(_) | JobSpec::ModelPrepare)
-            || matches!(spec, JobSpec::LibraryIndex(spec) if spec.embeds_text());
-        let needs_image = matches!(spec, JobSpec::ImageEmbed(_) | JobSpec::ModelPrepare)
-            || matches!(spec, JobSpec::LibraryIndex(spec) if spec.embeds_images());
-        if !needs_text && !needs_image {
-            return Ok(());
-        }
-        let needs_image_text = needs_image && self.image_embedder.model().supports_text_queries();
-        job.preparing_models(
-            u64::from(needs_text) + u64::from(needs_image) + u64::from(needs_image_text),
-        );
-        if needs_text {
-            self.embedder.prepare_with_progress(job)?;
-            job.models_loaded(1);
-        }
+    fn prepare_job_models(&self, job: &Job) -> anyhow::Result<()> {
+        let needs_image_text = self.image_embedder.model().supports_text_queries();
+        job.preparing_models(2 + u64::from(needs_image_text));
+        self.embedder.prepare_with_progress(job)?;
+        job.models_loaded(1);
         job.check_cancelled()?;
-        if needs_image {
-            self.image_embedder.prepare_with_progress(job)?;
+        self.image_embedder.prepare_with_progress(job)?;
+        job.models_loaded(1);
+        job.check_cancelled()?;
+        if needs_image_text {
+            self.image_query_embedder.prepare_with_progress(job)?;
             job.models_loaded(1);
-            job.check_cancelled()?;
-            if needs_image_text {
-                self.image_query_embedder.prepare_with_progress(job)?;
-                job.models_loaded(1);
-            }
         }
         job.check_cancelled()
     }
@@ -869,11 +904,12 @@ impl JobManager {
     fn run_index_pipeline(
         &self,
         spec: indexing::Spec,
-        ocr_models: Option<&Arc<Mutex<nicegal_core::ocr::PaddleOcrPool>>>,
+        ocr_models: Option<&Arc<StdMutex<nicegal_core::ocr::PaddleOcrPool>>>,
         job: &Job,
     ) -> anyhow::Result<()> {
         let embed_text = spec.embeds_text();
         let embed_image = spec.embeds_images();
+        let index_videos = spec.indexes_videos();
         let root = spec.root().clone();
         let retry_failed = spec.retry_failed();
         let debug_limit = spec.debug_limit();
@@ -890,11 +926,29 @@ impl JobManager {
                 if !embed_image {
                     return Ok(());
                 }
+                let image_spec = image_embeddings::Spec::pending_for(
+                    root.clone(),
+                    retry_failed,
+                    debug_limit,
+                    index_videos,
+                );
+                if !image_embeddings::has_pending(
+                    &image_spec,
+                    &self.databases,
+                    self.image_embedder.dimensions(),
+                    Some(catalog),
+                )? {
+                    return Ok(());
+                }
+                job.preparing_models(1);
+                let model = self.image_embedder.prepare_with_progress(job)?;
+                job.models_loaded(1);
+                job.check_cancelled()?;
                 image_embeddings::run(
-                    image_embeddings::Spec::pending_for(root.clone(), retry_failed, debug_limit),
-                    &self.databases.assets,
-                    &self.databases.images,
-                    self.image_embedder.prepare()?.as_ref(),
+                    image_spec,
+                    &self.databases,
+                    &self.thumbnails,
+                    model.as_ref(),
                     job,
                     Some(catalog),
                 )
@@ -906,19 +960,27 @@ impl JobManager {
                 &self.databases,
                 self.image_embedder.dimensions(),
                 &self.thumbnails,
-                &scanned,
+                prune_jobs::ReconcileInput::Scanned(&scanned),
                 job,
             )
         })?;
         if !embed_text {
             return Ok(());
         }
-        text_embeddings::job::run(
-            text_embeddings::job::Spec::pending_for(root, debug_limit),
+        let text_spec = text_embeddings::job::Spec::pending_for(root, debug_limit);
+        if !text_embeddings::job::has_pending(
+            &text_spec,
             &self.databases.ocr,
-            self.embedder.prepare()?.as_ref(),
-            job,
-        )
+            self.embedder.model().id(),
+            self.embedder.dimensions(),
+        )? {
+            return Ok(());
+        }
+        job.preparing_models(1);
+        let model = self.embedder.prepare_with_progress(job)?;
+        job.models_loaded(1);
+        job.check_cancelled()?;
+        text_embeddings::job::run(text_spec, &self.databases.ocr, model.as_ref(), job)
     }
 
     fn get(&self, id: u64) -> Option<Arc<Job>> {

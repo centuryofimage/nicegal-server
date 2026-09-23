@@ -2,11 +2,12 @@
 use super::{
     DecodedThumbnail, Thumbnail, ThumbnailEncoding, validate_key, validate_static_thumbnail,
 };
-use crate::assets::SourceFingerprint;
+use crate::assets::{Asset, MediaKind, SourceFingerprint};
 use crate::schema::{check_schema_read_only, open_schema_with_migrations};
 use crate::storage::{
     READ_ONLY_FLAGS, configure_reader, configure_writer, maintain, validate_asset_ids,
 };
+use crate::{poster, video};
 use anyhow::{Context, Result, bail};
 use camino::Utf8Path as Path;
 use rusqlite::{Connection, OptionalExtension};
@@ -16,9 +17,71 @@ use tracing::{debug_span, field, trace_span};
 const SCHEMA_VERSION: i32 = 4;
 const SCHEMA_LABEL: &str = "thumbnail database";
 const MIGRATIONS: &[(i32, &str)] = &[(3, "VACUUM;")];
+const VIDEO_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS video_thumbnails(
+    asset_id INTEGER NOT NULL CHECK(asset_id > 0),
+    timestamp_ms INTEGER NOT NULL CHECK(timestamp_ms >= 0),
+    size_bucket INTEGER NOT NULL CHECK(size_bucket IN (128, 256, 512, 1024)),
+    sampling_version INTEGER NOT NULL CHECK(sampling_version > 0),
+    source_modified_ns INTEGER NOT NULL,
+    source_size INTEGER NOT NULL CHECK(source_size >= 0),
+    width INTEGER NOT NULL CHECK(width > 0),
+    height INTEGER NOT NULL CHECK(height > 0),
+    encoding TEXT NOT NULL CHECK(encoding IN ('image/jpeg', 'image/png', 'image/webp')),
+    data BLOB NOT NULL,
+    PRIMARY KEY(asset_id, timestamp_ms, size_bucket)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS video_thumbnail_assets_idx ON video_thumbnails(asset_id);";
 
 pub struct ThumbnailDb {
     conn: Connection,
+}
+
+/// Encoded poster buckets are prepared off the SQLite writer thread.
+pub struct EncodedVideoSamples {
+    rows: Vec<(i64, Vec<poster::StaticPoster>)>,
+}
+
+pub fn encode_video_samples(
+    asset: &Asset,
+    samples: &[video::VideoSample],
+) -> Result<EncodedVideoSamples> {
+    encode_video_samples_with_output(asset, samples, video::VideoOutputOptions::default())
+}
+
+pub fn encode_video_samples_with_output(
+    asset: &Asset,
+    samples: &[video::VideoSample],
+    output: video::VideoOutputOptions,
+) -> Result<EncodedVideoSamples> {
+    if asset.media_kind != MediaKind::Video {
+        bail!("asset {} is not a video", asset.asset_id);
+    }
+    if asset.asset_id <= 0 {
+        bail!("asset identifier must be greater than zero");
+    }
+    if samples.is_empty() {
+        bail!("video has no sample frames");
+    }
+    let span = debug_span!("video_sample_encode", path = %asset.path, samples = samples.len());
+    let _entered = span.enter();
+    let mut rows = Vec::with_capacity(samples.len());
+    let mut seen_timestamps = std::collections::HashSet::new();
+    for sample in samples {
+        if sample.timestamp_ms < 0 {
+            bail!("video sample timestamp must be nonnegative");
+        }
+        if !seen_timestamps.insert(sample.timestamp_ms) {
+            continue;
+        }
+        let posters = poster::raster_buckets_with_output_at(
+            &asset.path,
+            &sample.raster,
+            &super::SIZE_BUCKETS,
+            output,
+        )?;
+        rows.push((sample.timestamp_ms, posters));
+    }
+    Ok(EncodedVideoSamples { rows })
 }
 
 impl ThumbnailDb {
@@ -35,6 +98,9 @@ impl ThumbnailDb {
             include_str!("../thumbs_create.sql"),
             MIGRATIONS,
         )?;
+        // Version 4 is also consumed directly by Electron. Additive table creation keeps its
+        // existing reader compatible with databases created before video thumbnails existed.
+        conn.execute_batch(VIDEO_TABLE_SQL)?;
         Ok(Self { conn })
     }
 
@@ -117,6 +183,164 @@ impl ThumbnailDb {
         drop(statement);
         transaction.commit().context("committing thumbnail batch")?;
         Ok(())
+    }
+
+    /// Replace all indexed samples for this video and refresh its default gallery poster.
+    /// Each timestamp has every public size bucket, encoded from the decoded raster.
+    pub fn store_video_samples(&self, asset: &Asset, samples: &[video::VideoSample]) -> Result<()> {
+        self.store_video_samples_with_output(asset, samples, video::VideoOutputOptions::default())
+    }
+
+    pub fn store_video_samples_with_output(
+        &self,
+        asset: &Asset,
+        samples: &[video::VideoSample],
+        output: video::VideoOutputOptions,
+    ) -> Result<()> {
+        let encoded = encode_video_samples_with_output(asset, samples, output)?;
+        self.store_encoded_video_samples(asset, &encoded)
+    }
+
+    pub fn store_encoded_video_samples(
+        &self,
+        asset: &Asset,
+        encoded: &EncodedVideoSamples,
+    ) -> Result<()> {
+        let span = debug_span!("video_sample_store", path = %asset.path, asset_id = asset.asset_id, samples = encoded.rows.len());
+        let _entered = span.enter();
+        if asset.media_kind != MediaKind::Video {
+            bail!("asset {} is not a video", asset.asset_id);
+        }
+        if asset.asset_id <= 0 {
+            bail!("asset identifier must be greater than zero");
+        }
+        if encoded.rows.is_empty() {
+            bail!("video has no sample frames");
+        }
+        let source_size = i64::try_from(asset.fingerprint.size)
+            .context("source byte size exceeds SQLite's integer range")?;
+        let write_span =
+            debug_span!("video_sample_write", path = %asset.path, samples = encoded.rows.len());
+        let _writing = write_span.enter();
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM video_thumbnails WHERE asset_id = ?1",
+            [asset.asset_id],
+        )?;
+        {
+            let mut insert = tx.prepare_cached(
+                "INSERT INTO video_thumbnails (asset_id, timestamp_ms, size_bucket, sampling_version, source_modified_ns, source_size, width, height, encoding, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
+            )?;
+            for (timestamp_ms, posters) in &encoded.rows {
+                for (&bucket, poster) in super::SIZE_BUCKETS.iter().zip(posters) {
+                    insert.execute((
+                        asset.asset_id,
+                        timestamp_ms,
+                        bucket,
+                        video::SAMPLING_VERSION,
+                        asset.fingerprint.modified_ns,
+                        source_size,
+                        poster.width,
+                        poster.height,
+                        poster.encoding.content_type(),
+                        &poster.data,
+                    ))?;
+                }
+            }
+        }
+        // The first indexed frame is also the standard gallery poster, readable by the
+        // unchanged desktop thumbnail reader.
+        for (&bucket, poster) in super::SIZE_BUCKETS.iter().zip(&encoded.rows[0].1) {
+            tx.execute(
+                "INSERT INTO thumbnails (asset_id, size_bucket, generator_version, source_modified_ns, source_size, width, height, encoding, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(asset_id, size_bucket, generator_version) DO UPDATE SET source_modified_ns=excluded.source_modified_ns, source_size=excluded.source_size, width=excluded.width, height=excluded.height, encoding=excluded.encoding, data=excluded.data",
+                (asset.asset_id, bucket, super::GENERATOR_VERSION, asset.fingerprint.modified_ns,
+                    source_size, poster.width, poster.height, poster.encoding.content_type(), &poster.data),
+            )?;
+        }
+        tx.commit().context("committing video thumbnails")?;
+        Ok(())
+    }
+
+    /// Read an exact indexed video frame without opening or decoding the source video.
+    pub fn get_video_sample(
+        &self,
+        asset_id: i64,
+        timestamp_ms: i64,
+        requested_physical_size: u32,
+        fingerprint: SourceFingerprint,
+    ) -> Result<Option<Thumbnail>> {
+        if asset_id <= 0 || timestamp_ms < 0 || requested_physical_size == 0 {
+            bail!("invalid video sample thumbnail key");
+        }
+        let source_size = i64::try_from(fingerprint.size)
+            .context("source byte size exceeds SQLite's integer range")?;
+        let row = self.conn.query_row(
+            "SELECT size_bucket, width, height, encoding, data FROM video_thumbnails WHERE asset_id=?1 AND timestamp_ms=?2 AND sampling_version=?3 AND source_modified_ns=?4 AND source_size=?5 ORDER BY CASE WHEN size_bucket >= ?6 THEN 0 ELSE 1 END, CASE WHEN size_bucket >= ?6 THEN size_bucket END ASC, CASE WHEN size_bucket < ?6 THEN size_bucket END DESC LIMIT 1",
+            (asset_id, timestamp_ms, video::SAMPLING_VERSION, fingerprint.modified_ns, source_size, i64::from(requested_physical_size)),
+            |row| Ok((row.get::<_, u16>(0)?, row.get::<_, u32>(1)?, row.get::<_, u32>(2)?, row.get::<_, String>(3)?, row.get::<_, Vec<u8>>(4)?)),
+        ).optional()?;
+        row.map(|(size_bucket, width, height, encoding, data)| {
+            Ok(Thumbnail {
+                size_bucket,
+                generator_version: super::GENERATOR_VERSION,
+                width,
+                height,
+                encoding: ThumbnailEncoding::parse(&encoding)?,
+                data,
+            })
+        })
+        .transpose()
+    }
+
+    /// Whether every indexed frame still has all persisted sizes and the gallery poster.
+    pub(crate) fn has_current_video_samples(
+        &self,
+        asset: &Asset,
+        timestamps: &[i64],
+    ) -> Result<bool> {
+        if timestamps.is_empty() {
+            return Ok(false);
+        }
+        let source_size = i64::try_from(asset.fingerprint.size)
+            .context("source byte size exceeds SQLite's integer range")?;
+        let mut statement = self.conn.prepare_cached(
+            "SELECT timestamp_ms, size_bucket FROM video_thumbnails WHERE asset_id = ?1 AND sampling_version = ?2 AND source_modified_ns = ?3 AND source_size = ?4",
+        )?;
+        let variants = statement
+            .query_map(
+                (
+                    asset.asset_id,
+                    video::SAMPLING_VERSION,
+                    asset.fingerprint.modified_ns,
+                    source_size,
+                ),
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, u16>(1)?)),
+            )?
+            .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?;
+        if !timestamps.iter().all(|timestamp| {
+            super::SIZE_BUCKETS
+                .iter()
+                .all(|bucket| variants.contains(&(*timestamp, *bucket)))
+        }) {
+            return Ok(false);
+        }
+        let mut poster = self.conn.prepare_cached(
+            "SELECT size_bucket FROM thumbnails WHERE asset_id = ?1 AND generator_version = ?2 AND source_modified_ns = ?3 AND source_size = ?4",
+        )?;
+        let poster_buckets = poster
+            .query_map(
+                (
+                    asset.asset_id,
+                    super::GENERATOR_VERSION,
+                    asset.fingerprint.modified_ns,
+                    source_size,
+                ),
+                |row| row.get::<_, u16>(0),
+            )?
+            .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?;
+        Ok(super::SIZE_BUCKETS
+            .iter()
+            .all(|bucket| poster_buckets.contains(bucket)))
     }
 
     pub fn has_current(
@@ -287,19 +511,27 @@ impl ThumbnailDb {
             return Ok(0);
         }
         let transaction = self.conn.unchecked_transaction()?;
-        let deleted = {
+        let mut deleted = {
             let mut statement =
                 transaction.prepare("DELETE FROM thumbnails WHERE asset_id = ?1")?;
             asset_ids.iter().try_fold(0usize, |deleted, asset_id| {
                 statement.execute([asset_id]).map(|count| deleted + count)
             })?
         };
+        {
+            let mut statement =
+                transaction.prepare("DELETE FROM video_thumbnails WHERE asset_id = ?1")?;
+            for asset_id in asset_ids {
+                deleted += statement.execute([asset_id])?;
+            }
+        }
         transaction
             .commit()
             .context("committing asset thumbnail deletions")?;
         Ok(deleted)
     }
 
+    #[tracing::instrument(level = "debug", skip(self))]
     pub fn prune_orphans(&self, catalog: &Path) -> Result<usize> {
         self.conn
             .execute(
@@ -307,23 +539,44 @@ impl ThumbnailDb {
                 [catalog.as_str()],
             )
             .with_context(|| format!("attaching asset catalog for thumbnail pruning: {catalog}"))?;
+        // Resolve orphan IDs from the covering index before touching blob-bearing table rows.
+        // A direct DELETE with NOT EXISTS visits every WITHOUT ROWID table row even when none match.
         let result = self
             .conn
             .execute(
                 "DELETE FROM thumbnails
-                 WHERE NOT EXISTS (
-                     SELECT 1 FROM maintenance_catalog.assets
-                     WHERE assets.asset_id = thumbnails.asset_id
+                 WHERE asset_id IN (
+                     SELECT asset_id FROM thumbnails AS candidates
+                     WHERE NOT EXISTS (
+                         SELECT 1 FROM maintenance_catalog.assets
+                         WHERE assets.asset_id = candidates.asset_id
+                     )
                  )",
                 [],
             )
             .context("pruning orphaned thumbnails");
+        let video_result = self
+            .conn
+            .execute(
+                "DELETE FROM video_thumbnails
+             WHERE asset_id IN (
+                 SELECT DISTINCT candidates.asset_id
+                   FROM video_thumbnails AS candidates INDEXED BY video_thumbnail_assets_idx
+                  WHERE NOT EXISTS (
+                      SELECT 1 FROM maintenance_catalog.assets
+                       WHERE assets.asset_id = candidates.asset_id
+                  )
+             )",
+                [],
+            )
+            .context("pruning orphaned video thumbnails");
         self.conn
             .execute_batch("DETACH DATABASE maintenance_catalog")
             .context("detaching asset catalog after thumbnail pruning")?;
-        result
+        Ok(result? + video_result?)
     }
 
+    #[tracing::instrument(level = "debug", skip(self))]
     pub fn maintain(&self) -> Result<()> {
         maintain(&self.conn).context("maintaining thumbnail database")
     }

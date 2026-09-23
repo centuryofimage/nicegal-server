@@ -1,6 +1,6 @@
 //! Opening a library never loads sessions. Indexing may download; search loads cached files only.
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -12,6 +12,7 @@ use nicegal_core::embedding::{
     ImageEmbedder, ImageEmbedderOptions, ImageQueryEmbedder, ImageQueryEmbedderOptions,
     TextEmbedder, TextEmbedderOptions,
 };
+use parking_lot::Mutex;
 use serde::Serialize;
 
 use super::{AppState, error::ApiError};
@@ -62,10 +63,7 @@ impl<T, O> LazyModel<T, O> {
     }
 
     pub(super) fn status(&self) -> ModelStatus {
-        self.status
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        self.status.lock().clone()
     }
 
     pub(super) fn prepare(&self) -> Result<Arc<T>> {
@@ -74,11 +72,11 @@ impl<T, O> LazyModel<T, O> {
     }
 
     fn prepare_with(&self, loader: impl FnOnce() -> Result<Option<T>>) -> Result<Option<Arc<T>>> {
-        let _guard = self.preparation.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = self.preparation.lock();
         if let Some(session) = self.session.get() {
             return Ok(Some(Arc::clone(session)));
         }
-        *self.status.lock().unwrap_or_else(|e| e.into_inner()) = ModelStatus {
+        *self.status.lock() = ModelStatus {
             state: ModelState::Preparing,
             error: None,
         };
@@ -101,21 +99,21 @@ impl<T, O> LazyModel<T, O> {
             Ok(Some(session)) => {
                 let session = Arc::new(session);
                 let _ = self.session.set(Arc::clone(&session));
-                *self.status.lock().unwrap_or_else(|e| e.into_inner()) = ModelStatus {
+                *self.status.lock() = ModelStatus {
                     state: ModelState::Ready,
                     error: None,
                 };
                 Ok(Some(session))
             }
             Ok(None) => {
-                *self.status.lock().unwrap_or_else(|e| e.into_inner()) = ModelStatus {
+                *self.status.lock() = ModelStatus {
                     state: ModelState::NotLoaded,
                     error: None,
                 };
                 Ok(None)
             }
             Err(error) => {
-                *self.status.lock().unwrap_or_else(|e| e.into_inner()) = ModelStatus {
+                *self.status.lock() = ModelStatus {
                     state: ModelState::Failed,
                     error: Some(format!("{error:#}")),
                 };
