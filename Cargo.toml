@@ -62,6 +62,7 @@ resolver = "2"
 
 [patch.crates-io]
 hf-hub = { path = "vendor/hf-hub" }
+ffmpeg-sys-the-third = { path = "vendor/ffmpeg-the-third/ffmpeg-sys-the-third" }
 
 [profile.release]
 opt-level = 3
