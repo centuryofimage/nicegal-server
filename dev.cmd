@@ -5,4 +5,5 @@ if not defined VCToolsInstallDir (
 )
 call "%~dp0dev.bat"
 if errorlevel 1 exit /b %errorlevel%
+if not defined CARGO_BUILD_WARNINGS set "CARGO_BUILD_WARNINGS=deny"
 cargo %*
