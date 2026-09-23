@@ -2,8 +2,6 @@
 if not defined VCPKG_ROOT set "VCPKG_ROOT=%USERPROFILE%\vcpkg"
 set "VCPKGRS_TRIPLET=x64-win-llvm-lto-static-md-rel"
 if not defined LIBCLANG_PATH set "LIBCLANG_PATH=%ProgramFiles%\Microsoft Visual Studio\18\Community\VC\Tools\Llvm\x64\bin"
-REM The custom FFmpeg archives contain LLVM ThinLTO objects, which require LLD.
-if not defined CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER set "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=%LIBCLANG_PATH%\lld-link.exe"
 REM Do not accidentally link Scoop's shared import libraries via a global FFMPEG_DIR.
 REM Use the app-specific override when building with another static FFmpeg package.
 if defined NICEGAL_FFMPEG_DIR (
