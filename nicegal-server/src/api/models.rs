@@ -41,13 +41,14 @@ pub(crate) struct LazyModel<T, O> {
     session: OnceLock<Arc<T>>,
     preparation: Mutex<()>,
     status: Mutex<ModelStatus>,
-    loader: fn(&O) -> Result<T>,
+    #[cfg(test)]
+    loader: Option<fn(&O) -> Result<T>>,
     cached_loader: Option<CachedLoader<T, O>>,
     name: &'static str,
 }
 
 impl<T, O> LazyModel<T, O> {
-    fn new(options: O, name: &'static str, loader: fn(&O) -> Result<T>) -> Self {
+    fn new(options: O, name: &'static str) -> Self {
         Self {
             options,
             session: OnceLock::new(),
@@ -56,7 +57,8 @@ impl<T, O> LazyModel<T, O> {
                 state: ModelState::NotLoaded,
                 error: None,
             }),
-            loader,
+            #[cfg(test)]
+            loader: None,
             cached_loader: None,
             name,
         }
@@ -66,8 +68,17 @@ impl<T, O> LazyModel<T, O> {
         self.status.lock().clone()
     }
 
+    #[cfg(test)]
+    fn new_with_loader(options: O, name: &'static str, loader: fn(&O) -> Result<T>) -> Self {
+        let mut model = Self::new(options, name);
+        model.loader = Some(loader);
+        model
+    }
+
+    #[cfg(test)]
     pub(super) fn prepare(&self) -> Result<Arc<T>> {
-        self.prepare_with(|| (self.loader)(&self.options).map(Some))?
+        let loader = self.loader.expect("test model has a loader");
+        self.prepare_with(|| loader(&self.options).map(Some))?
             .context("download-capable loader returned no model")
     }
 
@@ -170,7 +181,11 @@ macro_rules! model {
                 .context("download-capable loader returned no model")
             }
             pub(crate) fn deferred(options: $options) -> Self {
-                let mut model = Self::new(options, $name, $session::load);
+                let mut model = Self::new(options, $name);
+                #[cfg(test)]
+                {
+                    model.loader = Some($session::load);
+                }
                 model.cached_loader = $cached;
                 model
             }
@@ -272,7 +287,7 @@ mod tests {
     #[test]
     fn deferred_models_do_not_load_until_prepared_and_failures_can_retry() {
         let attempts = Arc::new(AtomicUsize::new(0));
-        let model = LazyModel::new(Arc::clone(&attempts), "test model", |attempts| {
+        let model = LazyModel::new_with_loader(Arc::clone(&attempts), "test model", |attempts| {
             if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                 anyhow::bail!("simulated download failure");
             }
@@ -302,7 +317,7 @@ mod tests {
     fn preparation_is_observable_without_waiting_for_the_loader() {
         let entered = Arc::new(std::sync::Barrier::new(2));
         let release = Arc::new(std::sync::Barrier::new(2));
-        let model = Arc::new(LazyModel::new(
+        let model = Arc::new(LazyModel::new_with_loader(
             (Arc::clone(&entered), Arc::clone(&release)),
             "test model",
             |barriers| {
@@ -323,7 +338,7 @@ mod tests {
 
     #[test]
     fn a_loader_panic_is_a_visible_retryable_failure() {
-        let model = LazyModel::new(AtomicUsize::new(0), "test model", |attempts| {
+        let model = LazyModel::new_with_loader(AtomicUsize::new(0), "test model", |attempts| {
             if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                 panic!("simulated loader panic");
             }
@@ -346,10 +361,11 @@ mod tests {
     #[test]
     fn searches_use_only_the_cached_loader_and_reuse_its_session() {
         let downloads = Arc::new(AtomicUsize::new(0));
-        let mut model = LazyModel::new(Arc::clone(&downloads), "test model", |downloads| {
-            downloads.fetch_add(1, Ordering::SeqCst);
-            Ok(0)
-        });
+        let mut model =
+            LazyModel::new_with_loader(Arc::clone(&downloads), "test model", |downloads| {
+                downloads.fetch_add(1, Ordering::SeqCst);
+                Ok(0)
+            });
         model.cached_loader = Some(|_| Ok(None));
         assert_eq!(
             model.ready_or_cached().unwrap_err().code.as_str(),
@@ -368,7 +384,7 @@ mod tests {
     #[test]
     fn a_corrupt_cached_model_does_not_trigger_a_download() {
         let mut model: LazyModel<i32, ()> =
-            LazyModel::new((), "test model", |_| panic!("must not download"));
+            LazyModel::new_with_loader((), "test model", |_| panic!("must not download"));
         model.cached_loader = Some(|_| anyhow::bail!("invalid cached ONNX model"));
         assert!(model.ready_or_cached().is_err());
         assert_eq!(model.status().state, ModelState::Failed);
