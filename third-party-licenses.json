@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "scope": "Cargo workspace dependencies, including transitive, build, development, and target-specific crates resolved by cargo metadata --locked. License expressions are package-author metadata, not a legal compatibility assessment or complete attribution bundle. Available root license/notice files and declared license files are retained as text. Native runtimes are listed separately; downloaded model weights are not included.",
-  "lockfileSha256": "5a68135bd307f30b1a64d28fc5e049492b7e83c634ed5ca9f20a6d693793d94c",
+  "lockfileSha256": "81d610647d9d3c08b3fbed26b59c75f4b73efaf7864d5b81fd56bec6f0e8a271",
   "packages": [
     {
       "name": "adler2",
