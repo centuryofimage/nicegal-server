@@ -1,8 +1,8 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::convert::Infallible;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -16,6 +16,7 @@ use axum::routing::{get, post};
 use camino::Utf8PathBuf as PathBuf;
 use nicegal_core::hub::{DownloadObserver, ModelSource};
 use nicegal_core::index::{IndexEvent, IndexObserver, IndexPhase, IndexProgressDelta};
+use nicegal_core::libraries::ScanOutcome;
 use nicegal_core::thumbs::ThumbnailService;
 use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
@@ -28,7 +29,7 @@ use super::error::ApiError;
 use super::extract::ApiJson;
 use super::models::{ImageModel as ImageEmbedder, ImageQueryModel, TextModel as TextEmbedder};
 use super::{
-    AppState, Databases, image_embeddings, indexing, ocr_models, prune_jobs, text_embeddings,
+    AppState, Databases, image_embeddings, library_scan, ocr_models, prune_jobs, text_embeddings,
     thumbnails,
 };
 
@@ -57,18 +58,6 @@ pub(crate) fn is_cancelled(error: &anyhow::Error) -> bool {
     error.downcast_ref::<JobCancelled>().is_some() || nicegal_core::hub::is_cancellation(error)
 }
 
-fn reconcile_after_discovery(
-    cancelled: bool,
-    scan_complete: bool,
-    reconcile: impl FnOnce() -> anyhow::Result<()>,
-) -> anyhow::Result<()> {
-    cancel_if(cancelled)?;
-    if !scan_complete {
-        return Ok(());
-    }
-    reconcile()
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(
     tag = "type",
@@ -79,8 +68,7 @@ fn reconcile_after_discovery(
 enum JobRequest {
     ModelPrepare(EmptyParams),
     OcrModelLoad(ocr_models::job::Request),
-    LibraryIndex(indexing::Request),
-    CatalogSync(indexing::CatalogSyncRequest),
+    LibraryScan(library_scan::Request),
     ThumbnailGenerate(thumbnails::job::Request),
     TextEmbed(text_embeddings::job::Request),
     ImageEmbed(image_embeddings::Request),
@@ -95,8 +83,7 @@ struct EmptyParams {}
 pub(super) enum JobSpec {
     ModelPrepare,
     OcrModelLoad(ocr_models::job::Spec),
-    LibraryIndex(indexing::Spec),
-    CatalogSync(indexing::CatalogSyncSpec),
+    LibraryScan(library_scan::Spec),
     ThumbnailGenerate(thumbnails::job::Spec),
     TextEmbed(text_embeddings::job::Spec),
     ImageEmbed(image_embeddings::Spec),
@@ -111,10 +98,7 @@ impl JobRequest {
             Self::OcrModelLoad(request) => {
                 Ok(JobSpec::OcrModelLoad(ocr_models::job::prepare(request)?))
             }
-            Self::LibraryIndex(request) => Ok(JobSpec::LibraryIndex(indexing::prepare(request)?)),
-            Self::CatalogSync(request) => Ok(JobSpec::CatalogSync(indexing::prepare_catalog_sync(
-                request,
-            )?)),
+            Self::LibraryScan(request) => Ok(JobSpec::LibraryScan(library_scan::prepare(request)?)),
             Self::ThumbnailGenerate(request) => Ok(JobSpec::ThumbnailGenerate(
                 thumbnails::job::prepare(request)?,
             )),
@@ -133,22 +117,30 @@ impl JobRequest {
 }
 
 impl JobSpec {
+    /// The library the job works on, which must exist when the job is accepted.
+    fn library_id(&self) -> Option<i64> {
+        match self {
+            Self::LibraryScan(spec) => Some(spec.library_id()),
+            Self::ThumbnailGenerate(spec) => Some(spec.library_id()),
+            Self::TextEmbed(spec) => spec.library_id(),
+            Self::ImageEmbed(spec) => spec.library_id(),
+            Self::PruneMissing(spec) => Some(spec.library_id()),
+            Self::LibraryPurge(spec) => Some(spec.library_id()),
+            Self::ModelPrepare | Self::OcrModelLoad(_) => None,
+        }
+    }
+
     fn kind(&self) -> JobKind {
         match self {
             Self::ModelPrepare => JobKind::ModelPrepare,
             Self::OcrModelLoad(_) => JobKind::OcrModelLoad,
-            Self::LibraryIndex(_) => JobKind::LibraryIndex,
-            Self::CatalogSync(_) => JobKind::CatalogSync,
+            Self::LibraryScan(_) => JobKind::LibraryScan,
             Self::ThumbnailGenerate(_) => JobKind::ThumbnailGenerate,
             Self::TextEmbed(_) => JobKind::TextEmbed,
             Self::ImageEmbed(_) => JobKind::ImageEmbed,
             Self::PruneMissing(_) => JobKind::PruneMissing,
             Self::LibraryPurge(_) => JobKind::LibraryPurge,
         }
-    }
-
-    fn requires_loaded_ocr_models(&self) -> bool {
-        matches!(self, Self::LibraryIndex(spec) if spec.recognizes_text())
     }
 }
 
@@ -157,8 +149,7 @@ impl JobSpec {
 enum JobKind {
     OcrModelLoad,
     ModelPrepare,
-    LibraryIndex,
-    CatalogSync,
+    LibraryScan,
     ThumbnailGenerate,
     TextEmbed,
     ImageEmbed,
@@ -260,15 +251,52 @@ impl DownloadObserver for Job {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq)]
-struct IndexStages {
-    ocr: bool,
-    image: bool,
-    text: bool,
+pub(super) struct IndexStages {
+    pub(super) ocr: bool,
+    pub(super) image: bool,
+    pub(super) text: bool,
+}
+
+/// Where one folder of a `libraryScan` stands.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(super) enum FolderState {
+    Queued,
+    Scanning,
+    /// Walked and cataloged completely; the library's indexes are still catching up.
+    Scanned,
+    /// Scanned, and every enabled index has caught up with it.
+    Completed,
+    /// Walked, but some entries could not be read or a debug limit stopped it. Not cleaned up.
+    Incomplete,
+    /// Offline or unreadable. Its cached entries are kept and it stays pending.
+    Unavailable,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct FolderProgress {
+    path: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scan_mode: Option<&'static str>,
+    state: FolderState,
+    /// Files found by this folder's walk.
+    discovered: usize,
+    /// Files confirmed in the catalog by this walk, whether new, changed, or already current.
+    cataloged: usize,
+    failed: usize,
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 struct JobData {
     index_stages: Option<IndexStages>,
+    /// Per-folder progress of a `libraryScan`, in scan order.
+    folders: Option<Vec<FolderProgress>>,
+    /// The folder whose walk the current catalog events belong to.
+    current_folder: Option<usize>,
     status: JobStatus,
     phase: JobPhase,
     progress: JobProgress,
@@ -292,7 +320,11 @@ struct JobItemError {
 pub(super) struct JobResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     index_stages: Option<IndexStages>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    folders: Option<Vec<FolderProgress>>,
     job_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    library_id: Option<i64>,
     #[serde(rename = "type")]
     kind: JobKind,
     status: JobStatus,
@@ -316,15 +348,24 @@ struct JobListResponse {
 pub(super) struct Job {
     id: u64,
     kind: JobKind,
+    library_id: Option<i64>,
+    scan_requests: Mutex<Vec<(PathBuf, i64)>>,
     cancel_requested: Arc<AtomicBool>,
     data: Mutex<JobData>,
     updates: watch::Sender<JobResponse>,
 }
 
 impl Job {
+    #[cfg(test)]
     fn new(id: u64, kind: JobKind) -> Self {
+        Self::new_for(id, kind, None)
+    }
+
+    fn new_for(id: u64, kind: JobKind, library_id: Option<i64>) -> Self {
         let data = JobData {
             index_stages: None,
+            folders: None,
+            current_folder: None,
             status: JobStatus::Queued,
             phase: JobPhase::Queued,
             progress: JobProgress::default(),
@@ -334,10 +375,12 @@ impl Job {
             phase_started_at: None,
             phase_started_skipped: 0,
         };
-        let (updates, _) = watch::channel(Self::response_from_data(id, kind, &data));
+        let (updates, _) = watch::channel(Self::response_from_data(id, kind, library_id, &data));
         Self {
             id,
             kind,
+            library_id,
+            scan_requests: Mutex::new(Vec::new()),
             cancel_requested: Arc::new(AtomicBool::new(false)),
             data: Mutex::new(data),
             updates,
@@ -352,10 +395,17 @@ impl Job {
         self.updates.borrow().clone()
     }
 
-    fn response_from_data(id: u64, kind: JobKind, data: &JobData) -> JobResponse {
+    fn response_from_data(
+        id: u64,
+        kind: JobKind,
+        library_id: Option<i64>,
+        data: &JobData,
+    ) -> JobResponse {
         JobResponse {
             index_stages: data.index_stages,
+            folders: data.folders.clone(),
             job_id: id.to_string(),
+            library_id,
             kind,
             status: data.status,
             phase: data.phase,
@@ -368,8 +418,12 @@ impl Job {
 
     fn publish(&self, data: &mut JobData) {
         refresh_phase_throughput(data);
-        self.updates
-            .send_replace(Self::response_from_data(self.id, self.kind, data));
+        self.updates.send_replace(Self::response_from_data(
+            self.id,
+            self.kind,
+            self.library_id,
+            data,
+        ));
     }
 
     fn subscribe(&self) -> watch::Receiver<JobResponse> {
@@ -403,7 +457,14 @@ impl Job {
         self.cancel_requested.store(true, Ordering::Release);
         let mut data = self.data();
         if !data.status.is_terminal() {
-            data.status = JobStatus::Cancelling;
+            data.status = if data.status == JobStatus::Queued {
+                JobStatus::Cancelled
+            } else {
+                JobStatus::Cancelling
+            };
+            if data.status == JobStatus::Cancelled {
+                data.phase = JobPhase::Finished;
+            }
             self.publish(&mut data);
             info!(job_id = self.id, kind = ?self.kind, "job cancellation requested");
         }
@@ -468,7 +529,79 @@ impl Job {
         self.publish(&mut data);
     }
 
-    fn preparing_models(&self, count: u64) {
+    pub(super) fn set_index_stages(&self, stages: IndexStages) {
+        let mut data = self.data();
+        data.index_stages = Some(stages);
+        self.publish(&mut data);
+    }
+
+    pub(super) fn set_folders(&self, paths: Vec<PathBuf>) {
+        let mut data = self.data();
+        data.folders = Some(
+            paths
+                .into_iter()
+                .map(|path| FolderProgress {
+                    path,
+                    scan_mode: None,
+                    state: FolderState::Queued,
+                    discovered: 0,
+                    cataloged: 0,
+                    failed: 0,
+                    error: None,
+                })
+                .collect(),
+        );
+        self.publish(&mut data);
+    }
+
+    pub(super) fn set_folder_scan_mode(&self, index: usize, mode: &'static str) {
+        let mut data = self.data();
+        if let Some(folder) = data
+            .folders
+            .as_mut()
+            .and_then(|folders| folders.get_mut(index))
+        {
+            folder.scan_mode = Some(mode);
+        }
+        self.publish(&mut data);
+    }
+
+    pub(super) fn set_scan_requests(&self, requests: Vec<(PathBuf, i64)>) {
+        *self.scan_requests.lock() = requests;
+    }
+
+    /// Attribute the following catalog events to folder `index` and mark it scanning.
+    pub(super) fn enter_folder(&self, index: usize) {
+        let mut data = self.data();
+        data.current_folder = Some(index);
+        if let Some(folder) = data
+            .folders
+            .as_mut()
+            .and_then(|folders| folders.get_mut(index))
+        {
+            folder.state = FolderState::Scanning;
+        }
+        self.publish(&mut data);
+    }
+
+    pub(super) fn leave_folder(&self) {
+        self.data().current_folder = None;
+    }
+
+    pub(super) fn finish_folder(&self, index: usize, state: FolderState, error: Option<String>) {
+        let mut data = self.data();
+        if let Some(folder) = data
+            .folders
+            .as_mut()
+            .and_then(|folders| folders.get_mut(index))
+        {
+            folder.state = state;
+            folder.error = error;
+        }
+        self.publish(&mut data);
+    }
+
+    pub(super) fn preparing_models(&self, count: u64) {
         let mut data = self.data();
         set_phase(&mut data, JobPhase::LoadingModels);
         data.progress.total = Some(count);
@@ -529,14 +662,25 @@ impl IndexObserver for Job {
                 };
                 set_phase(&mut data, phase);
             }
-            IndexEvent::Discovered { count } => data.progress.discovered = count,
+            IndexEvent::Discovered { count } => {
+                data.progress.discovered = count;
+                if let Some(folder) = current_folder(&mut data) {
+                    folder.discovered = count;
+                }
+            }
             IndexEvent::DiscoveryComplete { total } => {
                 data.progress.total = Some(total as u64);
                 if data.phase == JobPhase::Scanning {
                     data.progress.phase_completed = total as u64;
                 }
             }
-            IndexEvent::Progress(delta) => apply_delta(&mut data.progress, delta),
+            IndexEvent::Progress(delta) => {
+                apply_delta(&mut data.progress, delta);
+                if let Some(folder) = current_folder(&mut data) {
+                    folder.cataloged += delta.cataloged;
+                    folder.failed += delta.failed;
+                }
+            }
             IndexEvent::ActiveAsset { path, active } => {
                 if active {
                     data.active_asset_paths.insert(path);
@@ -552,6 +696,11 @@ impl IndexObserver for Job {
         }
         self.publish(&mut data);
     }
+}
+
+fn current_folder(data: &mut JobData) -> Option<&mut FolderProgress> {
+    let index = data.current_folder?;
+    data.folders.as_mut()?.get_mut(index)
 }
 
 fn apply_delta(progress: &mut JobProgress, delta: IndexProgressDelta) {
@@ -611,6 +760,7 @@ fn refresh_phase_throughput(data: &mut JobData) {
 struct JobRegistry {
     active: Option<u64>,
     jobs: BTreeMap<u64, Arc<Job>>,
+    queued: VecDeque<(u64, JobSpec)>,
 }
 
 pub(crate) struct JobManager {
@@ -655,43 +805,65 @@ impl JobManager {
     }
 
     pub(super) fn start(self: &Arc<Self>, spec: JobSpec) -> Result<Arc<Job>, ApiError> {
-        let job = {
+        let mut spec = Some(spec);
+        if let Some(JobSpec::LibraryScan(scan)) = spec.as_mut() {
+            scan.apply_settings(&self.runtime)
+                .map_err(ApiError::internal)?;
+        }
+        let mut replaced = Vec::new();
+        let (job, run_now) = {
             let mut registry = self.registry();
             if self.shutting_down.load(Ordering::Acquire) {
                 return Err(ApiError::shutting_down());
             }
             if let Some(active_id) = registry.active {
                 let active = registry.jobs.get(&active_id);
-                if active.is_some_and(|job| !job.response().status.is_terminal()) {
+                if active.is_some() && !matches!(spec, Some(JobSpec::LibraryScan(_))) {
                     return Err(ApiError::job_busy());
                 }
-                registry.active = None;
+            }
+            // At most one scan waits for the worker, and the newest request wins: a request for
+            // the queued library merges into it, and one for another library replaces it.
+            if let Some(JobSpec::LibraryScan(ref incoming)) = spec
+                && let Some((id, JobSpec::LibraryScan(queued))) = registry.queued.front_mut()
+                && queued.library_id() == incoming.library_id()
+            {
+                queued.merge(incoming);
+                let id = *id;
+                return Ok(Arc::clone(
+                    registry.jobs.get(&id).expect("queued job exists"),
+                ));
+            }
+            if registry.active.is_some() {
+                replaced.extend(registry.queued.drain(..).map(|(id, _)| id));
             }
             evict_retained_jobs(&mut registry);
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-            let job = Arc::new(Job::new(id, spec.kind()));
-            if let JobSpec::LibraryIndex(spec) = &spec {
-                let mut data = job.data();
-                data.index_stages = Some(IndexStages {
-                    ocr: spec.recognizes_text(),
-                    image: spec.embeds_images(),
-                    text: spec.embeds_text(),
-                });
-                job.publish(&mut data);
-            } else if let JobSpec::CatalogSync(spec) = &spec {
-                let mut data = job.data();
-                data.index_stages = Some(IndexStages {
-                    ocr: false,
-                    image: spec.embeds_images(),
-                    text: false,
-                });
-                job.publish(&mut data);
+            let job = Arc::new(Job::new_for(
+                id,
+                spec.as_ref().unwrap().kind(),
+                spec.as_ref().unwrap().library_id(),
+            ));
+            let run_now = registry.active.is_none();
+            if run_now {
+                registry.active = Some(id);
+            } else {
+                registry.queued.push_back((id, spec.take().unwrap()));
             }
-            registry.active = Some(id);
             registry.jobs.insert(id, Arc::clone(&job));
-            job
+            (job, run_now)
         };
+        // Outside the registry lock: cancelling records the replaced scan's folders as stopped.
+        for id in replaced {
+            self.cancel(id);
+        }
+        if run_now {
+            self.spawn_job(spec.take().unwrap(), Arc::clone(&job));
+        }
+        Ok(job)
+    }
 
+    fn spawn_job(self: &Arc<Self>, spec: JobSpec, job: Arc<Job>) {
         let manager = Arc::clone(self);
         let worker_job = Arc::clone(&job);
         let job_span = info_span!("job", job_id = job.id, kind = ?job.kind);
@@ -699,14 +871,24 @@ impl JobManager {
             async move {
                 match manager.run_job(spec, Arc::clone(&worker_job)).await {
                     Ok(()) => worker_job.complete(false),
-                    Err(error) if is_cancelled(&error) => worker_job.complete(true),
-                    Err(error) => worker_job.fail(format!("{error:#}")),
+                    Err(error) if is_cancelled(&error) => {
+                        manager.record_stopped_scan(
+                            &worker_job,
+                            ScanOutcome::Cancelled,
+                            "cancelled",
+                        );
+                        worker_job.complete(true);
+                    }
+                    Err(error) => {
+                        let message = format!("{error:#}");
+                        manager.record_stopped_scan(&worker_job, ScanOutcome::Failed, &message);
+                        worker_job.fail(message);
+                    }
                 }
                 manager.finish(worker_job.id);
             }
             .instrument(job_span),
         );
-        Ok(job)
     }
 
     async fn run_job(self: &Arc<Self>, spec: JobSpec, job: Arc<Job>) -> anyhow::Result<()> {
@@ -725,68 +907,30 @@ impl JobManager {
         let embedder = Arc::clone(&self.embedder);
         let image_embedder = Arc::clone(&self.image_embedder);
         let manager = Arc::clone(self);
-        let ocr_models = spec
-            .requires_loaded_ocr_models()
-            .then(|| self.ocr_models.snapshot())
-            .flatten();
+        let handle = tokio::runtime::Handle::current();
         let span = Span::current();
         tokio::task::spawn_blocking(move || {
             let _entered = span.enter();
             let result = (|| match spec {
                 JobSpec::ModelPrepare => manager.prepare_job_models(&job),
-                JobSpec::LibraryIndex(spec) => {
-                    manager.run_index_pipeline(spec, ocr_models.as_ref(), &job)
-                }
-                JobSpec::CatalogSync(spec) => {
-                    let reconciliation = spec.reconciliation();
-                    let embed_image = spec.embeds_images();
-                    let index_videos = spec.indexes_videos();
-                    let root = spec.root().clone();
-                    let debug_limit = spec.debug_limit();
-                    let delta = indexing::run_catalog_sync(spec, &databases.assets, job.as_ref())?;
-                    reconcile_after_discovery(delta.cancelled, delta.scan_complete, || {
-                        prune_jobs::reconcile(
-                            reconciliation,
-                            &databases,
-                            image_embedder.dimensions(),
-                            &thumbnails,
-                            prune_jobs::ReconcileInput::UnseenPaths(&delta.unseen_paths),
-                            job.as_ref(),
-                        )
-                    })?;
-                    if embed_image && !delta.cancelled && !delta.cataloged.is_empty() {
-                        let image_spec = image_embeddings::Spec::pending_for(
-                            root,
-                            false,
-                            debug_limit,
-                            index_videos,
-                        );
-                        if image_embeddings::has_pending(
-                            &image_spec,
-                            &databases,
-                            image_embedder.dimensions(),
-                            Some(&delta.cataloged),
-                        )? {
-                            job.preparing_models(1);
-                            let model = image_embedder.prepare_with_progress(job.as_ref())?;
-                            job.models_loaded(1);
-                            job.check_cancelled()?;
-                            image_embeddings::run(
-                                image_spec,
-                                &databases,
-                                &thumbnails,
-                                model.as_ref(),
-                                job.as_ref(),
-                                Some(&delta.cataloged),
-                            )?;
-                        }
-                    }
-                    Ok(())
-                }
+                JobSpec::LibraryScan(spec) => library_scan::run(
+                    spec,
+                    &library_scan::Services {
+                        databases: &databases,
+                        thumbnails: &thumbnails,
+                        text_embedder: &embedder,
+                        image_embedder: &image_embedder,
+                        ocr_store: &manager.ocr_models,
+                        runtime: &manager.runtime,
+                        handle,
+                    },
+                    &job,
+                ),
                 JobSpec::ThumbnailGenerate(spec) => {
                     thumbnails::job::run(spec, &databases.assets, &thumbnails, job.as_ref())
                 }
                 JobSpec::TextEmbed(spec) => {
+                    let spec = spec.resolve(&databases)?;
                     if !text_embeddings::job::has_pending(
                         &spec,
                         &databases.ocr,
@@ -801,6 +945,7 @@ impl JobManager {
                     text_embeddings::job::run(spec, &databases.ocr, model.as_ref(), job.as_ref())
                 }
                 JobSpec::ImageEmbed(spec) => {
+                    let spec = spec.resolve(&databases)?;
                     if !image_embeddings::has_pending(
                         &spec,
                         &databases,
@@ -901,95 +1046,50 @@ impl JobManager {
         job.check_cancelled()
     }
 
-    fn run_index_pipeline(
-        &self,
-        spec: indexing::Spec,
-        ocr_models: Option<&Arc<StdMutex<nicegal_core::ocr::PaddleOcrPool>>>,
-        job: &Job,
-    ) -> anyhow::Result<()> {
-        let embed_text = spec.embeds_text();
-        let embed_image = spec.embeds_images();
-        let index_videos = spec.indexes_videos();
-        let root = spec.root().clone();
-        let retry_failed = spec.retry_failed();
-        let debug_limit = spec.debug_limit();
-        let reconciliation = spec.reconciliation();
-        let mut scanned = Vec::new();
-        let summary = indexing::run(
-            spec,
-            &self.databases.assets,
-            &self.databases.ocr,
-            ocr_models,
-            job,
-            |catalog| {
-                scanned.extend_from_slice(catalog);
-                if !embed_image {
-                    return Ok(());
-                }
-                let image_spec = image_embeddings::Spec::pending_for(
-                    root.clone(),
-                    retry_failed,
-                    debug_limit,
-                    index_videos,
-                );
-                if !image_embeddings::has_pending(
-                    &image_spec,
-                    &self.databases,
-                    self.image_embedder.dimensions(),
-                    Some(catalog),
-                )? {
-                    return Ok(());
-                }
-                job.preparing_models(1);
-                let model = self.image_embedder.prepare_with_progress(job)?;
-                job.models_loaded(1);
-                job.check_cancelled()?;
-                image_embeddings::run(
-                    image_spec,
-                    &self.databases,
-                    &self.thumbnails,
-                    model.as_ref(),
-                    job,
-                    Some(catalog),
-                )
-            },
-        )?;
-        reconcile_after_discovery(summary.cancelled, summary.scan_complete, || {
-            prune_jobs::reconcile(
-                reconciliation,
-                &self.databases,
-                self.image_embedder.dimensions(),
-                &self.thumbnails,
-                prune_jobs::ReconcileInput::Scanned(&scanned),
-                job,
-            )
-        })?;
-        if !embed_text {
-            return Ok(());
-        }
-        let text_spec = text_embeddings::job::Spec::pending_for(root, debug_limit);
-        if !text_embeddings::job::has_pending(
-            &text_spec,
-            &self.databases.ocr,
-            self.embedder.model().id(),
-            self.embedder.dimensions(),
-        )? {
-            return Ok(());
-        }
-        job.preparing_models(1);
-        let model = self.embedder.prepare_with_progress(job)?;
-        job.models_loaded(1);
-        job.check_cancelled()?;
-        text_embeddings::job::run(text_spec, &self.databases.ocr, model.as_ref(), job)
-    }
-
     fn get(&self, id: u64) -> Option<Arc<Job>> {
         self.registry().jobs.get(&id).cloned()
     }
 
+    fn record_stopped_scan(&self, job: &Job, outcome: ScanOutcome, message: &str) {
+        let Some(library_id) = job.library_id.filter(|_| job.kind == JobKind::LibraryScan) else {
+            return;
+        };
+        let result = (|| -> anyhow::Result<()> {
+            let catalog = nicegal_core::assets::AssetCatalog::new(&self.databases.assets)?;
+            let requests = job.scan_requests.lock().clone();
+            if requests.is_empty() {
+                // A queued scan was cancelled before it could read the definition.
+                if let Some(library) = catalog.library(library_id)? {
+                    for folder in library.include.iter().filter(|folder| folder.scan_pending) {
+                        catalog.fail_folder_scan_request(
+                            library_id,
+                            &folder.path,
+                            folder.scan_request,
+                            outcome,
+                            message,
+                        )?;
+                    }
+                }
+            } else {
+                for (path, request) in requests {
+                    catalog
+                        .fail_folder_scan_request(library_id, &path, request, outcome, message)?;
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            tracing::warn!(?error, library_id, "could not record stopped scan");
+        }
+    }
+
     fn cancel(&self, id: u64) -> Option<Arc<Job>> {
         let job = self.get(id)?;
+        let queued = job.response().status == JobStatus::Queued;
         job.request_cancel();
+        if queued {
+            self.record_stopped_scan(&job, ScanOutcome::Cancelled, "cancelled");
+        }
         Some(job)
     }
 
@@ -1028,10 +1128,20 @@ impl JobManager {
         }
     }
 
-    fn finish(&self, id: u64) {
+    fn finish(self: &Arc<Self>, id: u64) {
         let mut registry = self.registry();
         if registry.active == Some(id) {
             registry.active = None;
+        }
+        while let Some((next_id, spec)) = registry.queued.pop_front() {
+            let job = Arc::clone(registry.jobs.get(&next_id).expect("queued job exists"));
+            if job.response().status.is_terminal() {
+                continue;
+            }
+            registry.active = Some(next_id);
+            drop(registry);
+            self.spawn_job(spec, job);
+            return;
         }
     }
 }
@@ -1042,7 +1152,11 @@ fn evict_retained_jobs(registry: &mut JobRegistry) {
         let removable = registry
             .jobs
             .iter()
-            .find(|(id, job)| Some(**id) != registry.active && job.response().status.is_terminal())
+            .find(|(id, job)| {
+                Some(**id) != registry.active
+                    && !registry.queued.iter().any(|(queued, _)| queued == *id)
+                    && job.response().status.is_terminal()
+            })
             .map(|(id, _)| *id);
         let Some(id) = removable else {
             break;
@@ -1110,12 +1224,24 @@ async fn create_job(
     State(state): State<AppState>,
     ApiJson(request): ApiJson<JobRequest>,
 ) -> Result<(StatusCode, Json<JobResponse>), ApiError> {
-    let spec = request.prepare()?;
-    if spec.requires_loaded_ocr_models() && !state.ocr_models.is_loaded() {
-        return Err(ApiError::ocr_models_not_loaded());
-    }
-    let job = state.jobs.start(spec)?;
+    let job = start_job(&state, request.prepare()?).await?;
     Ok((StatusCode::ACCEPTED, Json(job.response())))
+}
+
+/// Start a job after checking that the library it names exists, so an unknown library is a
+/// `404` rather than a job that fails.
+pub(super) async fn start_job(state: &AppState, spec: JobSpec) -> Result<Arc<Job>, ApiError> {
+    if let Some(library_id) = spec.library_id() {
+        let databases = Arc::clone(&state.databases);
+        super::run_blocking(move || {
+            match databases.open_assets_read_only()?.library(library_id)? {
+                Some(_) => Ok(()),
+                None => Err(ApiError::library_not_found(library_id)),
+            }
+        })
+        .await?;
+    }
+    state.jobs.start(spec)
 }
 
 async fn get_job(
@@ -1164,18 +1290,16 @@ mod tests {
     use tokio_stream::StreamExt as _;
 
     #[test]
-    fn reconciliation_only_runs_after_complete_uncancelled_discovery() {
-        for (cancelled, complete) in [(true, true), (true, false)] {
-            let error = reconcile_after_discovery(cancelled, complete, || panic!("must not prune"))
-                .unwrap_err();
-            assert!(is_cancelled(&error));
-        }
-        reconcile_after_discovery(false, false, || panic!("must not prune")).unwrap();
-        let error = reconcile_after_discovery(false, true, || cancel_if(true)).unwrap_err();
-        assert!(is_cancelled(&error));
-        reconcile_after_discovery(false, true, || Ok(())).unwrap();
+    fn library_job_snapshots_identify_their_library() {
+        let job = Job::new_for(42, JobKind::LibraryScan, Some(7));
+        let snapshot = serde_json::to_value(job.response()).unwrap();
+        assert_eq!(snapshot["libraryId"], 7);
+        assert_eq!(snapshot["status"], "queued");
         assert!(
-            reconcile_after_discovery(false, true, || anyhow::bail!("store unavailable")).is_err()
+            serde_json::to_value(Job::new(43, JobKind::ModelPrepare).response())
+                .unwrap()
+                .get("libraryId")
+                .is_none()
         );
     }
 
@@ -1279,7 +1403,7 @@ mod tests {
 
     #[test]
     fn phase_progress_is_scoped_to_the_current_phase() {
-        let job = Job::new(8, JobKind::LibraryIndex);
+        let job = Job::new(8, JobKind::LibraryScan);
         assert!(job.begin());
         job.on_event(IndexEvent::PhaseChanged(IndexPhase::Scanning));
         job.on_event(IndexEvent::Discovered { count: 5 });
@@ -1307,7 +1431,7 @@ mod tests {
 
     #[test]
     fn throughput_resets_when_indexing_phase_changes() {
-        let job = Job::new(8, JobKind::LibraryIndex);
+        let job = Job::new(8, JobKind::LibraryScan);
         assert!(job.begin());
 
         for phase in [
@@ -1338,7 +1462,7 @@ mod tests {
 
     #[test]
     fn resumed_ocr_throughput_excludes_skips_but_preserves_progress() {
-        let job = Job::new(10, JobKind::LibraryIndex);
+        let job = Job::new(10, JobKind::LibraryScan);
         assert!(job.begin());
         job.on_event(IndexEvent::PhaseChanged(IndexPhase::Cataloging));
         job.on_event(IndexEvent::Progress(IndexProgressDelta {
@@ -1401,22 +1525,24 @@ mod tests {
         });
         assert!(serde_json::from_value::<JobRequest>(valid).is_ok());
 
-        let catalog_sync = serde_json::json!({
-            "type": "catalogSync",
-            "params": {
-                "root": "C:/gallery",
-                "scan": {
-                    "recursive": false,
-                    "exclude": ["*/.cache"]
-                }
-            }
+        let library_scan = serde_json::json!({
+            "type": "libraryScan",
+            "params": { "libraryId": 1, "pendingOnly": true }
         });
-        assert!(serde_json::from_value::<JobRequest>(catalog_sync).is_ok());
+        assert!(serde_json::from_value::<JobRequest>(library_scan).is_ok());
+        for retired in ["libraryIndex", "catalogSync"] {
+            let request =
+                serde_json::json!({ "type": retired, "params": { "root": "C:/gallery" } });
+            assert!(
+                serde_json::from_value::<JobRequest>(request).is_err(),
+                "{retired}"
+            );
+        }
 
         let thumbnail_generate = serde_json::json!({
             "type": "thumbnailGenerate",
             "params": {
-                "root": "C:/gallery"
+                "libraryId": 1
             }
         });
         assert!(serde_json::from_value::<JobRequest>(thumbnail_generate).is_ok());
@@ -1424,7 +1550,7 @@ mod tests {
         let library_purge = serde_json::json!({
             "type": "libraryPurge",
             "params": {
-                "root": "C:/gallery"
+                "libraryId": 1
             }
         });
         assert!(serde_json::from_value::<JobRequest>(library_purge).is_ok());
@@ -1445,36 +1571,37 @@ mod tests {
     }
 
     #[test]
-    fn selective_indexing_only_requires_selected_models() {
-        let root = std::env::current_dir().unwrap();
-        for (ocr, image) in [(true, true), (true, false), (false, true)] {
-            let request: JobRequest = serde_json::from_value(serde_json::json!({
-                "type": "libraryIndex", "params": { "root": root, "ocr": ocr, "image": image }
-            }))
-            .unwrap();
-            let spec = request.prepare().unwrap();
-            assert_eq!(spec.requires_loaded_ocr_models(), ocr);
-            let JobSpec::LibraryIndex(spec) = spec else {
-                panic!("wrong job type")
-            };
-            assert_eq!(spec.embeds_text(), ocr);
-            assert_eq!(spec.embeds_images(), image);
-        }
-        let request: JobRequest = serde_json::from_value(serde_json::json!({
-            "type": "libraryIndex", "params": { "root": root, "ocr": false, "image": false }
-        }))
-        .unwrap();
-        assert!(request.prepare().is_err());
-        let request: JobRequest = serde_json::from_value(serde_json::json!({
-            "type": "libraryIndex", "params": { "root": root, "embed": false }
-        }))
-        .unwrap();
-        let JobSpec::LibraryIndex(spec) = request.prepare().unwrap() else {
-            panic!("wrong job type")
-        };
-        assert!(spec.recognizes_text());
-        assert!(!spec.embeds_text());
-        assert!(!spec.embeds_images());
+    fn folder_progress_attributes_catalog_events_to_the_current_folder() {
+        let job = Job::new(11, JobKind::LibraryScan);
+        assert!(job.begin());
+        job.set_folders(vec!["/a".into(), "/b".into()]);
+        job.enter_folder(0);
+        job.on_event(IndexEvent::PhaseChanged(IndexPhase::Scanning));
+        job.on_event(IndexEvent::Discovered { count: 3 });
+        job.on_event(IndexEvent::Progress(IndexProgressDelta {
+            cataloged: 2,
+            failed: 1,
+            ..IndexProgressDelta::default()
+        }));
+        job.finish_folder(0, FolderState::Scanned, None);
+        job.enter_folder(1);
+        job.on_event(IndexEvent::Discovered { count: 5 });
+        job.finish_folder(1, FolderState::Unavailable, Some("offline".to_owned()));
+        job.leave_folder();
+        // Later phases are library-wide and leave folder counts alone.
+        job.on_event(IndexEvent::Progress(IndexProgressDelta {
+            cataloged: 9,
+            ..IndexProgressDelta::default()
+        }));
+
+        let folders = serde_json::to_value(job.response()).unwrap()["folders"].clone();
+        assert_eq!(
+            folders,
+            serde_json::json!([
+                {"path": "/a", "state": "scanned", "discovered": 3, "cataloged": 2, "failed": 1, "error": null},
+                {"path": "/b", "state": "unavailable", "discovered": 5, "cataloged": 0, "failed": 0, "error": "offline"}
+            ])
+        );
     }
 
     #[test]
@@ -1556,8 +1683,34 @@ mod tests {
         .unwrap();
         assert!(manager.start(second.prepare().unwrap()).is_err());
 
+        let scan = |params: serde_json::Value| {
+            let request: JobRequest = serde_json::from_value(
+                serde_json::json!({ "type": "libraryScan", "params": params }),
+            )
+            .unwrap();
+            manager.start(request.prepare().unwrap()).unwrap()
+        };
+        let queued = scan(serde_json::json!({ "libraryId": 7, "pendingOnly": true }));
+        assert_eq!(queued.response().status, JobStatus::Queued);
+        assert_eq!(queued.response().library_id, Some(7));
+        let merged = scan(serde_json::json!({ "libraryId": 7, "retryFailed": true }));
+        assert_eq!(
+            merged.id, queued.id,
+            "a request for the queued library merges"
+        );
+        assert_eq!(manager.registry().queued.len(), 1);
+        let replacement = scan(serde_json::json!({ "libraryId": 8 }));
+        assert_ne!(replacement.id, queued.id);
+        assert_eq!(
+            queued.response().status,
+            JobStatus::Cancelled,
+            "another library replaces it"
+        );
+        assert_eq!(replacement.response().status, JobStatus::Queued);
+        assert_eq!(manager.registry().queued.len(), 1);
+
         let mut updates = job.subscribe();
-        job.request_cancel();
+        manager.cancel_all();
         tokio::time::timeout(Duration::from_secs(5), async {
             while !updates.borrow().status.is_terminal() {
                 updates.changed().await.unwrap();

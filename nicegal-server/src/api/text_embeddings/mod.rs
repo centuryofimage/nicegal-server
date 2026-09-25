@@ -8,21 +8,20 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::{MethodRouter, get, post};
-use camino::Utf8PathBuf as PathBuf;
 use nicegal_core::db::{SearchFilters, TextEmbeddingSpace};
 use serde::{Deserialize, Serialize};
 
 use super::error::ApiError;
 use super::extract::{ApiJson, ApiQuery};
 use super::jobs::{JobResponse, JobSpec};
-use super::{AppState, roots, run_blocking};
+use super::{AppState, libraries, run_blocking};
 
 pub(super) mod job;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct StatusRequest {
-    root: PathBuf,
+    library_id: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -66,7 +65,7 @@ async fn create_job(
     ApiJson(request): ApiJson<job::Request>,
 ) -> Result<(StatusCode, Json<JobResponse>), ApiError> {
     let spec = JobSpec::TextEmbed(job::prepare(request)?);
-    let job = state.jobs.start(spec)?;
+    let job = super::jobs::start_job(&state, spec).await?;
     Ok((StatusCode::ACCEPTED, Json(job.response())))
 }
 
@@ -74,7 +73,6 @@ async fn status(
     State(state): State<AppState>,
     ApiQuery(request): ApiQuery<StatusRequest>,
 ) -> Result<Json<StatusResponse>, ApiError> {
-    let requested_root = request.root;
     let databases = state.databases;
     let embedder = EmbedderResponse {
         model: state.embedder.model().id().to_owned(),
@@ -82,7 +80,7 @@ async fn status(
     };
 
     run_blocking(move || {
-        let root = roots::resolve_root("text embeddings", &requested_root)?;
+        let scope = libraries::scope(&databases, request.library_id)?;
         let db = databases.open_ocr_read_only()?;
         let stored = db
             .text_embedding_model(TextEmbeddingSpace::OcrText)?
@@ -91,7 +89,7 @@ async fn status(
                 dimensions: model.dimensions,
             });
         let coverage =
-            db.text_embedding_coverage(TextEmbeddingSpace::OcrText, &SearchFilters::new(&root))?;
+            db.text_embedding_coverage(TextEmbeddingSpace::OcrText, &SearchFilters::new(scope))?;
         Ok(Json(StatusResponse {
             embedder,
             stored,
@@ -111,11 +109,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_root_is_required_and_unknown_parameters_are_rejected() {
+    fn the_library_is_required_and_unknown_parameters_are_rejected() {
         assert!(serde_urlencoded::from_str::<StatusRequest>("").is_err());
-        assert!(serde_urlencoded::from_str::<StatusRequest>("root=C:/gallery&bogus=1").is_err());
+        assert!(serde_urlencoded::from_str::<StatusRequest>("libraryId=7&bogus=1").is_err());
         let request: StatusRequest =
-            serde_urlencoded::from_str("root=C:/gallery").expect("a root alone is enough");
-        assert_eq!(request.root, "C:/gallery");
+            serde_urlencoded::from_str("libraryId=7").expect("a library alone is enough");
+        assert_eq!(request.library_id, 7);
     }
 }

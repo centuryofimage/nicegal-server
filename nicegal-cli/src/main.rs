@@ -7,6 +7,7 @@ use clap::builder::{PossibleValuesParser, TypedValueParser};
 use clap::{ArgMatches, Command, arg, crate_description, crate_version, value_parser};
 
 use nicegal_core::db::{DB, SearchFilters, SearchType};
+use nicegal_core::scope::PathScope;
 
 #[cfg(not(target_env = "msvc"))]
 #[cfg(not(debug_assertions))]
@@ -33,8 +34,10 @@ fn run(matches: ArgMatches) -> Result<()> {
         .ok_or_else(|| anyhow!("No queries were provided"))?;
     let cwd = PathBuf::from_path_buf(env::current_dir()?)
         .map_err(|path| anyhow!("current directory is not valid UTF-8: {}", path.display()))?;
-    let filters = SearchFilters::new(&cwd)
-        .with_exclude(matches.get_one::<String>("exclude").map(String::as_str));
+    let exclude = matches
+        .get_one::<String>("exclude")
+        .map(|exclude| cwd.join(exclude));
+    let filters = SearchFilters::new(PathScope::root(&cwd).with_exclude(exclude));
     let results = db.search(
         queries.map(String::as_str).collect(),
         &filters,
@@ -66,7 +69,7 @@ fn cli() -> Command {
                 .value_parser(value_parser!(PathBuf))
                 .env("NICEGAL_DB")
                 .default_value(DBPATH.as_os_str()),
-            arg!(-x --exclude <PATTERN> "Exclude indexed paths matching this glob"),
+            arg!(-x --exclude <DIR> "Exclude indexed files under this directory"),
             arg!(-l --limit <LIMIT> "Maximum number of results")
                 .value_parser(value_parser!(usize))
                 .default_value("100"),

@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use super::AppState;
 use super::error::ApiError;
 use super::extract::ApiJson;
+use super::ocr_models;
 
 /// The runtime selection read at server startup and the persisted selection for its next launch.
 /// ONNX Runtime binds to its loaded DLL process-wide, so changing this setting deliberately does
@@ -74,6 +75,8 @@ impl RuntimeSettings {
                 .expect("runtime settings mutex poisoned")
                 .clone(),
             configured_execution_provider: configured.execution_provider.to_string(),
+            index_videos: configured.index_videos,
+            ocr_models: configured.ocr_models.clone(),
             restart_required: self.active_execution_provider != configured.execution_provider,
             image_model: None,
             available_execution_providers: available_execution_providers()
@@ -98,11 +101,47 @@ impl RuntimeSettings {
             .image_model
     }
 
+    pub(super) fn index_videos(&self) -> bool {
+        self.configured
+            .lock()
+            .expect("runtime settings mutex poisoned")
+            .index_videos
+    }
+
+    pub(super) fn ocr_models(&self) -> Result<ocr_models::job::Spec> {
+        let request = self
+            .configured
+            .lock()
+            .expect("runtime settings mutex poisoned")
+            .ocr_models
+            .clone();
+        ocr_models::job::prepare(request)
+            .map_err(|error| anyhow!("invalid saved OCR models: {error:?}"))
+    }
+
+    pub(super) fn save_scan_options(
+        &self,
+        videos: Option<bool>,
+        ocr: Option<&ocr_models::job::Spec>,
+    ) -> Result<()> {
+        self.update_all(None, None, videos, ocr)
+    }
+
     /// Publish both selections only after their shared record has been atomically replaced.
     pub(super) fn update(
         &self,
         provider: Option<ExecutionProvider>,
         model: Option<ImageEmbeddingModel>,
+    ) -> Result<()> {
+        self.update_all(provider, model, None, None)
+    }
+
+    fn update_all(
+        &self,
+        provider: Option<ExecutionProvider>,
+        model: Option<ImageEmbeddingModel>,
+        videos: Option<bool>,
+        ocr: Option<&ocr_models::job::Spec>,
     ) -> Result<()> {
         if let Some(provider) = provider {
             anyhow::ensure!(
@@ -124,6 +163,12 @@ impl RuntimeSettings {
         if let Some(model) = model {
             next.image_model = model;
         }
+        if let Some(videos) = videos {
+            next.index_videos = videos;
+        }
+        if let Some(ocr) = ocr {
+            next.ocr_models = ocr.request();
+        }
         write_settings(&self.path, &RuntimeSettingsFile::from(&next))?;
         *configured = next;
         Ok(())
@@ -137,6 +182,8 @@ pub(super) struct RuntimeStatusResponse {
     active_runtime_distribution: String,
     onnx_runtime_build_info: String,
     configured_execution_provider: String,
+    index_videos: bool,
+    ocr_models: ocr_models::job::Request,
     restart_required: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     image_model: Option<super::image_model::ModelStatus>,
@@ -207,6 +254,8 @@ fn default_provider() -> ExecutionProvider {
 struct RuntimeUpdateRequest {
     execution_provider: Option<String>,
     image_model: Option<String>,
+    index_videos: Option<bool>,
+    ocr_models: Option<ocr_models::job::Request>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -215,6 +264,22 @@ struct RuntimeSettingsFile {
     execution_provider: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     image_model: Option<String>,
+    #[serde(default = "default_true")]
+    index_videos: bool,
+    #[serde(default = "default_ocr_models")]
+    ocr_models: ocr_models::job::Request,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_ocr_models() -> ocr_models::job::Request {
+    serde_json::from_value(serde_json::json!({
+        "detection": { "modelId": "PaddlePaddle/PP-OCRv6_small_det_onnx", "revision": "main" },
+        "recognition": { "modelId": "PaddlePaddle/PP-OCRv6_small_rec_onnx", "revision": "main" }
+    }))
+    .expect("built-in OCR model pair is valid")
 }
 
 pub(super) fn route() -> MethodRouter<AppState> {
@@ -237,11 +302,17 @@ async fn update(
     State(state): State<AppState>,
     ApiJson(request): ApiJson<RuntimeUpdateRequest>,
 ) -> Result<(StatusCode, Json<RuntimeStatusResponse>), ApiError> {
-    if request.execution_provider.is_none() && request.image_model.is_none() {
-        return Err(ApiError::bad_request(
-            "Provide executionProvider or imageModel",
-        ));
+    if request.execution_provider.is_none()
+        && request.image_model.is_none()
+        && request.index_videos.is_none()
+        && request.ocr_models.is_none()
+    {
+        return Err(ApiError::bad_request("Provide a runtime setting"));
     }
+    let ocr_models = request
+        .ocr_models
+        .map(ocr_models::job::prepare)
+        .transpose()?;
     let execution_provider = request
         .execution_provider
         .as_deref()
@@ -261,7 +332,9 @@ async fn update(
         .map(str::parse::<nicegal_core::embedding::ImageEmbeddingModel>)
         .transpose()
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    if state.jobs.has_active_job() {
+    if state.jobs.has_active_job()
+        && (request.execution_provider.is_some() || request.image_model.is_some())
+    {
         return Err(ApiError::job_busy());
     }
     if let Some(model) = model
@@ -271,7 +344,12 @@ async fn update(
     }
     let runtime = Arc::clone(&state.runtime);
     tokio::task::spawn_blocking(move || -> Result<()> {
-        runtime.update(execution_provider, model)
+        runtime.update_all(
+            execution_provider,
+            model,
+            request.index_videos,
+            ocr_models.as_ref(),
+        )
     })
     .await
     .map_err(|error| ApiError::internal(anyhow!("runtime settings task failed: {error}")))?
@@ -283,6 +361,8 @@ async fn update(
 struct ConfiguredSettings {
     execution_provider: ExecutionProvider,
     image_model: ImageEmbeddingModel,
+    index_videos: bool,
+    ocr_models: ocr_models::job::Request,
 }
 
 impl From<&ConfiguredSettings> for RuntimeSettingsFile {
@@ -290,6 +370,8 @@ impl From<&ConfiguredSettings> for RuntimeSettingsFile {
         Self {
             execution_provider: settings.execution_provider.to_string(),
             image_model: Some(settings.image_model.id().to_owned()),
+            index_videos: settings.index_videos,
+            ocr_models: settings.ocr_models.clone(),
         }
     }
 }
@@ -320,6 +402,10 @@ fn read_settings(path: &PathBuf) -> Result<ConfiguredSettings> {
             Some(model) => model.parse()?,
             None => read_legacy_image_model(path)?,
         },
+        index_videos: file.as_ref().is_none_or(|file| file.index_videos),
+        ocr_models: file
+            .as_ref()
+            .map_or_else(default_ocr_models, |file| file.ocr_models.clone()),
     };
     if saved.is_some() && provider.is_none() {
         write_settings(path, &RuntimeSettingsFile::from(&settings))?;
@@ -373,6 +459,24 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn scan_options_survive_restart() -> Result<()> {
+        let temp = TempDir::new()?;
+        let path = PathBuf::try_from(temp.path().join("runtime.json"))?;
+        let settings = RuntimeSettings::load(path.clone(), None)?;
+        let request: ocr_models::job::Request = serde_json::from_value(serde_json::json!({
+            "detection": {"modelId": "example/detector"},
+            "recognition": {"modelId": "example/recognizer"}
+        }))?;
+        let models = ocr_models::job::prepare(request).map_err(|error| anyhow!("{error:?}"))?;
+        settings.save_scan_options(Some(false), Some(&models))?;
+        let restarted = RuntimeSettings::load(path, None)?;
+        assert!(!restarted.index_videos());
+        let saved = serde_json::to_value(restarted.ocr_models()?.request())?;
+        assert_eq!(saved["detection"]["modelId"], "example/detector");
+        Ok(())
+    }
 
     #[test]
     fn legacy_image_selection_migrates_and_combined_updates_survive_restart() -> Result<()> {
@@ -535,7 +639,9 @@ mod tests {
     fn saved_unavailable_providers_migrate_but_explicit_overrides_fail() {
         let temp = TempDir::new().unwrap();
         let path = PathBuf::try_from(temp.path().join("runtime.json")).unwrap();
-        for saved in ["cuda", "migraphx", "webgpu", "openvino", "directml", "coreml"] {
+        for saved in [
+            "cuda", "migraphx", "webgpu", "openvino", "directml", "coreml",
+        ] {
             if saved.parse().is_ok_and(provider_available) {
                 continue;
             }

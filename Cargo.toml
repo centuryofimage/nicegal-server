@@ -12,7 +12,7 @@ categories = ["multimedia::images"]
 
 [features]
 default = ["regex"]
-regex = ["dep:regex", "rusqlite/functions"]
+regex = ["dep:regex"]
 logging = ["dep:tracing-subscriber", "dep:tracing-appender"]
 ort-openvino = ["ort/openvino"]
 ort-webgpu = ["ort/webgpu", "fastembed/webgpu"]
@@ -43,7 +43,7 @@ ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "
 png = "0.18.1"
 rayon = "1.12.0"
 regex = { version = "1.13.1", optional = true }
-rusqlite = { version = "0.40.2", features = ["bundled", "hooks"] }
+rusqlite = { version = "0.40.2", features = ["bundled", "hooks", "functions"] }
 sqlite-vec = "0.1.9"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"

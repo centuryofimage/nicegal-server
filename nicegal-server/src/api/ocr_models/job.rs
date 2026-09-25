@@ -18,14 +18,14 @@ use crate::api::{RESTART_EXIT_CODE, RuntimeSettings};
 const DEFAULT_MODEL_FILENAME: &str = "inference.onnx";
 const DEFAULT_CONFIG_FILENAME: &str = "inference.yml";
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct Request {
     detection: ModelRequest,
     recognition: ModelRequest,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ModelRequest {
     model_id: String,
@@ -36,11 +36,33 @@ struct ModelRequest {
     config_filename: String,
 }
 
+#[derive(Clone)]
 pub(crate) struct Spec {
     detection: ModelSource,
     detection_config: ModelSource,
     recognition: ModelSource,
     recognition_config: ModelSource,
+}
+
+impl Spec {
+    pub(crate) fn request(&self) -> Request {
+        fn model(source: &ModelSource, config: &ModelSource) -> ModelRequest {
+            ModelRequest {
+                model_id: source.model_id.clone(),
+                revision: source.revision.clone(),
+                filename: source.filename.clone(),
+                config_filename: config.filename.clone(),
+            }
+        }
+        Request {
+            detection: model(&self.detection, &self.detection_config),
+            recognition: model(&self.recognition, &self.recognition_config),
+        }
+    }
+    /// Whether this exact pair is the one already loaded, so a scan can skip reloading it.
+    pub(crate) fn is_loaded_in(&self, store: &ModelStore) -> bool {
+        store.is_loaded_with(&self.detection, &self.recognition)
+    }
 }
 
 pub(crate) fn prepare(request: Request) -> Result<Spec, ApiError> {

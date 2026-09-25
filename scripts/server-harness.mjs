@@ -19,6 +19,19 @@ export function spawnServer({ executable, repository, stateDirectory, token, env
   })
 }
 
+/** Create a library and return its ID. `definition` is a `POST /v1/libraries` body. */
+export async function createLibrary(endpoint, token, definition) {
+  const response = await fetch(`${endpoint}/v1/libraries`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+    body: JSON.stringify(definition)
+  })
+  if (response.status !== 201) {
+    throw new Error(`creating a library returned HTTP ${response.status}: ${await response.text()}`)
+  }
+  return (await response.json()).id
+}
+
 export async function createAndWaitForJob(endpoint, token, type, params, stderrTail = () => '') {
   const response = await fetch(`${endpoint}/v1/jobs`, {
     method: 'POST',

@@ -3,14 +3,25 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use camino::Utf8Path;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::functions::FunctionFlags;
+use rusqlite::types::Value;
+use rusqlite::{Connection, OpenFlags, ToSql};
 
 pub(crate) const READ_ONLY_FLAGS: OpenFlags =
     OpenFlags::SQLITE_OPEN_READ_ONLY.union(OpenFlags::SQLITE_OPEN_NO_MUTEX);
 
 pub(crate) fn configure_reader(conn: &Connection) -> Result<()> {
     conn.busy_timeout(Duration::from_secs(5))?;
+    conn.create_scalar_function(
+        "nicegal_path_contains",
+        2,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |context| {
+            let path: String = context.get(0)?;
+            let needle: String = context.get(1)?;
+            Ok(path.replace('\\', "/").to_lowercase().contains(&needle))
+        },
+    )?;
     Ok(())
 }
 
@@ -39,19 +50,13 @@ pub(crate) fn validate_asset_ids(asset_ids: &[i64]) -> Result<()> {
     Ok(())
 }
 
-/// Match descendants of a literal directory using `LIKE ... ESCAPE '#'`.
-pub(crate) fn path_prefix_like(path: &Utf8Path) -> String {
-    let mut prefix = path.as_str().to_owned();
-    if !prefix.ends_with(['/', '\\']) {
-        prefix.push(std::path::MAIN_SEPARATOR);
-    }
-    format!(
-        "{}%",
-        prefix
-            .replace('#', "##")
-            .replace('%', "#%")
-            .replace('_', "#_")
-    )
+/// rusqlite rejects a named parameter the statement does not mention, so owned parameter lists
+/// are only borrowed as `ToSql` at the point of binding.
+pub(crate) fn bind_named<N: AsRef<str>>(params: &[(N, Value)]) -> Vec<(&str, &dyn ToSql)> {
+    params
+        .iter()
+        .map(|(name, value)| (name.as_ref(), value as &dyn ToSql))
+        .collect()
 }
 
 /// Rolls back on errors, failed commits, and unwinding while retaining access to the owner.
@@ -141,36 +146,6 @@ mod tests {
             2
         );
         maintain(&conn)?;
-        Ok(())
-    }
-
-    #[test]
-    fn descendant_pattern_escapes_wildcards_and_preserves_boundaries() -> Result<()> {
-        let conn = Connection::open_in_memory()?;
-        let root = Utf8Path::new("/gallery_100%#");
-        let pattern = path_prefix_like(root);
-        for (directory, expected) in [
-            (root.as_str(), true),
-            ("/galleryX100%#", false),
-            ("/gallery_100anything#", false),
-            ("/gallery_100%#-other", false),
-        ] {
-            let path = Utf8Path::new(directory).join("photo.png");
-            let matches: bool = conn.query_row(
-                "SELECT ?1 LIKE ?2 ESCAPE '#'",
-                (path.as_str(), &pattern),
-                |row| row.get(0),
-            )?;
-            assert_eq!(matches, expected, "{path}");
-        }
-        let root_matches: bool = conn.query_row(
-            "SELECT ?1 LIKE ?2 ESCAPE '#'",
-            (root.as_str(), &pattern),
-            |row| row.get(0),
-        )?;
-        assert!(!root_matches);
-        assert_eq!(path_prefix_like(Utf8Path::new("/")), "/%");
-        assert_eq!(path_prefix_like(Utf8Path::new("C:\\")), "C:\\%");
         Ok(())
     }
 }

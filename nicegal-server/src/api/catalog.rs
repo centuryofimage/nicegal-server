@@ -5,13 +5,14 @@ use nicegal_core::metadata::{FileMetadata, SourceState};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    AppState, assets::IndexStateResponse, error::ApiError, extract::ApiQuery, run_blocking,
+    AppState, assets::IndexStateResponse, error::ApiError, extract::ApiQuery, libraries,
+    run_blocking,
 };
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Listing {
-    root: Utf8PathBuf,
+    library_id: i64,
     #[serde(default)]
     timeline: CatalogTimeline,
 }
@@ -33,33 +34,45 @@ struct Lookup {
 pub(super) fn routes() -> Router<AppState> {
     Router::new()
         .route("/v1/catalog", get(list))
+        .route("/v1/catalog/folders", get(folders))
         .route("/v1/catalog/count", get(count))
         .route("/v1/catalog/revision", get(revision))
         .route("/v1/catalog/metadata", get(metadata))
 }
 
-fn validate_root(request: &Listing) -> Result<(), ApiError> {
-    // Do not stat/canonicalize here: an offline library can still be browsed.
-    if !request.root.is_absolute() {
-        return Err(ApiError::bad_request("catalog root must be absolute"));
-    }
-    Ok(())
+async fn folders(
+    State(state): State<AppState>,
+    ApiQuery(request): ApiQuery<Listing>,
+) -> Result<Json<Vec<String>>, ApiError> {
+    Ok(Json(
+        run_blocking(move || {
+            let scope = libraries::scope(&state.databases, request.library_id)?;
+            Ok(state
+                .databases
+                .open_assets_read_only()?
+                .list_folders(request.library_id, &scope)?
+                .into_iter()
+                .map(Utf8PathBuf::into_string)
+                .collect())
+        })
+        .await?,
+    ))
 }
 
 async fn list(
     State(state): State<AppState>,
     ApiQuery(request): ApiQuery<Listing>,
 ) -> Result<Json<Vec<GalleryAssetResponse>>, ApiError> {
-    validate_root(&request)?;
     Ok(Json(
         run_blocking(move || {
+            let scope = libraries::scope(&state.databases, request.library_id)?;
             let catalog = state.databases.open_assets_read_only()?;
             let timeline = match request.timeline {
                 CatalogTimeline::Modified => Timeline::Modified,
                 CatalogTimeline::Capture => Timeline::Capture,
             };
             Ok(catalog
-                .list_gallery(&request.root, timeline)?
+                .list_gallery(&scope, timeline)?
                 .into_iter()
                 .map(GalleryAssetResponse::from)
                 .collect())
@@ -72,13 +85,13 @@ async fn count(
     State(state): State<AppState>,
     ApiQuery(request): ApiQuery<Listing>,
 ) -> Result<Json<i64>, ApiError> {
-    validate_root(&request)?;
     Ok(Json(
         run_blocking(move || {
+            let scope = libraries::scope(&state.databases, request.library_id)?;
             Ok(state
                 .databases
                 .open_assets_read_only()?
-                .count_gallery(&request.root)?)
+                .count_gallery(&scope)?)
         })
         .await?,
     ))

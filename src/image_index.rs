@@ -27,6 +27,7 @@ use crate::embedding::ImageEmbedder;
 use crate::index::{
     IndexEvent, IndexObserver, IndexPhase, IndexProgressDelta, aborted, send_unless_aborted,
 };
+use crate::scope::PathScope;
 
 mod storage;
 use storage::StoredImageEmbedding;
@@ -59,24 +60,24 @@ impl Default for ImageIndexOptions {
     }
 }
 
-/// Incrementally embed cataloged images beneath `root`.
+/// Incrementally embed cataloged images in `scope`.
 ///
 /// Decode workers overlap source I/O with a single batched inference lane. ONNX Runtime owns all
 /// model execution parallelism; no session replicas are created.
 #[instrument(
     name = "image_index",
     skip_all,
-    fields(root = %root, model = %embedder.model(), sources = tracing::field::Empty)
+    fields(model = %embedder.model(), sources = tracing::field::Empty)
 )]
 pub fn index_images_observed(
     catalog: &AssetCatalog,
     db: &mut ImageIndexDb,
     embedder: &ImageEmbedder,
-    root: &Path,
+    scope: &PathScope,
     options: ImageIndexOptions,
     observer: &dyn IndexObserver,
 ) -> Result<bool> {
-    let assets = catalog.under_root(root)?;
+    let assets = catalog.in_scope(scope)?;
     index_catalog_images(catalog, db, embedder, &assets, options, observer)
 }
 
@@ -84,13 +85,12 @@ pub fn index_images_observed(
 #[instrument(
     name = "image_index",
     skip_all,
-    fields(root = %root, model = %embedder.model(), sources = tracing::field::Empty)
+    fields(model = %embedder.model(), sources = tracing::field::Empty)
 )]
 pub fn index_catalog_images_observed(
     catalog: &AssetCatalog,
     db: &mut ImageIndexDb,
     embedder: &ImageEmbedder,
-    root: &Path,
     assets: &[Asset],
     options: ImageIndexOptions,
     observer: &dyn IndexObserver,
@@ -731,6 +731,7 @@ fn guard_decode_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scope::PathScope;
     use tempfile::TempDir;
 
     #[test]
@@ -821,9 +822,9 @@ mod tests {
         });
         let index = image_index_with_vectors(&temp, 2, &vectors)?;
         let db = ImageIndexDb::new_read_only(&index, 2, &catalog)?;
-        assert_eq!(db.coverage(&SearchFilters::new(&root))?, (5, 1));
+        assert_eq!(db.coverage(&SearchFilters::under(&root))?, (5, 1));
         assert_eq!(
-            db.coverage(&SearchFilters::new(Path::new("C:/empty")))?,
+            db.coverage(&SearchFilters::under(Path::new("C:/empty")))?,
             (0, 0)
         );
         Ok(())
@@ -1043,7 +1044,7 @@ mod tests {
         let reader = ImageIndexDb::new_read_only(&images, 3, &catalog)?;
         let (total, hits) = reader.search_vectors(
             &[1.0, 0.0, 0.0],
-            &SearchFilters::new(&root),
+            &SearchFilters::under(&root),
             100,
             &ImageVectorSearchOptions::default(),
         )?;
@@ -1090,7 +1091,7 @@ mod tests {
         assert_eq!(snapshot.current_vector(1)?, Some(vec![1.0, 0.0, 0.0]));
         let (total, hits) = snapshot.search_vectors(
             &[1.0, 0.0, 0.0],
-            &SearchFilters::new(&root),
+            &SearchFilters::under(&root),
             100,
             &ImageVectorSearchOptions::default(),
         )?;
@@ -1113,7 +1114,7 @@ mod tests {
         let excluded = root.join("skip");
         let (total, hits) = reader.search_vectors(
             &query,
-            &SearchFilters::new(&root).with_exclude(Some(excluded.as_str())),
+            &SearchFilters::new(PathScope::root(&root).with_exclude([excluded.clone()])),
             100,
             &ImageVectorSearchOptions::default(),
         )?;
@@ -1125,7 +1126,7 @@ mod tests {
 
         let (total, hits) = reader.search_vectors(
             &query,
-            &SearchFilters::new(&root),
+            &SearchFilters::under(&root),
             100,
             &ImageVectorSearchOptions {
                 max_distance: Some(0.5),
@@ -1140,7 +1141,7 @@ mod tests {
         // `limit` caps the returned rows without changing how many matched.
         let (total, hits) = reader.search_vectors(
             &query,
-            &SearchFilters::new(&root),
+            &SearchFilters::under(&root),
             2,
             &ImageVectorSearchOptions::default(),
         )?;
@@ -1156,7 +1157,7 @@ mod tests {
         };
         let (total, hits) = reader.search_vectors(
             &query,
-            &SearchFilters::new(&root).with_time(Some(time)),
+            &SearchFilters::under(&root).with_time(Some(time)),
             100,
             &ImageVectorSearchOptions::default(),
         )?;
@@ -1175,7 +1176,7 @@ mod tests {
         let reader = ImageIndexDb::new_read_only(&images, 3, &catalog)?;
         let (total, hits) = reader.search_vectors(
             &[1.0, 0.0, 0.0],
-            &SearchFilters::new(&root),
+            &SearchFilters::under(&root),
             0,
             &ImageVectorSearchOptions::default(),
         )?;
@@ -1184,7 +1185,7 @@ mod tests {
 
         let (total, hits) = reader.search_vectors(
             &[-1.0, 0.0, 0.0],
-            &SearchFilters::new(&root),
+            &SearchFilters::under(&root),
             10,
             &ImageVectorSearchOptions {
                 max_distance: Some(0.0),
@@ -1204,7 +1205,7 @@ mod tests {
             reader
                 .search_vectors(
                     &[1.0, 0.0],
-                    &SearchFilters::new(&root),
+                    &SearchFilters::under(&root),
                     10,
                     &ImageVectorSearchOptions::default(),
                 )
@@ -1235,7 +1236,7 @@ mod tests {
         );
         let (total, _) = reader.search_vectors(
             &[1.0, 0.0, 0.0],
-            &SearchFilters::new(&root),
+            &SearchFilters::under(&root),
             10,
             &ImageVectorSearchOptions::default(),
         )?;

@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use axum::Json;
 use axum::extract::State;
 use axum::routing::{MethodRouter, get};
-use camino::Utf8PathBuf as PathBuf;
-use nicegal_core::assets::Timeline;
+use camino::Utf8PathBuf;
+use nicegal_core::assets::{FileSearchField, Timeline};
 use nicegal_core::cancellation::SearchCancellation;
 use nicegal_core::db::{
     DB, SNIPPET_CLOSE, SNIPPET_OPEN, SearchFilters, SearchType, TextEmbeddingSpace,
@@ -19,12 +19,13 @@ use nicegal_core::db::{
 };
 use nicegal_core::highlight::{self, Highlight};
 use nicegal_core::image_index::{ImageIndexDb, ImageVectorSearchOptions};
+use nicegal_core::scope::PathScope;
 use serde::{Deserialize, Serialize};
 
 use super::error::ApiError;
 use super::external_image::{self, ExternalImageRequest};
 use super::extract::{ApiJson, ApiQuery};
-use super::{AppState, roots, run_cancellable as run_search};
+use super::{AppState, libraries, run_cancellable as run_search};
 
 const DEFAULT_LIMIT: usize = 100_000;
 const MAX_LIMIT: usize = 250_000;
@@ -50,9 +51,12 @@ enum SearchTypeRequest {
     /// index. A different engine from `vector`: the query is embedded by the image model's
     /// paired text encoder, and the neighbours are pictures, not OCR text.
     Image,
-    Simple,
-    Match,
-    Glob,
+    /// Case-insensitive substring in the cataloged full path.
+    Path,
+    Name,
+    OcrSimple,
+    OcrMatch,
+    OcrGlob,
     Regex,
 }
 
@@ -61,9 +65,11 @@ impl SearchTypeRequest {
         match self {
             Self::Vector => "vector",
             Self::Image => "image",
-            Self::Simple => "simple",
-            Self::Match => "match",
-            Self::Glob => "glob",
+            Self::Path => "path",
+            Self::Name => "name",
+            Self::OcrSimple => "ocrSimple",
+            Self::OcrMatch => "ocrMatch",
+            Self::OcrGlob => "ocrGlob",
             Self::Regex => "regex",
         }
     }
@@ -83,9 +89,11 @@ impl SearchTypeRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SearchRequest {
     q: String,
+    folder: Option<String>,
+    path_contains: Option<String>,
     #[serde(rename = "type", default = "default_search_type")]
     kind: SearchTypeRequest,
-    root: PathBuf,
+    library_id: i64,
     #[serde(default = "default_limit")]
     limit: usize,
     /// Cosine distance ceiling, honoured by `type=vector` and `type=image`.
@@ -250,10 +258,10 @@ fn add_highlights(query: &str, kind: Option<SearchType>, hits: &mut [SearchHit])
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct MultiSearchRequest {
-    root: PathBuf,
+    library_id: i64,
+    folder: Option<String>,
+    path_contains: Option<String>,
     queries: Vec<QueryRequest>,
-    /// A directory under `root` to leave out, as an absolute path.
-    exclude: Option<PathBuf>,
     #[serde(default = "default_limit")]
     limit: usize,
     /// Applies to every query that does not set its own.
@@ -413,8 +421,9 @@ async fn search(
         time,
     };
     let batch = MultiSearchPlan {
-        root: request.root,
-        exclude: None,
+        library_id: request.library_id,
+        folder: request.folder,
+        path_contains: validate_path_contains(request.path_contains)?,
         queries: vec![plan],
         fusion: None,
     };
@@ -447,8 +456,9 @@ async fn multi_search(
 }
 
 struct MultiSearchPlan {
-    root: PathBuf,
-    exclude: Option<PathBuf>,
+    library_id: i64,
+    folder: Option<String>,
+    path_contains: Option<String>,
     queries: Vec<QueryPlan>,
     fusion: Option<Fusion>,
 }
@@ -537,8 +547,9 @@ fn plan_multi_search(request: MultiSearchRequest) -> Result<MultiSearchPlan, Api
     }
 
     Ok(MultiSearchPlan {
-        root: request.root,
-        exclude: request.exclude,
+        library_id: request.library_id,
+        folder: request.folder,
+        path_contains: validate_path_contains(request.path_contains)?,
         queries: plans,
         fusion,
     })
@@ -551,8 +562,9 @@ fn execute_search(
     include_model_metadata: bool,
 ) -> Result<MultiSearchResponse, ApiError> {
     let MultiSearchPlan {
-        root: requested_root,
-        exclude: requested_exclude,
+        library_id,
+        folder,
+        path_contains,
         queries: plans,
         fusion,
     } = plan;
@@ -561,13 +573,18 @@ fn execute_search(
     let image_query_embedder = state.image_query_embedder;
     let image_dimensions = image_query_embedder.dimensions();
     let image_embedder = state.image_embedder;
-    // Validate the root before preparing embeddings. An existing, unindexed root still
+    // Resolve the library before preparing embeddings. A library with nothing indexed yet still
     // produces an empty result set through the read-only stores.
-    let root = roots::resolve_root("search", &requested_root)?;
-    let exclude = requested_exclude
-        .map(|exclude| roots::resolve_root("exclude", &exclude))
-        .transpose()?;
-    let exclude = exclude.as_deref().map(camino::Utf8Path::as_str);
+    let mut scope = libraries::scope(&databases, library_id)?;
+    if let Some(folder) = folder {
+        #[cfg(windows)]
+        let folder = folder.replace('/', "\\");
+        let folder = Utf8PathBuf::from(folder);
+        if !folder.is_absolute() {
+            return Err(ApiError::bad_request("folder must be an absolute path"));
+        }
+        scope = scope.focused(&folder);
+    }
     let mut db = if include_model_metadata
         || plans
             .iter()
@@ -587,6 +604,16 @@ fn execute_search(
         let images = databases.open_images_read_only(image_dimensions)?;
         images.set_search_cancellation(&cancellation)?;
         Some(images)
+    } else {
+        None
+    };
+    let files = if plans
+        .iter()
+        .any(|plan| matches!(plan.input, QueryInput::File { .. }))
+    {
+        let catalog = databases.open_assets_read_only()?;
+        catalog.set_search_cancellation(&cancellation)?;
+        Some(catalog)
     } else {
         None
     };
@@ -646,12 +673,41 @@ fn execute_search(
         for plan in &plans {
             cancellation.check()?;
             let (total, results) = match &plan.input {
+                QueryInput::File { field, text } => {
+                    let catalog = files
+                        .as_ref()
+                        .expect("a file query opens the catalog first");
+                    let filters = SearchFilters::new(scope.clone())
+                        .with_time(plan.time)
+                        .with_path_contains(path_contains.as_deref());
+                    let (total, matches) =
+                        catalog.search_files(&filters, *field, text, plan.limit, &cancellation)?;
+                    let mut hits = matches
+                        .into_iter()
+                        .map(|hit| SearchHit {
+                            asset_id: hit.asset_id,
+                            timestamp_ms: None,
+                            snippet: match field {
+                                FileSearchField::Name => {
+                                    hit.path.file_name().unwrap_or(hit.path.as_str()).to_owned()
+                                }
+                                FileSearchField::Path => hit.path.into_string(),
+                            },
+                            rank: 0,
+                            distance: None,
+                            score: None,
+                            highlights: Vec::new(),
+                        })
+                        .collect::<Vec<_>>();
+                    add_highlights(text, None, &mut hits);
+                    (total, hits)
+                }
                 QueryInput::Image(_) => {
                     let images = image_snapshot
                         .as_ref()
                         .expect("an image query opens the image snapshot first");
                     let vector = image_vectors.get(plan.key.as_str()).map(Vec::as_slice);
-                    plan.run_image(images, vector, &root, exclude)?
+                    plan.run_image(images, vector, &scope, path_contains.as_deref())?
                 }
                 QueryInput::Ocr(query) => {
                     let vector = ocr_embeddings.get(query.text.as_str()).map(Vec::as_slice);
@@ -659,9 +715,9 @@ fn execute_search(
                         query,
                         db.as_deref_mut()
                             .expect("an OCR query opens the OCR snapshot first"),
-                        &root,
-                        exclude,
+                        &scope,
                         vector,
+                        path_contains.as_deref(),
                     )?
                 }
             };
@@ -702,6 +758,7 @@ enum PlanKind {
     OcrVector,
     /// Nearest image vectors in the image index.
     Image,
+    File(FileSearchField),
     /// A literal text mode over the OCR store.
     Text(SearchType),
 }
@@ -742,6 +799,10 @@ impl ImageQuery {
 enum QueryInput {
     Ocr(OcrQuery),
     Image(ImageQuery),
+    File {
+        field: FileSearchField,
+        text: String,
+    },
 }
 
 #[derive(Debug)]
@@ -778,18 +839,25 @@ impl QueryPlan {
                 })
                 .sum(),
             QueryInput::Ocr(_) => 0,
+            QueryInput::File { .. } => 0,
         }
     }
 
     fn request_kind(&self) -> SearchTypeRequest {
+        if let QueryInput::File { field, .. } = self.input {
+            return match field {
+                FileSearchField::Name => SearchTypeRequest::Name,
+                FileSearchField::Path => SearchTypeRequest::Path,
+            };
+        }
         let QueryInput::Ocr(query) = &self.input else {
             return SearchTypeRequest::Image;
         };
         match query.kind {
             OcrQueryKind::Vector => SearchTypeRequest::Vector,
-            OcrQueryKind::Literal(SearchType::Simple) => SearchTypeRequest::Simple,
-            OcrQueryKind::Literal(SearchType::Match) => SearchTypeRequest::Match,
-            OcrQueryKind::Literal(SearchType::Glob) => SearchTypeRequest::Glob,
+            OcrQueryKind::Literal(SearchType::Simple) => SearchTypeRequest::OcrSimple,
+            OcrQueryKind::Literal(SearchType::Match) => SearchTypeRequest::OcrMatch,
+            OcrQueryKind::Literal(SearchType::Glob) => SearchTypeRequest::OcrGlob,
             #[cfg(feature = "regex")]
             OcrQueryKind::Literal(SearchType::Regex) => SearchTypeRequest::Regex,
         }
@@ -802,13 +870,13 @@ impl QueryPlan {
         &self,
         query: &OcrQuery,
         db: &mut DB,
-        root: &camino::Utf8Path,
-        exclude: Option<&str>,
+        scope: &PathScope,
         vector: Option<&[f32]>,
+        path_contains: Option<&str>,
     ) -> anyhow::Result<(usize, Vec<SearchHit>)> {
-        let filters = SearchFilters::new(root)
-            .with_exclude(exclude)
-            .with_time(self.time);
+        let filters = SearchFilters::new(scope.clone())
+            .with_time(self.time)
+            .with_path_contains(path_contains);
         let text = query.text.as_str();
         match query.kind {
             OcrQueryKind::Literal(kind) => {
@@ -865,13 +933,13 @@ impl QueryPlan {
         &self,
         images: &ImageIndexDb,
         vector: Option<&[f32]>,
-        root: &camino::Utf8Path,
-        exclude: Option<&str>,
+        scope: &PathScope,
+        path_contains: Option<&str>,
     ) -> anyhow::Result<(usize, Vec<SearchHit>)> {
         let vector = vector.expect("an image query is embedded before it is run");
-        let filters = SearchFilters::new(root)
-            .with_exclude(exclude)
-            .with_time(self.time);
+        let filters = SearchFilters::new(scope.clone())
+            .with_time(self.time)
+            .with_path_contains(path_contains);
         let options = ImageVectorSearchOptions {
             max_distance: self.max_distance,
         };
@@ -1154,6 +1222,15 @@ fn validate_query(query: &str) -> Result<&str, ApiError> {
     Ok(query)
 }
 
+fn validate_path_contains(path: Option<String>) -> Result<Option<String>, ApiError> {
+    if path.as_ref().is_some_and(|value| value.len() > 4096) {
+        return Err(ApiError::bad_request(
+            "pathContains must be at most 4096 bytes",
+        ));
+    }
+    Ok(path)
+}
+
 fn validate_limit(name: &str, limit: usize) -> Result<usize, ApiError> {
     if limit == 0 || limit > MAX_LIMIT {
         return Err(ApiError::bad_request(format!(
@@ -1185,7 +1262,19 @@ fn query_input(
         PlanKind::Text(kind) => Some(OcrQueryKind::Literal(kind)),
         PlanKind::OcrVector => Some(OcrQueryKind::Vector),
         PlanKind::Image => None,
+        PlanKind::File(_) => None,
     };
+    if let PlanKind::File(field) = kind {
+        if image_query.is_some() {
+            return Err(ApiError::bad_request(format!(
+                "query {key}: imageQuery applies only to type=image"
+            )));
+        }
+        return Ok(QueryInput::File {
+            field,
+            text: validate_query(q.as_deref().unwrap_or_default())?.to_owned(),
+        });
+    }
     if let Some(kind) = ocr_kind {
         if image_query.is_some() {
             return Err(ApiError::bad_request(format!(
@@ -1295,9 +1384,11 @@ fn search_type(kind: SearchTypeRequest) -> Result<PlanKind, ApiError> {
     Ok(match kind {
         SearchTypeRequest::Vector => PlanKind::OcrVector,
         SearchTypeRequest::Image => PlanKind::Image,
-        SearchTypeRequest::Simple => PlanKind::Text(SearchType::Simple),
-        SearchTypeRequest::Match => PlanKind::Text(SearchType::Match),
-        SearchTypeRequest::Glob => PlanKind::Text(SearchType::Glob),
+        SearchTypeRequest::Path => PlanKind::File(FileSearchField::Path),
+        SearchTypeRequest::Name => PlanKind::File(FileSearchField::Name),
+        SearchTypeRequest::OcrSimple => PlanKind::Text(SearchType::Simple),
+        SearchTypeRequest::OcrMatch => PlanKind::Text(SearchType::Match),
+        SearchTypeRequest::OcrGlob => PlanKind::Text(SearchType::Glob),
         SearchTypeRequest::Regex => {
             #[cfg(feature = "regex")]
             {
@@ -1411,7 +1502,7 @@ mod tests {
     fn answered(key: &str, ids: &[i64]) -> QueryResponse {
         QueryResponse {
             key: key.to_owned(),
-            kind: SearchTypeRequest::Simple,
+            kind: SearchTypeRequest::OcrSimple,
             total: ids.len(),
             results: ids
                 .iter()
@@ -1432,7 +1523,7 @@ mod tests {
     #[test]
     fn query_string_defaults_match_the_documented_contract() {
         let request: SearchRequest =
-            serde_urlencoded::from_str("q=receipt&root=C:/gallery").expect("minimal query parses");
+            serde_urlencoded::from_str("q=receipt&libraryId=1").expect("minimal query parses");
         assert_eq!(request.q, "receipt");
         assert_eq!(request.limit, DEFAULT_LIMIT);
         // Vector search is the default mode; the text modes are opt-in.
@@ -1443,9 +1534,9 @@ mod tests {
     #[test]
     fn planning_preserves_typed_modes_keys_and_time_inheritance() {
         let request: MultiSearchRequest = serde_json::from_value(serde_json::json!({
-            "root": "C:/gallery", "timeline": "modified", "after": "5",
+            "libraryId": 1, "timeline": "modified", "after": "5",
             "queries": [
-                {"type": "simple", "q": "literal"},
+                {"type": "ocrSimple", "q": "literal"},
                 {"type": "vector", "q": "semantic", "timeline": "modified", "before": "4"},
                 {"type": "image", "imageQuery": {"components": [{"assetId": 7}]}}
             ], "fuse": {"method": "rrf"}
@@ -1458,7 +1549,7 @@ mod tests {
                 .iter()
                 .map(|q| q.key.as_str())
                 .collect::<Vec<_>>(),
-            ["simple", "vector", "image"]
+            ["ocrSimple", "vector", "image"]
         );
         assert!(
             matches!(&planned.queries[0].input, QueryInput::Ocr(OcrQuery { kind: OcrQueryKind::Literal(SearchType::Simple), text }) if text == "literal")
@@ -1476,17 +1567,16 @@ mod tests {
 
     #[test]
     fn the_image_mode_parses_and_is_a_distance_mode() {
-        let request: SearchRequest =
-            serde_urlencoded::from_str("q=sunset&type=image&root=C:/gallery")
-                .expect("type=image parses");
+        let request: SearchRequest = serde_urlencoded::from_str("q=sunset&type=image&libraryId=1")
+            .expect("type=image parses");
         assert_eq!(request.kind, SearchTypeRequest::Image);
         assert!(request.kind.uses_distance());
         // `vector` and `image` are two engines with a distance each; the text modes have none.
         assert!(SearchTypeRequest::Vector.uses_distance());
         for kind in [
-            SearchTypeRequest::Simple,
-            SearchTypeRequest::Match,
-            SearchTypeRequest::Glob,
+            SearchTypeRequest::OcrSimple,
+            SearchTypeRequest::OcrMatch,
+            SearchTypeRequest::OcrGlob,
         ] {
             assert!(!kind.uses_distance());
         }
@@ -1646,15 +1736,13 @@ mod tests {
 
     #[test]
     fn unknown_query_parameters_are_rejected() {
-        assert!(
-            serde_urlencoded::from_str::<SearchRequest>("q=a&root=C:/gallery&bogus=1").is_err()
-        );
+        assert!(serde_urlencoded::from_str::<SearchRequest>("q=a&libraryId=1&bogus=1").is_err());
         // `deny_unknown_fields` and `flatten` are documented as not composing in serde's own
         // derive, so the combination is pinned here rather than assumed: the time fields must
         // reach `TimeRequest` while an unknown one is still rejected.
         assert!(
             serde_urlencoded::from_str::<SearchRequest>(
-                "q=a&root=C:/gallery&timeline=capture&after=1&bogus=1"
+                "q=a&libraryId=1&timeline=capture&after=1&bogus=1"
             )
             .is_err()
         );
@@ -1663,7 +1751,7 @@ mod tests {
     #[test]
     fn the_time_filter_parses_from_the_query_string() {
         let request: SearchRequest = serde_urlencoded::from_str(
-            "q=a&root=C:/gallery&timeline=capture&after=1717243200123456789",
+            "q=a&libraryId=1&timeline=capture&after=1717243200123456789",
         )
         .expect("the documented time parameters parse");
         let range = request
@@ -1678,7 +1766,7 @@ mod tests {
 
         // No bound at all is an unbounded search, not an error, even with a timeline named.
         let unbounded: SearchRequest =
-            serde_urlencoded::from_str("q=a&root=C:/gallery&timeline=modified").unwrap();
+            serde_urlencoded::from_str("q=a&libraryId=1&timeline=modified").unwrap();
         assert_eq!(unbounded.time.resolve("search").unwrap(), None);
     }
 
@@ -1772,9 +1860,8 @@ mod tests {
     #[test]
     fn a_combined_request_parses_its_documented_shape() {
         let request: MultiSearchRequest = serde_json::from_value(serde_json::json!({
-            "root": "C:/gallery",
+            "libraryId": 1,
             "limit": 50,
-            "exclude": "C:/gallery/tmp",
             "queries": [
                 {"key": "semantic", "type": "vector", "q": "coffee receipt", "maxDistance": 1.2, "weight": 2.0},
                 {"key": "visual", "type": "image", "maxDistance": 0.8,
@@ -1782,7 +1869,7 @@ mod tests {
                    {"assetId": 101, "weight": 1},
                    {"text": "a latte on a marble table", "weight": -0.5}
                  ]}},
-                {"key": "literal", "type": "simple", "q": "coffee"}
+                {"key": "literal", "type": "ocrSimple", "q": "coffee"}
             ],
             "fuse": {"method": "rrf", "k": 60, "limit": 20}
         }))
@@ -1808,7 +1895,7 @@ mod tests {
 
         assert!(
             serde_json::from_value::<MultiSearchRequest>(serde_json::json!({
-                "root": "C:/gallery",
+                "libraryId": 1,
                 "queries": [{"q": "a", "bogus": 1}]
             }))
             .is_err(),

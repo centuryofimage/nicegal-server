@@ -18,7 +18,7 @@ pub(crate) enum ErrorCode {
     ThumbnailNotFound,
     JobNotFound,
     JobBusy,
-    OcrModelsNotLoaded,
+    LibraryNotFound,
     ModelsNotReady,
     MethodNotAllowed,
     PayloadTooLarge,
@@ -39,8 +39,8 @@ impl ErrorCode {
             Self::ThumbnailNotFound => "thumbnail_not_found",
             Self::JobNotFound => "job_not_found",
             Self::JobBusy => "job_busy",
+            Self::LibraryNotFound => "library_not_found",
             Self::ModelsNotReady => "models_not_ready",
-            Self::OcrModelsNotLoaded => "ocr_models_not_loaded",
             Self::MethodNotAllowed => "method_not_allowed",
             Self::PayloadTooLarge => "payload_too_large",
             Self::UnsupportedMediaType => "unsupported_media_type",
@@ -163,19 +163,19 @@ impl ApiError {
         )
     }
 
+    pub(crate) fn library_not_found(id: i64) -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            ErrorCode::LibraryNotFound,
+            format!("library {id} does not exist"),
+        )
+    }
+
     pub(crate) fn job_busy() -> Self {
         Self::new(
             StatusCode::CONFLICT,
             ErrorCode::JobBusy,
             "another resource-intensive job is already active",
-        )
-    }
-
-    pub(crate) fn ocr_models_not_loaded() -> Self {
-        Self::new(
-            StatusCode::CONFLICT,
-            ErrorCode::OcrModelsNotLoaded,
-            "PaddleOCR models are not loaded; complete an ocrModelLoad job first",
         )
     }
 
@@ -279,6 +279,7 @@ mod tests {
             (ErrorCode::ThumbnailNotFound, "thumbnail_not_found"),
             (ErrorCode::JobNotFound, "job_not_found"),
             (ErrorCode::JobBusy, "job_busy"),
+            (ErrorCode::LibraryNotFound, "library_not_found"),
             (ErrorCode::MethodNotAllowed, "method_not_allowed"),
             (ErrorCode::PayloadTooLarge, "payload_too_large"),
             (ErrorCode::UnsupportedMediaType, "unsupported_media_type"),
@@ -315,6 +316,7 @@ mod tests {
             ApiError::thumbnail_not_found(),
             ApiError::job_not_found(),
             ApiError::job_busy(),
+            ApiError::library_not_found(1),
         ] {
             assert!(error.status.is_client_error(), "{error:?}");
         }

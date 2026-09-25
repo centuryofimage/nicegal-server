@@ -20,6 +20,7 @@ use crate::assets::{
 };
 use crate::db::{DB, OcrResult};
 use crate::ocr::{PaddleOcrModels, PaddleOcrOptions, PaddleOcrPool};
+use crate::scope::PathScope;
 
 const DEFAULT_COMMIT_CHUNK_SIZE: usize = 32;
 const CATALOG_COMMIT_CHUNK_SIZE: usize = 128;
@@ -28,6 +29,9 @@ const MAX_DECODE_WORKERS: usize = 4;
 pub struct IndexOptions {
     pub limit: Option<usize>,
     pub exclude: Vec<Pattern>,
+    /// Literal directories the walk skips with their whole subtree, such as a library's excluded
+    /// folders. Unlike `exclude`, these are paths, so glob characters in folder names are safe.
+    pub exclude_dirs: Vec<PathBuf>,
     pub rescan: bool,
     /// Retry source revisions whose prior decode failed, while retaining current OCR results.
     pub retry_failed: bool,
@@ -43,6 +47,7 @@ impl Default for IndexOptions {
         Self {
             limit: None,
             exclude: Vec::new(),
+            exclude_dirs: Vec::new(),
             rescan: false,
             retry_failed: false,
             subdirs: true,
@@ -59,7 +64,8 @@ pub struct IndexSummary {
     pub indexed: usize,
     pub deleted: usize,
     pub cancelled: bool,
-    /// Discovery and cataloging exhausted their scope without access errors or a debug limit.
+    /// Discovery and cataloging exhausted their scope without access errors or reaching a debug
+    /// limit.
     pub scan_complete: bool,
 }
 
@@ -200,12 +206,14 @@ pub fn catalog_delta_dir_observed(
     })
 }
 
+/// Scan and catalog a directory, returning every asset the walk visited in scan order. Unchanged
+/// assets keep their rows; only new or changed files are probed.
 #[instrument(
     name = "catalog_sync",
     skip_all,
     fields(root = %path, cataloged = field::Empty, cancelled = field::Empty)
 )]
-fn catalog_snapshot(
+pub fn catalog_snapshot(
     assets: &AssetCatalog,
     path: &Path,
     options: IndexOptions,
@@ -284,10 +292,115 @@ struct IndexPipeline<'a> {
     observer: &'a dyn IndexObserver,
 }
 
-struct OcrSelection {
+/// The images in a catalog pass that still need text recognition.
+pub struct OcrSelection {
     sources: Vec<Asset>,
     total: usize,
     skipped: usize,
+}
+
+impl OcrSelection {
+    /// Whether recognition has anything to do, so its models need not load when it does not.
+    pub fn is_empty(&self) -> bool {
+        self.sources.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.sources.len()
+    }
+}
+
+/// Choose which assets of `catalog` need OCR: current images without a result for their present
+/// fingerprint, skipping recorded decode failures and images over `options.max_dimensions`.
+/// `options.rescan` selects every image and `options.retry_failed` retries decode failures.
+pub fn select_ocr_sources(
+    assets: &AssetCatalog,
+    db: &DB,
+    catalog: &[Asset],
+    options: &IndexOptions,
+    observer: &dyn IndexObserver,
+) -> Result<OcrSelection> {
+    let image_fingerprints = catalog
+        .iter()
+        .filter(|asset| is_ocr_image(asset))
+        .map(|asset| (asset.asset_id, asset.fingerprint))
+        .collect::<Vec<_>>();
+    let current = if options.rescan {
+        Default::default()
+    } else {
+        db.current_asset_ids(&image_fingerprints)?
+    };
+    let decode_failed = if options.rescan || options.retry_failed {
+        Default::default()
+    } else {
+        assets.current_decode_failure_asset_ids(&image_fingerprints)?
+    };
+    let exceeds_dimension_limit = |asset: &Asset| {
+        matches!(
+            (options.max_dimensions, asset.width, asset.height),
+            (Some((max_width, max_height)), Some(width), Some(height))
+                if width as usize > max_width || height as usize > max_height
+        )
+    };
+    let mut sources = Vec::new();
+    let mut skipped = 0;
+    for asset in catalog {
+        if observer.is_cancelled() {
+            break;
+        }
+        if !is_ocr_image(asset)
+            || current.contains(&asset.asset_id)
+            || decode_failed.contains(&asset.asset_id)
+        {
+            skipped += 1;
+            continue;
+        }
+        if exceeds_dimension_limit(asset) {
+            debug!(
+                asset_id = asset.asset_id,
+                path = %asset.path,
+                width = asset.width.unwrap_or_default(),
+                height = asset.height.unwrap_or_default(),
+                "skipping image over the OCR dimension limit"
+            );
+            skipped += 1;
+            continue;
+        }
+        sources.push(asset.clone());
+    }
+    Ok(OcrSelection {
+        sources,
+        total: catalog.len(),
+        skipped,
+    })
+}
+
+/// Recognize a selection with loaded models, announcing the OCR phase first. Returns how many
+/// assets were indexed; cancellation stops early with committed results retained.
+pub fn recognize_selection(
+    assets: &AssetCatalog,
+    db: &mut DB,
+    models: &mut PaddleOcrPool,
+    selection: OcrSelection,
+    options: &IndexOptions,
+    observer: &dyn IndexObserver,
+) -> Result<usize> {
+    if options.commit_chunk_size == 0 {
+        bail!("OCR commit chunk size must be greater than zero");
+    }
+    options.ocr.validate()?;
+    announce_ocr_selection(observer, selection.total, selection.skipped);
+    let mut sources = selection.sources;
+    sources.retain(is_ocr_image);
+    BoundedOcrPipeline {
+        assets,
+        db,
+        models,
+        options: options.ocr,
+        commit_chunk_size: options.commit_chunk_size,
+        observer,
+    }
+    .run(sources)
 }
 
 fn announce_ocr_selection(observer: &dyn IndexObserver, total: usize, skipped: usize) {
@@ -363,8 +476,10 @@ impl IndexPipeline<'_> {
         }
         let scan_complete = files.complete && catalog_complete;
         // Legacy OCR-only mark/sweep cannot represent excluded or unvisited paths.
-        self.options.cleanup &=
-            scan_complete && self.options.subdirs && self.options.exclude.is_empty();
+        self.options.cleanup &= scan_complete
+            && self.options.subdirs
+            && self.options.exclude.is_empty()
+            && self.options.exclude_dirs.is_empty();
         if self.options.cleanup {
             self.db.mark_for_deletion(root)?;
         }
@@ -377,68 +492,20 @@ impl IndexPipeline<'_> {
         fields(catalog = catalog.len(), sources = field::Empty)
     )]
     fn select_ocr_sources(&mut self, catalog: &[Asset]) -> Result<OcrSelection> {
-        let image_fingerprints = catalog
-            .iter()
-            .filter(|asset| is_ocr_image(asset))
-            .map(|asset| (asset.asset_id, asset.fingerprint))
-            .collect::<Vec<_>>();
         if self.options.cleanup {
             // A present image is not stale even when unchanged, over the caller's dimension limit,
             // or a new OCR attempt fails. Cleanup removes disappeared sources, not good old results.
-            let asset_ids = image_fingerprints
+            let asset_ids = catalog
                 .iter()
-                .map(|(asset_id, _)| *asset_id)
+                .filter(|asset| is_ocr_image(asset))
+                .map(|asset| asset.asset_id)
                 .collect::<Vec<_>>();
             self.db.unmark_assets(&asset_ids)?;
         }
-        let current = if self.options.rescan {
-            Default::default()
-        } else {
-            self.db.current_asset_ids(&image_fingerprints)?
-        };
-        let decode_failed = if self.options.rescan || self.options.retry_failed {
-            Default::default()
-        } else {
-            self.assets
-                .current_decode_failure_asset_ids(&image_fingerprints)?
-        };
-        let mut sources = Vec::new();
-        let mut skipped = 0;
-        for asset in catalog {
-            if self.cancelled() {
-                break;
-            }
-            if !is_ocr_image(asset) {
-                skipped += 1;
-                continue;
-            }
-            if current.contains(&asset.asset_id) {
-                skipped += 1;
-                continue;
-            }
-            if decode_failed.contains(&asset.asset_id) {
-                skipped += 1;
-                continue;
-            }
-            if self.exceeds_dimension_limit(asset) {
-                debug!(
-                    asset_id = asset.asset_id,
-                    path = %asset.path,
-                    width = asset.width.unwrap_or_default(),
-                    height = asset.height.unwrap_or_default(),
-                    "skipping image over the OCR dimension limit"
-                );
-                skipped += 1;
-                continue;
-            }
-            sources.push(asset.clone());
-        }
-        Span::current().record("sources", sources.len());
-        Ok(OcrSelection {
-            sources,
-            total: catalog.len(),
-            skipped,
-        })
+        let selection =
+            select_ocr_sources(self.assets, self.db, catalog, &self.options, self.observer)?;
+        Span::current().record("sources", selection.sources.len());
+        Ok(selection)
     }
 
     #[instrument(
@@ -492,14 +559,6 @@ impl IndexPipeline<'_> {
         })
     }
 
-    fn exceeds_dimension_limit(&self, asset: &Asset) -> bool {
-        matches!(
-            (self.options.max_dimensions, asset.width, asset.height),
-            (Some((max_width, max_height)), Some(width), Some(height))
-                if width as usize > max_width || height as usize > max_height
-        )
-    }
-
     fn cancelled(&self) -> bool {
         self.observer.is_cancelled()
     }
@@ -545,15 +604,16 @@ impl CatalogPipeline<'_> {
         }
 
         let mut files = Vec::new();
-        let mut complete = self.options.limit.is_none();
+        let mut complete = true;
         for result in walker.into_iter().filter_entry(|entry| {
             !self
                 .options
                 .exclude
                 .iter()
                 .any(|pattern| pattern.matches_path(entry.path()))
+                && !is_excluded_dir(&self.options.exclude_dirs, entry)
         }) {
-            if self.options.limit.is_some_and(|limit| files.len() >= limit) || self.cancelled() {
+            if self.cancelled() {
                 complete = false;
                 break;
             }
@@ -616,6 +676,11 @@ impl CatalogPipeline<'_> {
                         continue;
                     }
                 }
+            }
+            // A limit only leaves the walk incomplete once another file is actually left out.
+            if self.options.limit.is_some_and(|limit| files.len() >= limit) {
+                complete = false;
+                break;
             }
             files.push(source_path);
             self.observer
@@ -709,7 +774,23 @@ impl CatalogPipeline<'_> {
                         continue;
                     }
                 };
-                match self.assets.prepare_upsert_timed(source_path, &metadata) {
+                let mut probing_video = false;
+                let result =
+                    self.assets
+                        .prepare_upsert_timed_with_probe(source_path, &metadata, || {
+                            probing_video = true;
+                            self.observer.on_event(IndexEvent::ActiveAsset {
+                                path: source_path.clone(),
+                                active: true,
+                            });
+                        });
+                if probing_video {
+                    self.observer.on_event(IndexEvent::ActiveAsset {
+                        path: source_path.clone(),
+                        active: false,
+                    });
+                }
+                match result {
                     Ok((asset, timings)) => {
                         unchanged += usize::from(timings.unchanged);
                         upsert_timings.accumulate(timings);
@@ -784,6 +865,31 @@ impl CatalogPipeline<'_> {
         }
         self.observer.on_event(IndexEvent::Error { path, message });
     }
+}
+
+/// Whether a walked entry is one of the literal excluded directories, or a directory link that
+/// resolves into one. The walk prunes an excluded directory's subtree, so matching the directory
+/// itself is enough for ordinary entries; a link, including a Windows junction, can land anywhere
+/// inside one.
+fn is_excluded_dir(exclude_dirs: &[PathBuf], entry: &walkdir::DirEntry) -> bool {
+    if exclude_dirs.is_empty() {
+        return false;
+    }
+    let Some(path) = entry.path().to_str().map(Path::new) else {
+        return false;
+    };
+    let trim = |path: &Path| path.as_str().trim_end_matches(['/', '\\']).to_owned();
+    let is_or_inside = |path: &Path| {
+        exclude_dirs
+            .iter()
+            .any(|dir| trim(dir) == trim(path) || PathScope::root(dir).contains(path))
+    };
+    if is_or_inside(path) {
+        return true;
+    }
+    entry.path_is_symlink()
+        && entry.file_type().is_dir()
+        && canonicalize_path(path).is_ok_and(|target| is_or_inside(&target))
 }
 
 fn duration_micros(duration: Duration) -> u64 {
@@ -1265,6 +1371,43 @@ mod tests {
     }
 
     #[test]
+    fn catalog_reports_only_videos_while_their_metadata_is_probed() -> Result<()> {
+        let temp = TempDir::new()?;
+        let root = canonicalize_path(&PathBuf::try_from(temp.path().to_owned())?)?;
+        let assets = AssetCatalog::new(&root.join("assets.db"))?;
+        let image = root.join("image.png");
+        let video = root.join("video.mp4");
+        std::fs::write(&image, b"image")?;
+        std::fs::write(&video, b"video")?;
+        let observer = EventObserver::default();
+
+        catalog_snapshot(&assets, &root, IndexOptions::default(), &observer)?;
+        let active = observer
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                IndexEvent::ActiveAsset { path, active } => Some((path.clone(), *active)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(active, [(video.clone(), true), (video, false)]);
+
+        observer.0.lock().unwrap().clear();
+        catalog_snapshot(&assets, &root, IndexOptions::default(), &observer)?;
+        assert!(
+            observer
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|event| { !matches!(event, IndexEvent::ActiveAsset { .. }) })
+        );
+        Ok(())
+    }
+
+    #[test]
     fn ocr_progress_is_reannounced_after_a_derived_catalog_step() {
         let observer = EventObserver::default();
         observer.on_event(IndexEvent::PhaseChanged(IndexPhase::ImageEmbedding));
@@ -1293,6 +1436,51 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// A directory link that needs no privileges: a junction on Windows, a symlink elsewhere.
+    fn link_dir(target: &Path, link: &Path) -> Result<()> {
+        #[cfg(windows)]
+        {
+            let status = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J", link.as_str(), target.as_str()])
+                .stdout(std::process::Stdio::null())
+                .status()?;
+            anyhow::ensure!(status.success(), "mklink /J failed");
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_link_into_an_excluded_folder_is_not_walked() -> Result<()> {
+        let temp = TempDir::new()?;
+        let root = canonicalize_path(&PathBuf::try_from(temp.path().to_owned())?)?;
+        let assets = AssetCatalog::new(&root.join("assets.db"))?;
+        let library = root.join("library");
+        let private = library.join("private");
+        std::fs::create_dir_all(private.join("nested"))?;
+        std::fs::write(library.join("kept.png"), b"image")?;
+        std::fs::write(private.join("hidden.png"), b"image")?;
+        std::fs::write(private.join("nested").join("deeper.png"), b"image")?;
+        link_dir(&private, &library.join("alias"))?;
+        link_dir(&private.join("nested"), &library.join("nested-alias"))?;
+
+        let observer = TestObserver { cancelled: false };
+        let options = IndexOptions {
+            exclude_dirs: vec![private],
+            ..IndexOptions::default()
+        };
+        let files = CatalogPipeline {
+            assets: &assets,
+            options: &options,
+            observer: &observer,
+        }
+        .collect_files(&library, ScanSelection::All)?
+        .paths;
+        assert_eq!(files, [library.join("kept.png")]);
+        Ok(())
     }
 
     #[test]
@@ -1391,18 +1579,22 @@ mod tests {
                 .collect_files(&root.join("unavailable"), ScanSelection::All)?
                 .complete
         );
-        let limited = IndexOptions {
-            limit: Some(100),
-            ..IndexOptions::default()
-        };
-        assert!(
-            !CatalogPipeline {
+        std::fs::write(root.join("a.png"), b"a")?;
+        std::fs::write(root.join("b.png"), b"b")?;
+        // A limit the walk never reaches leaves it complete; reaching it with a file left does not.
+        for (limit, complete) in [(100, true), (2, true), (1, false)] {
+            let limited = IndexOptions {
+                limit: Some(limit),
+                ..IndexOptions::default()
+            };
+            let files = CatalogPipeline {
                 options: &limited,
                 ..scan
             }
-            .collect_files(&root, ScanSelection::All)?
-            .complete
-        );
+            .collect_files(&root, ScanSelection::All)?;
+            assert_eq!(files.complete, complete, "limit {limit}");
+            assert_eq!(files.paths.len(), limit.min(2), "limit {limit}");
+        }
         let cancelled = TestObserver { cancelled: true };
         let summary = catalog_dir_observed(&assets, &root, options, &cancelled)?;
         assert!(summary.cancelled);
@@ -1419,6 +1611,8 @@ mod tests {
         std::fs::write(&missing, b"removed")?;
         assets.upsert(&missing, &missing.metadata()?)?;
         std::fs::remove_file(&missing)?;
+        std::fs::write(root.join("a.png"), b"a")?;
+        std::fs::write(root.join("b.png"), b"b")?;
         let observer = TestObserver { cancelled: false };
         let options = IndexOptions {
             limit: Some(1),

@@ -5,13 +5,15 @@ use nicegal_core::index::{IndexEvent, IndexObserver, IndexPhase, IndexProgressDe
 use nicegal_core::thumbs::{GENERATOR_VERSION, SIZE_BUCKETS, ThumbnailService};
 use serde::Deserialize;
 
+use nicegal_core::scope::PathScope;
+
 use super::super::error::ApiError;
-use super::super::roots;
+use super::super::libraries;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct Request {
-    root: PathBuf,
+    library_id: i64,
     #[serde(default = "default_backfill_buckets")]
     buckets: Vec<u16>,
     #[serde(default)]
@@ -39,7 +41,7 @@ struct TimelineRange {
 }
 
 pub(crate) struct Spec {
-    root: PathBuf,
+    library_id: i64,
     buckets: Vec<u16>,
     force: bool,
     sweep_stale: bool,
@@ -49,7 +51,6 @@ pub(crate) struct Spec {
 }
 
 pub(crate) fn prepare(mut request: Request) -> Result<Spec, ApiError> {
-    let root = roots::resolve_root("thumbnail", &request.root)?;
     request.buckets.sort_unstable();
     request.buckets.dedup();
     if request.buckets.is_empty() {
@@ -89,7 +90,7 @@ pub(crate) fn prepare(mut request: Request) -> Result<Spec, ApiError> {
         ));
     }
     Ok(Spec {
-        root,
+        library_id: request.library_id,
         buckets: request.buckets,
         force: request.force,
         sweep_stale: request.sweep_stale,
@@ -120,7 +121,9 @@ pub(crate) fn run(
     thumbnails: &ThumbnailService,
     observer: &dyn IndexObserver,
 ) -> anyhow::Result<()> {
-    let assets = selected_assets(&AssetCatalog::new(asset_database)?, &spec)?;
+    let catalog = AssetCatalog::new(asset_database)?;
+    let scope = libraries::stored(&catalog, spec.library_id)?.scope();
+    let assets = selected_assets(&catalog, &scope, &spec)?;
     observer.on_event(IndexEvent::PhaseChanged(IndexPhase::Thumbnails));
     observer.on_event(IndexEvent::Discovered {
         count: assets.len(),
@@ -181,11 +184,21 @@ pub(crate) fn run(
     Ok(())
 }
 
-fn selected_assets(catalog: &AssetCatalog, spec: &Spec) -> anyhow::Result<Vec<Asset>> {
-    // Scope by the canonical root before filtering the selected timeline, so a broad range can
-    // never make this maintenance job operate on a sibling library.
+impl Spec {
+    pub(crate) fn library_id(&self) -> i64 {
+        self.library_id
+    }
+}
+
+fn selected_assets(
+    catalog: &AssetCatalog,
+    scope: &PathScope,
+    spec: &Spec,
+) -> anyhow::Result<Vec<Asset>> {
+    // Scope by the library before filtering the selected timeline, so a broad range can never make
+    // this maintenance job operate on another folder.
     Ok(catalog
-        .under_root(&spec.root)?
+        .in_scope(scope)?
         .into_iter()
         .filter(|asset| {
             let timestamp = match spec.timeline {
@@ -209,15 +222,10 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn existing_root() -> PathBuf {
-        PathBuf::try_from(std::env::current_dir().unwrap()).unwrap()
-    }
-
     #[test]
     fn parses_lossless_half_open_timeline_range() {
-        let root = existing_root();
         let request: Request = serde_json::from_value(serde_json::json!({
-            "root": root.as_str(),
+            "libraryId": 1,
             "timeline": "capture",
             "range": {
                 "fromNs": "1704067200000000000",
@@ -233,9 +241,8 @@ mod tests {
 
     #[test]
     fn rejects_reversed_or_imprecise_numeric_ranges() {
-        let root = existing_root();
         let reversed: Request = serde_json::from_value(serde_json::json!({
-            "root": root.as_str(),
+            "libraryId": 1,
             "range": { "fromNs": "2", "toNs": "1" }
         }))
         .unwrap();
@@ -243,7 +250,7 @@ mod tests {
 
         assert!(
             serde_json::from_value::<Request>(serde_json::json!({
-                "root": root.as_str(),
+                "libraryId": 1,
                 "range": { "fromNs": 1704067200000000000_i64 }
             }))
             .is_err()
@@ -251,13 +258,11 @@ mod tests {
     }
 
     #[test]
-    fn thumbnail_root_is_required_and_request_fields_are_strict() {
+    fn thumbnail_library_is_required_and_request_fields_are_strict() {
         assert!(serde_json::from_value::<Request>(serde_json::json!({})).is_err());
-
-        let root = existing_root();
         assert!(
             serde_json::from_value::<Request>(serde_json::json!({
-                "root": root.as_str(),
+                "libraryId": 1,
                 "unexpected": true
             }))
             .is_err()
@@ -281,16 +286,16 @@ mod tests {
         let included = catalog.upsert(&inside, &fs::metadata(&inside)?)?;
         let excluded = catalog.upsert(&outside, &fs::metadata(&outside)?)?;
         let spec = prepare(Request {
-            root,
+            library_id: 1,
             buckets: default_backfill_buckets(),
             force: false,
             sweep_stale: false,
             timeline: TimelineRequest::Modified,
             range: None,
         })
-        .expect("temporary root should prepare for thumbnail selection");
+        .expect("a request with defaults prepares");
 
-        let selected = selected_assets(&catalog, &spec)?;
+        let selected = selected_assets(&catalog, &PathScope::root(&root), &spec)?;
         assert_eq!(
             selected
                 .iter()

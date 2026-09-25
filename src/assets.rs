@@ -1,4 +1,5 @@
-use std::collections::{HashMap, HashSet};
+use std::cmp::Ordering;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::BufReader;
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -8,14 +9,16 @@ use camino::{Utf8Path as Path, Utf8PathBuf as PathBuf};
 use nom_exif::{ExifTag, read_exif};
 use rusqlite::{Connection, OptionalExtension, params_from_iter};
 
+use crate::cancellation::SearchCancellation;
+use crate::db::SearchFilters;
 use crate::imaging::{ExifOrientation, orientation_from_exif};
 use crate::schema::{check_schema_read_only, open_schema_with_migrations};
+use crate::scope::PathScope;
 use crate::storage::{
-    READ_ONLY_FLAGS, configure_reader, configure_writer, maintain, path_prefix_like,
-    validate_asset_ids,
+    READ_ONLY_FLAGS, bind_named, configure_reader, configure_writer, maintain, validate_asset_ids,
 };
 
-const SCHEMA_VERSION: i32 = 6;
+const SCHEMA_VERSION: i32 = 10;
 const SCHEMA_LABEL: &str = "asset catalog";
 const MIGRATIONS: &[(i32, &str)] = &[
     (
@@ -35,19 +38,24 @@ const MIGRATIONS: &[(i32, &str)] = &[
     );",
     ),
     (5, "VACUUM;"),
+    (6, include_str!("migrations/assets_6_to_7.sql")),
+    (7, include_str!("migrations/assets_7_to_8.sql")),
+    (8, include_str!("migrations/assets_8_to_9.sql")),
+    (9, include_str!("migrations/assets_9_to_10.sql")),
 ];
 // Creation time is filesystem metadata, not media-probe output. Keeping this version unchanged
 // lets version-3 catalogs backfill it with a narrow update instead of re-reading every image.
 const METADATA_VERSION: i32 = 2;
-const GALLERY_ROOT_PREDICATE: &str = r"(
-    path = ?1 OR (
-        substr(path, 1, length(?1)) = ?1
-        AND (
-            substr(?1, -1) IN ('/', '\')
-            OR substr(path, length(?1) + 1, 1) IN ('/', '\')
-        )
-    )
-)";
+// Older video rows were cataloged before the video probe supplied display dimensions. Refresh
+// only videos on the next scan; reprobing the entire image library would be unnecessarily costly.
+const VIDEO_METADATA_VERSION: i32 = 3;
+
+fn metadata_version_for(kind: MediaKind) -> i32 {
+    match kind {
+        MediaKind::Image => METADATA_VERSION,
+        MediaKind::Video => VIDEO_METADATA_VERSION,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SourceFingerprint {
@@ -75,6 +83,7 @@ pub(crate) struct CatalogScanEntry {
     fingerprint: SourceFingerprint,
     source_created_ns: Option<i64>,
     metadata_version: i32,
+    media_kind: MediaKind,
 }
 
 impl CatalogScanEntry {
@@ -82,7 +91,7 @@ impl CatalogScanEntry {
         Ok(
             self.fingerprint == SourceFingerprint::from_metadata(metadata)?
                 && self.source_created_ns == timestamp_ns(metadata.created().ok())
-                && self.metadata_version == METADATA_VERSION,
+                && self.metadata_version == metadata_version_for(self.media_kind),
         )
     }
 }
@@ -206,7 +215,64 @@ struct MediaProbe {
 }
 
 pub struct AssetCatalog {
-    conn: Connection,
+    pub(crate) conn: Connection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileSearchHit {
+    pub asset_id: i64,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileSearchField {
+    Name,
+    Path,
+}
+
+/// Compare lowercased UTF-8 names and paths by ASCII numeric runs and byte order otherwise.
+/// Using the same ordering for every string keeps mixed ASCII and Unicode results transitive.
+fn natural_file_cmp(left: &[u8], right: &[u8]) -> Ordering {
+    let (mut a, mut b) = (0, 0);
+    while a < left.len() && b < right.len() {
+        if left[a].is_ascii_digit() && right[b].is_ascii_digit() {
+            let start_a = a;
+            let start_b = b;
+            while a < left.len() && left[a].is_ascii_digit() {
+                a += 1;
+            }
+            while b < right.len() && right[b].is_ascii_digit() {
+                b += 1;
+            }
+            let digits_a = &left[start_a..a];
+            let digits_b = &right[start_b..b];
+            let trimmed_a = digits_a
+                .iter()
+                .position(|digit| *digit != b'0')
+                .map_or(&digits_a[digits_a.len() - 1..], |index| &digits_a[index..]);
+            let trimmed_b = digits_b
+                .iter()
+                .position(|digit| *digit != b'0')
+                .map_or(&digits_b[digits_b.len() - 1..], |index| &digits_b[index..]);
+            let compared = trimmed_a
+                .len()
+                .cmp(&trimmed_b.len())
+                .then(trimmed_a.cmp(trimmed_b));
+            if compared != Ordering::Equal {
+                return compared;
+            }
+            continue;
+        }
+        let compared = left[a].cmp(&right[b]);
+        if compared != Ordering::Equal {
+            return compared;
+        }
+        a += 1;
+        b += 1;
+    }
+    left.len()
+        .saturating_sub(a)
+        .cmp(&right.len().saturating_sub(b))
 }
 
 #[derive(Debug, Default)]
@@ -282,6 +348,23 @@ pub(crate) struct PreparedCatalogChange {
 }
 
 impl AssetCatalog {
+    /// The scan snapshot is updated once per completed folder scan, not once per indexed file.
+    /// Keep configured roots visible before the first scan and while a drive is offline.
+    pub fn list_folders(&self, library_id: i64, scope: &PathScope) -> Result<Vec<PathBuf>> {
+        let mut paths: BTreeSet<PathBuf> = scope.include().iter().cloned().collect();
+        let mut statement = self.conn.prepare(
+            "SELECT path FROM library_directory_snapshots WHERE library_id = ?1 ORDER BY path",
+        )?;
+        let rows = statement.query_map([library_id], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            let path = PathBuf::from(row?);
+            if scope.contains_folder(&path) {
+                paths.insert(path);
+            }
+        }
+        Ok(paths.into_iter().collect())
+    }
+
     pub fn new(path: &Path) -> Result<Self> {
         let conn =
             Connection::open(path).with_context(|| format!("opening asset catalog: {path}"))?;
@@ -307,6 +390,129 @@ impl AssetCatalog {
         Ok(Self { conn })
     }
 
+    pub fn set_search_cancellation(&self, cancellation: &SearchCancellation) -> Result<()> {
+        cancellation.register(&self.conn)
+    }
+
+    /// Search indexed paths inside the same library scope used by gallery listing. FTS5 narrows
+    /// ordinary ASCII substrings; short, Unicode, and wildcard-character terms use a scoped scan
+    /// so the final literal match never inherits SQLite LIKE's case or wildcard behavior.
+    pub fn search_files(
+        &self,
+        filters: &SearchFilters,
+        field: FileSearchField,
+        query: &str,
+        limit: usize,
+        cancellation: &SearchCancellation,
+    ) -> Result<(usize, Vec<FileSearchHit>)> {
+        cancellation.check()?;
+        let scope = &filters.scope;
+        let time = filters.time;
+        let path_contains = filters.path_contains.as_deref();
+        let needle = match field {
+            FileSearchField::Name => query.to_owned(),
+            FileSearchField::Path => query.replace('\\', "/"),
+        }
+        .to_lowercase();
+        let indexed = needle.len() >= 4
+            && needle.is_ascii()
+            && !needle.contains(['%', '_'])
+            && !(field == FileSearchField::Name && needle.contains('\\'));
+        let bound = scope.bind("a.path");
+        let mut params = bound.params;
+        let mut where_sql = bound.sql;
+        let path_needle = path_contains
+            .filter(|value| !value.is_empty())
+            .map(|value| value.replace('\\', "/").to_lowercase());
+        if let Some(needle) = &path_needle {
+            where_sql.push_str(" AND nicegal_path_contains(a.path, :path_contains)");
+            params.push((
+                ":path_contains".to_owned(),
+                rusqlite::types::Value::Text(needle.clone()),
+            ));
+        }
+        if indexed {
+            where_sql.push_str(" AND f.path LIKE :path_pattern");
+            params.push((
+                ":path_pattern".to_owned(),
+                rusqlite::types::Value::Text(format!("%{needle}%")),
+            ));
+        }
+        if let Some(time) = time {
+            let expression = time.timeline.expression("a");
+            if let Some(after) = time.after_ns {
+                where_sql.push_str(&format!(" AND {expression} >= :path_after"));
+                params.push((
+                    ":path_after".to_owned(),
+                    rusqlite::types::Value::Integer(after),
+                ));
+            }
+            if let Some(before) = time.before_ns {
+                where_sql.push_str(&format!(" AND {expression} < :path_before"));
+                params.push((
+                    ":path_before".to_owned(),
+                    rusqlite::types::Value::Integer(before),
+                ));
+            }
+        }
+        let from = if indexed {
+            "asset_path_fts f JOIN assets a ON a.asset_id = f.rowid"
+        } else {
+            "assets a"
+        };
+        let mut statement = self.conn.prepare(&format!(
+            "SELECT a.asset_id, a.path FROM {from} WHERE {where_sql}"
+        ))?;
+        let rows = statement.query_map(bind_named(&params).as_slice(), |row| {
+            Ok(FileSearchHit {
+                asset_id: row.get(0)?,
+                path: PathBuf::from(row.get::<_, String>(1)?),
+            })
+        })?;
+        let mut matches = Vec::new();
+        for row in rows {
+            cancellation.check()?;
+            let hit = row?;
+            let text = match field {
+                FileSearchField::Name => hit.path.file_name().unwrap_or(hit.path.as_str()),
+                FileSearchField::Path => hit.path.as_str(),
+            };
+            let text = match field {
+                FileSearchField::Name => text.to_owned(),
+                FileSearchField::Path => text.replace('\\', "/"),
+            };
+            if text.to_lowercase().contains(&needle)
+                && path_needle.as_ref().is_none_or(|path_needle| {
+                    hit.path
+                        .as_str()
+                        .replace('\\', "/")
+                        .to_lowercase()
+                        .contains(path_needle)
+                })
+            {
+                matches.push(hit);
+            }
+        }
+        let total = matches.len();
+        let mut matches = matches
+            .into_iter()
+            .map(|hit| {
+                let text = match field {
+                    FileSearchField::Name => hit.path.file_name().unwrap_or(hit.path.as_str()),
+                    FileSearchField::Path => hit.path.as_str(),
+                };
+                let sort_key = text.to_lowercase();
+                (hit, sort_key)
+            })
+            .collect::<Vec<_>>();
+        matches.sort_unstable_by(|(left, left_key), (right, right_key)| {
+            natural_file_cmp(left_key.as_bytes(), right_key.as_bytes())
+                .then(left.asset_id.cmp(&right.asset_id))
+        });
+        matches.truncate(limit);
+        Ok((total, matches.into_iter().map(|(hit, _)| hit).collect()))
+    }
+
     #[tracing::instrument(level = "debug", skip(self))]
     pub fn maintain(&self) -> Result<()> {
         maintain(&self.conn).context("maintaining asset catalog")
@@ -327,6 +533,15 @@ impl AssetCatalog {
         path: &Path,
         metadata: &fs::Metadata,
     ) -> Result<(PreparedCatalogAsset, CatalogUpsertTimings)> {
+        self.prepare_upsert_timed_with_probe(path, metadata, || {})
+    }
+
+    pub(crate) fn prepare_upsert_timed_with_probe(
+        &self,
+        path: &Path,
+        metadata: &fs::Metadata,
+        on_video_probe: impl FnOnce(),
+    ) -> Result<(PreparedCatalogAsset, CatalogUpsertTimings)> {
         if !path.is_absolute() {
             bail!("asset path must be absolute: {path}");
         }
@@ -346,7 +561,7 @@ impl AssetCatalog {
         let started = Instant::now();
         if let Some(mut existing) = self.get_by_path(&path)?
             && existing.fingerprint == fingerprint
-            && existing.metadata_version == METADATA_VERSION
+            && existing.metadata_version == metadata_version_for(existing.media_kind)
         {
             timings.lookup = started.elapsed();
             if existing.source_created_ns == source_created_ns {
@@ -358,6 +573,9 @@ impl AssetCatalog {
         }
         timings.lookup = started.elapsed();
 
+        if is_catalog_video(&path) {
+            on_video_probe();
+        }
         let started = Instant::now();
         let (probe, probe_timings) = probe_media(&path);
         timings.probe = started.elapsed();
@@ -466,7 +684,7 @@ impl AssetCatalog {
                         change.probe.is_animated,
                         change.frame_count,
                         change.duration_ms,
-                        METADATA_VERSION,
+                        metadata_version_for(change.probe.kind),
                     ),
                     |row| row.get(0),
                 )
@@ -484,7 +702,7 @@ impl AssetCatalog {
                 is_animated: change.probe.is_animated,
                 frame_count: change.probe.frame_count,
                 duration_ms: change.probe.duration_ms,
-                metadata_version: METADATA_VERSION,
+                metadata_version: metadata_version_for(change.probe.kind),
             });
         }
         drop(statement);
@@ -606,13 +824,21 @@ impl AssetCatalog {
         if !root.is_absolute() {
             bail!("asset root must be absolute: {root}");
         }
+        self.in_scope(&PathScope::root(root))
+    }
+
+    /// Every asset in `scope`, in asset ID order.
+    pub fn in_scope(&self, scope: &PathScope) -> Result<Vec<Asset>> {
+        let scope = scope.bind("path");
         let mut statement = self.conn.prepare_cached(&format!(
             "SELECT {ASSET_COLUMNS} FROM assets
-             WHERE path LIKE ?1 ESCAPE '#' ORDER BY asset_id"
+             WHERE {} ORDER BY asset_id",
+            scope.sql
         ))?;
-        let rows = statement.query_and_then([path_prefix_like(root)], asset_from_row)?;
+        let rows =
+            statement.query_and_then(bind_named(&scope.params).as_slice(), asset_from_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
-            .context("listing assets under root")
+            .context("listing assets in scope")
     }
 
     /// Read the small catalog fields needed to classify a directory walk.
@@ -623,11 +849,13 @@ impl AssetCatalog {
         if !root.is_absolute() {
             bail!("asset root must be absolute: {root}");
         }
-        let mut statement = self.conn.prepare_cached(
-            "SELECT path, source_modified_ns, source_size, source_created_ns, metadata_version
-             FROM assets WHERE path LIKE ?1 ESCAPE '#'",
-        )?;
-        let rows = statement.query_map([path_prefix_like(root)], |row| {
+        let scope = PathScope::root(root).bind("path");
+        let mut statement = self.conn.prepare_cached(&format!(
+            "SELECT path, source_modified_ns, source_size, source_created_ns, metadata_version, media_kind
+             FROM assets WHERE {}",
+            scope.sql
+        ))?;
+        let rows = statement.query_map(bind_named(&scope.params).as_slice(), |row| {
             Ok((
                 PathBuf::from(row.get::<_, String>(0)?),
                 CatalogScanEntry {
@@ -643,6 +871,13 @@ impl AssetCatalog {
                     },
                     source_created_ns: row.get(3)?,
                     metadata_version: row.get(4)?,
+                    media_kind: MediaKind::from_db(&row.get::<_, String>(5)?).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            5,
+                            rusqlite::types::Type::Text,
+                            error.into(),
+                        )
+                    })?,
                 },
             ))
         })?;
@@ -675,45 +910,46 @@ impl AssetCatalog {
             }
         }
         let unseen = {
+            let scope = PathScope::root(root).bind("path");
             let mut statement = transaction.prepare(&format!(
                 "SELECT {ASSET_COLUMNS} FROM assets
-                 WHERE {GALLERY_ROOT_PREDICATE}
+                 WHERE {}
                    AND NOT EXISTS (
                        SELECT 1 FROM scan_seen_assets
                        WHERE scan_seen_assets.asset_id = assets.asset_id
                    )
-                 ORDER BY asset_id"
+                 ORDER BY asset_id",
+                scope.sql
             ))?;
-            let rows = statement.query_and_then(
-                [root.as_str().trim_end_matches(['/', '\\'])],
-                asset_from_row,
-            )?;
+            let rows =
+                statement.query_and_then(bind_named(&scope.params).as_slice(), asset_from_row)?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
         transaction.commit()?;
         Ok(unseen)
     }
 
-    /// Desktop reads use literal path boundaries, including roots containing SQL wildcards.
-    pub fn list_gallery(&self, root: &Path, timeline: Timeline) -> Result<Vec<Asset>> {
+    /// Every asset in `scope`, newest first on `timeline`. Scope membership is a literal path
+    /// match, so an offline library remains browsable.
+    pub fn list_gallery(&self, scope: &PathScope, timeline: Timeline) -> Result<Vec<Asset>> {
         let order = timeline.expression("assets");
+        let scope = scope.bind("path");
         let mut statement = self.conn.prepare(&format!(
             "SELECT {ASSET_COLUMNS} FROM assets
-             WHERE {GALLERY_ROOT_PREDICATE}
-             ORDER BY {order} DESC, asset_id DESC"
+             WHERE {}
+             ORDER BY {order} DESC, asset_id DESC",
+            scope.sql
         ))?;
         Ok(statement
-            .query_and_then(
-                [root.as_str().trim_end_matches(['/', '\\'])],
-                asset_from_row,
-            )?
+            .query_and_then(bind_named(&scope.params).as_slice(), asset_from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    pub fn count_gallery(&self, root: &Path) -> Result<i64> {
+    pub fn count_gallery(&self, scope: &PathScope) -> Result<i64> {
+        let scope = scope.bind("path");
         Ok(self.conn.query_row(
-            &format!("SELECT COUNT(*) FROM assets WHERE {GALLERY_ROOT_PREDICATE}"),
-            [root.as_str().trim_end_matches(['/', '\\'])],
+            &format!("SELECT COUNT(*) FROM assets WHERE {}", scope.sql),
+            bind_named(&scope.params).as_slice(),
             |row| row.get(0),
         )?)
     }
@@ -855,7 +1091,7 @@ fn probe_media(path: &Path) -> (MediaProbe, MediaProbeTimings) {
         let _entered = span.enter();
         let started = Instant::now();
         // The catalog keeps the source even when its container or codec cannot be read.
-        let metadata = crate::video::probe(path).ok();
+        let metadata = crate::video::probe_catalog(path).ok();
         timings.dimensions = started.elapsed();
         return (
             MediaProbe {
@@ -1026,6 +1262,11 @@ pub fn is_catalog_media(path: &Path) -> bool {
     })
 }
 
+pub fn is_catalog_video(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| is_video_extension(&extension.to_ascii_lowercase()))
+}
+
 fn is_video_extension(extension: &str) -> bool {
     matches!(
         extension,
@@ -1050,6 +1291,80 @@ mod tests {
     use std::borrow::Cow;
     use std::fs::File;
     use tempfile::TempDir;
+
+    #[test]
+    fn path_search_uses_scope_and_updates_its_index() -> Result<()> {
+        let temp = TempDir::new()?;
+        let root = PathBuf::try_from(temp.path().to_path_buf())?;
+        let catalog = AssetCatalog::new(&root.join("assets.db"))?;
+        let trips = root.join("Trips 2025");
+        let excluded = trips.join("Excluded");
+        fs::create_dir_all(&excluded)?;
+        let wanted = trips.join("Café_100%.jpg");
+        let hidden = excluded.join("Café_100%.jpg");
+        let outside = root.join("Elsewhere.jpg");
+        for path in [&wanted, &hidden, &outside] {
+            fs::write(path, b"image")?;
+            catalog.upsert(path, &fs::metadata(path)?)?;
+        }
+        let scope = PathScope::root(&root).with_exclude([excluded]);
+        let cancellation = SearchCancellation::default();
+        let find = |term: &str| {
+            catalog.search_files(
+                &SearchFilters::new(scope.clone()),
+                FileSearchField::Path,
+                term,
+                10,
+                &cancellation,
+            )
+        };
+        for term in ["TRIPS", "Café_100%", "Trips 2025\\Café"] {
+            let (total, hits) = find(term)?;
+            assert_eq!(total, 1, "{term}");
+            assert_eq!(hits[0].path, wanted, "{term}");
+        }
+        let filters =
+            SearchFilters::new(scope.clone()).with_path_contains(Some("TRIPS 2025\\CAFÉ"));
+        let (total, hits) =
+            catalog.search_files(&filters, FileSearchField::Name, "Café", 1, &cancellation)?;
+        assert_eq!(total, 1);
+        assert_eq!(hits[0].path, wanted);
+        assert_eq!(find("elsewhere")?.0, 1);
+        catalog.delete_asset(catalog.get_by_path(&wanted)?.unwrap().asset_id)?;
+        assert_eq!(find("trips")?.0, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn name_search_ignores_folder_matches_and_sorts_numbers_naturally() -> Result<()> {
+        let temp = TempDir::new()?;
+        let root = PathBuf::try_from(temp.path().to_path_buf())?;
+        let catalog = AssetCatalog::new(&root.join("assets.db"))?;
+        let folder = root.join("photo folder");
+        fs::create_dir_all(&folder)?;
+        for name in ["photo10.jpg", "photo2.jpg", "other.jpg"] {
+            let path = folder.join(name);
+            fs::write(&path, b"image")?;
+            catalog.upsert(&path, &fs::metadata(&path)?)?;
+        }
+        let cancellation = SearchCancellation::default();
+        let scope = PathScope::root(&root);
+        let (total, hits) = catalog.search_files(
+            &SearchFilters::new(scope),
+            FileSearchField::Name,
+            "PHOTO",
+            10,
+            &cancellation,
+        )?;
+        assert_eq!(total, 2);
+        assert_eq!(
+            hits.iter()
+                .map(|hit| hit.path.file_name().unwrap())
+                .collect::<Vec<_>>(),
+            ["photo2.jpg", "photo10.jpg"]
+        );
+        Ok(())
+    }
 
     #[test]
     fn videos_are_cataloged_and_visible_even_when_metadata_probe_fails() -> Result<()> {
@@ -1095,9 +1410,17 @@ mod tests {
         assert_eq!(catalog.all()?, videos);
         assert_eq!(catalog.under_root(&root)?, videos);
         assert_eq!(catalog.scan_entries_under_root(&root)?.len(), videos.len());
-        assert_eq!(catalog.count_gallery(&root)?, videos.len() as i64);
+        assert_eq!(
+            catalog.count_gallery(&PathScope::root(&root))?,
+            videos.len() as i64
+        );
         for timeline in [Timeline::Modified, Timeline::Capture] {
-            assert_eq!(catalog.list_gallery(&root, timeline)?.len(), videos.len());
+            assert_eq!(
+                catalog
+                    .list_gallery(&PathScope::root(&root), timeline)?
+                    .len(),
+                videos.len()
+            );
             assert_eq!(
                 catalog.timeline_range(timeline, None, None)?.len(),
                 videos.len()
@@ -1146,22 +1469,25 @@ mod tests {
                 .map(|asset| asset.asset_id)
                 .collect::<Vec<_>>()
         };
-        assert_eq!(catalog.count_gallery(&root)?, 3);
+        assert_eq!(catalog.count_gallery(&PathScope::root(&root))?, 3);
         assert_eq!(
-            ids(catalog.list_gallery(&root, Timeline::Modified)?),
+            ids(catalog.list_gallery(&PathScope::root(&root), Timeline::Modified)?),
             [3, 2, 1]
         );
         assert_eq!(
-            ids(catalog.list_gallery(&root, Timeline::Capture)?),
+            ids(catalog.list_gallery(&PathScope::root(&root), Timeline::Capture)?),
             [3, 1, 2]
         );
         let trailing = PathBuf::from(format!("{root}/"));
-        assert_eq!(catalog.count_gallery(&trailing)?, 3);
-        assert_eq!(catalog.count_gallery(&base.join("empty"))?, 0);
+        assert_eq!(catalog.count_gallery(&PathScope::root(&trailing))?, 3);
+        assert_eq!(
+            catalog.count_gallery(&PathScope::root(&base.join("empty")))?,
+            0
+        );
         assert_eq!(catalog.revision()?, 0);
         catalog.delete_assets(&[1])?;
         assert_eq!(catalog.revision()?, 1);
-        assert_eq!(catalog.count_gallery(&root)?, 2);
+        assert_eq!(catalog.count_gallery(&PathScope::root(&root))?, 2);
         Ok(())
     }
 
@@ -1254,14 +1580,51 @@ mod tests {
     }
 
     #[test]
-    fn migrates_existing_catalogs_through_incremental_vacuum_version_six() -> Result<()> {
-        for old_version in 2..=5 {
+    fn old_video_metadata_is_reprobed_without_refreshing_images() -> Result<()> {
+        let temp = TempDir::new()?;
+        let root = PathBuf::try_from(temp.path().to_path_buf())?;
+        let video = root.join("keyframes.mp4");
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/video/keyframes.mp4"),
+            &video,
+        )?;
+        let image = root.join("photo.jpg");
+        fs::write(
+            &image,
+            crate::imaging::test_support::jpeg_with_orientation(1)?,
+        )?;
+
+        let catalog = AssetCatalog::new(&root.join("assets.db"))?;
+        let video_asset = catalog.upsert(&video, &fs::metadata(&video)?)?;
+        let image_asset = catalog.upsert(&image, &fs::metadata(&image)?)?;
+        assert_eq!(
+            (video_asset.width, video_asset.height),
+            (Some(128), Some(96))
+        );
+        catalog.conn.execute(
+            "UPDATE assets SET width = NULL, height = NULL, metadata_version = 2 WHERE asset_id = ?1",
+            [video_asset.asset_id],
+        )?;
+
+        let entries = catalog.scan_entries_under_root(&root)?;
+        assert!(!entries[&video].is_current(&fs::metadata(&video)?)?);
+        assert!(entries[&image].is_current(&fs::metadata(&image)?)?);
+        let refreshed = catalog.upsert(&video, &fs::metadata(&video)?)?;
+        assert_eq!((refreshed.width, refreshed.height), (Some(128), Some(96)));
+        assert_eq!(refreshed.metadata_version, VIDEO_METADATA_VERSION);
+        assert_eq!(image_asset.metadata_version, METADATA_VERSION);
+        Ok(())
+    }
+
+    #[test]
+    fn migrates_existing_catalogs_through_the_current_version() -> Result<()> {
+        for old_version in 2..SCHEMA_VERSION {
             let temp = TempDir::new()?;
             let catalog_path = PathBuf::try_from(temp.path().join("assets.db"))?;
             let conn = Connection::open(&catalog_path)?;
             conn.execute_batch(
-                "CREATE TABLE assets(asset_id INTEGER PRIMARY KEY);
-             INSERT INTO assets VALUES (42);
+                "CREATE TABLE assets(asset_id INTEGER PRIMARY KEY, path TEXT);
+             INSERT INTO assets VALUES (42, 'legacy.png');
              PRAGMA user_version = 2;",
             )?;
             for (from, sql) in MIGRATIONS {
@@ -1301,9 +1664,162 @@ mod tests {
             catalog
                 .conn
                 .execute("INSERT INTO decode_failure_state VALUES (42, 1, 1)", [])?;
+            assert_eq!(catalog.libraries()?, []);
             drop(catalog);
             AssetCatalog::new(&catalog_path)?;
         }
+        Ok(())
+    }
+
+    /// Every schema object except SQLite's own, with whitespace folded so formatting differences
+    /// in the DDL text do not count.
+    fn schema_of(conn: &Connection) -> Result<Vec<(String, String, String)>> {
+        let mut statement = conn.prepare(
+            "SELECT type, name, coalesce(sql, '') FROM sqlite_master
+             WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// A real version-6 catalog, created from the schema that version shipped with, migrates to
+    /// exactly the schema a new catalog gets, keeps every row, and reopens without migrating again.
+    #[test]
+    fn a_version_six_catalog_migrates_to_the_fresh_schema_and_keeps_its_rows() -> Result<()> {
+        let temp = TempDir::new()?;
+        let old_path = PathBuf::try_from(temp.path().join("old.db"))?;
+        let conn = Connection::open(&old_path)?;
+        configure_writer(&conn)?;
+        conn.execute_batch(include_str!("../tests/fixtures/schema/assets_v6.sql"))?;
+        conn.execute_batch(
+            "INSERT INTO assets(asset_id, path, source_modified_ns, source_created_ns,
+                 exif_taken_ns, source_size, media_kind, media_format, width, height,
+                 is_animated, frame_count, duration_ms, metadata_version)
+             VALUES (7, 'C:/photos/a.png', 10, 11, 12, 13, 'image', 'png', 640, 480, 0,
+                     NULL, NULL, 2),
+                    (9, 'C:/photos/clip.mp4', 20, NULL, NULL, 30, 'video', 'mp4', 1920,
+                     1080, 0, 300, 10000, 3);
+             INSERT INTO decode_failure_state VALUES (7, 10, 13);
+             UPDATE catalog_meta SET revision = 42;",
+        )?;
+        drop(conn);
+        // Readers never migrate: they refuse the old version until a writer has upgraded it.
+        assert!(AssetCatalog::new_read_only(&old_path).is_err());
+
+        let migrated = AssetCatalog::new(&old_path)?;
+        let fresh_path = PathBuf::try_from(temp.path().join("fresh.db"))?;
+        let fresh = AssetCatalog::new(&fresh_path)?;
+        assert_eq!(schema_of(&migrated.conn)?, schema_of(&fresh.conn)?);
+        let version: i32 =
+            migrated
+                .conn
+                .query_row("SELECT user_version FROM pragma_user_version", [], |row| {
+                    row.get(0)
+                })?;
+        assert_eq!(version, SCHEMA_VERSION);
+
+        let assets = migrated.all()?;
+        assert_eq!(
+            assets
+                .iter()
+                .map(|asset| (asset.asset_id, asset.path.as_str()))
+                .collect::<Vec<_>>(),
+            [(7, "C:/photos/a.png"), (9, "C:/photos/clip.mp4")]
+        );
+        assert_eq!(assets[1].duration_ms, Some(10_000));
+        assert_eq!(migrated.revision()?, 42);
+        assert_eq!(
+            migrated.current_decode_failure_asset_ids(&[(7, assets[0].fingerprint)])?,
+            HashSet::from([7])
+        );
+        assert_eq!(migrated.libraries()?, []);
+        let integrity: String = migrated
+            .conn
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        assert_eq!(integrity, "ok");
+        drop(migrated);
+
+        // The migrated catalog now serves readers and reopens as current, and its new tables work.
+        let reader = AssetCatalog::new_read_only(&old_path)?;
+        assert_eq!(
+            reader.count_gallery(&PathScope::root(Path::new("C:/photos")))?,
+            2
+        );
+        drop(reader);
+        let mut reopened = AssetCatalog::new(&old_path)?;
+        let library = reopened.create_library(
+            &crate::libraries::LibraryDefinition {
+                include: vec![PathBuf::from("C:/photos")],
+                exclude: Vec::new(),
+                options: Default::default(),
+            },
+            Some("C:/photos"),
+        )?;
+        assert!(matches!(library, crate::libraries::Created::New(_)));
+        assert_eq!(
+            reopened.revision()?,
+            42,
+            "library edits are not catalog changes"
+        );
+        Ok(())
+    }
+
+    /// A version-7 catalog gains the structured scan outcome; a folder whose failure was only
+    /// recorded as text becomes a generic failure and keeps the text.
+    #[test]
+    fn a_version_seven_catalog_migrates_folder_errors_to_outcomes() -> Result<()> {
+        use crate::libraries::ScanOutcome;
+
+        let temp = TempDir::new()?;
+        let old_path = PathBuf::try_from(temp.path().join("old.db"))?;
+        let conn = Connection::open(&old_path)?;
+        configure_writer(&conn)?;
+        conn.execute_batch(include_str!("../tests/fixtures/schema/assets_v7.sql"))?;
+        conn.execute_batch(
+            "INSERT INTO libraries VALUES (1, 2, 0, 1, NULL);
+             INSERT INTO library_folders VALUES
+                 (1, 'C:/offline', 0, 0, 1, 0, 'drive is offline', NULL),
+                 (1, 'C:/photos', 0, 1, 2, 2, NULL, 42);",
+        )?;
+        drop(conn);
+
+        let migrated = AssetCatalog::new(&old_path)?;
+        let fresh = AssetCatalog::new(&PathBuf::try_from(temp.path().join("fresh.db"))?)?;
+        assert_eq!(schema_of(&migrated.conn)?, schema_of(&fresh.conn)?);
+        let library = migrated.library(1)?.expect("the library survives");
+        let folders = library
+            .include
+            .iter()
+            .map(|folder| {
+                (
+                    folder.path.as_str(),
+                    folder.scan_pending,
+                    folder.scan_outcome,
+                    folder.scan_error.as_deref(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            folders,
+            [
+                (
+                    "C:/offline",
+                    true,
+                    Some(ScanOutcome::Failed),
+                    Some("drive is offline")
+                ),
+                ("C:/photos", false, None, None),
+            ]
+        );
         Ok(())
     }
 

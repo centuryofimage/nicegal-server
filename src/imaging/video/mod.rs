@@ -16,6 +16,22 @@ use crate::video::{VideoMetadata, VideoSample, VideoSamplingOptions};
 const MAX_PACKETS_PER_SAMPLE: usize = 20_000;
 const MAX_SOURCE_PIXELS: u64 = 64 * 1024 * 1024;
 
+pub(crate) enum ProbeBudget {
+    /// Catalog metadata is best effort; MPEG program streams otherwise scan up to 5 MiB.
+    Catalog,
+    /// Decoding and detailed inspection need reliable stream metadata for seeking.
+    Full,
+}
+
+impl ProbeBudget {
+    fn size_bytes(&self) -> &'static str {
+        match self {
+            Self::Catalog => "65536",
+            Self::Full => "5242880",
+        }
+    }
+}
+
 struct Interrupt {
     cancelled: Arc<AtomicBool>,
     aborted: Arc<AtomicBool>,
@@ -54,6 +70,7 @@ impl VideoReader {
         path: &Utf8Path,
         cancelled: Arc<AtomicBool>,
         aborted: Arc<AtomicBool>,
+        probe_budget: ProbeBudget,
     ) -> Result<Self> {
         // Verify this is a local file before passing a string to FFmpeg's URL-oriented API.
         ensure!(
@@ -66,7 +83,7 @@ impl VideoReader {
             deadline: Instant::now() + Duration::from_secs(30),
         });
         control.check()?;
-        let input = open_input(path, Arc::clone(&control))?;
+        let input = open_input(path, Arc::clone(&control), probe_budget)?;
         let stream = input
             .streams()
             .filter(|stream| {
@@ -489,12 +506,16 @@ fn orientation_from_matrix(matrix: [i32; 9]) -> Result<ExifOrientation> {
     )
 }
 
-fn open_input(path: &Utf8Path, control: Arc<Interrupt>) -> Result<format::context::Input> {
-    let options = ffmpeg::dict! {
+fn open_input(
+    path: &Utf8Path,
+    control: Arc<Interrupt>,
+    probe_budget: ProbeBudget,
+) -> Result<format::context::Input> {
+    let mut options = ffmpeg::dict! {
         "protocol_whitelist" => "file",
-        "probesize" => "5242880",
         "analyzeduration" => "5000000",
     };
+    options.set("probesize", probe_budget.size_bytes());
     let probe_options = ffmpeg::dict! { "threads" => "1" };
     format::input_with_dictionary_and_interrupt(path.as_str(), options, &probe_options, move || {
         control.stopped()

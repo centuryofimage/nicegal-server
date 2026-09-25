@@ -5,7 +5,7 @@ import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { parseArgs } from 'node:util'
-import { spawnServer, readReadyMessage, sseSnapshots, stopChild, withTimeout } from './server-harness.mjs'
+import { createLibrary, spawnServer, readReadyMessage, sseSnapshots, stopChild, withTimeout } from './server-harness.mjs'
 
 const { values } = parseArgs({ options: {
   before: { type: 'string' }, after: { type: 'string' },
@@ -58,7 +58,9 @@ async function benchmark(variant, round, stateDirectory) {
   child.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-32000) })
   try {
     const { endpoint } = await withTimeout(readReadyMessage(child, () => stderr), 60000, 'server readiness')
-    const catalog = await measureJob(endpoint, token, 'catalogSync', { root: corpus, scan: { debugLimit: limit } }, `${variant}/${round}`)
+    const libraryId = await createLibrary(endpoint, token, { include: [corpus], ocr: false, image: false })
+    // A library with no search indexes only catalogs, so this measures cataloging alone.
+    const catalog = await measureJob(endpoint, token, 'libraryScan', { libraryId, debugLimit: limit }, `${variant}/${round}`)
     const db = new DatabaseSync(join(stateDirectory, 'assets.db'), { readOnly: true })
     let sources
     try {
@@ -67,7 +69,7 @@ async function benchmark(variant, round, stateDirectory) {
       sources = statement.all()
     } finally { db.close() }
     const sourceHash = createHash('sha256').update(JSON.stringify(sources, (_, value) => typeof value === 'bigint' ? value.toString() : value)).digest('hex')
-    const image = await measureJob(endpoint, token, 'imageEmbed', { root: corpus, debugLimit: limit }, `${variant}/${round}`)
+    const image = await measureJob(endpoint, token, 'imageEmbed', { libraryId, debugLimit: limit }, `${variant}/${round}`)
     await stopChild(child)
     const trace = (await readFile(join(stateDirectory, 'nicegal-server.log'), 'utf8')).trim().split('\n').map(line => JSON.parse(line))
     const catalogTrace = trace.find(event => event.span?.name === 'catalog' && event.fields?.message === 'close')

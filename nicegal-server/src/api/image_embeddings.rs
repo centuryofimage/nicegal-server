@@ -7,7 +7,6 @@ use axum::{
     extract::State,
     routing::{MethodRouter, get},
 };
-use camino::Utf8PathBuf as PathBuf;
 use nicegal_core::assets::{Asset, AssetCatalog};
 use nicegal_core::db::SearchFilters;
 use nicegal_core::embedding::ImageEmbedder;
@@ -16,16 +15,16 @@ use nicegal_core::image_index::{
     index_images_observed,
 };
 use nicegal_core::index::IndexObserver;
+use nicegal_core::scope::PathScope;
 use nicegal_core::thumbs::ThumbnailService;
 use serde::{Deserialize, Serialize};
 
 use super::error::ApiError;
-use super::roots;
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CoverageRequest {
-    root: PathBuf,
+    library_id: i64,
 }
 
 #[derive(Serialize)]
@@ -44,9 +43,9 @@ async fn coverage(
 ) -> Result<Json<CoverageResponse>, ApiError> {
     let dimensions = state.image_query_embedder.dimensions();
     run_blocking(move || {
-        let root = roots::resolve_root("image embeddings", &request.root)?;
+        let scope = super::libraries::scope(&state.databases, request.library_id)?;
         let db = state.databases.open_images_read_only(dimensions)?;
-        let (total, indexed) = db.coverage(&SearchFilters::new(&root))?;
+        let (total, indexed) = db.coverage(&SearchFilters::new(scope))?;
         Ok(Json(CoverageResponse { total, indexed }))
     })
     .await
@@ -55,14 +54,16 @@ async fn coverage(
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct Request {
-    root: PathBuf,
+    library_id: i64,
     #[serde(default)]
     force: bool,
     debug_limit: Option<usize>,
 }
 
 pub(crate) struct Spec {
-    root: PathBuf,
+    /// Set for a standalone job; its scope is read from the library when the job runs.
+    library_id: Option<i64>,
+    scope: PathScope,
     force: bool,
     retry_failed: bool,
     debug_limit: Option<usize>,
@@ -71,18 +72,34 @@ pub(crate) struct Spec {
 
 impl Spec {
     pub(crate) fn pending_for(
-        root: PathBuf,
+        scope: PathScope,
         retry_failed: bool,
         debug_limit: Option<usize>,
         index_videos: bool,
     ) -> Self {
         Self {
-            root,
+            library_id: None,
+            scope,
             force: false,
             retry_failed,
             debug_limit,
             index_videos,
         }
+    }
+}
+
+impl Spec {
+    pub(crate) fn library_id(&self) -> Option<i64> {
+        self.library_id
+    }
+
+    /// Read a standalone job's library scope.
+    pub(crate) fn resolve(mut self, databases: &Databases) -> anyhow::Result<Self> {
+        if let Some(library_id) = self.library_id {
+            let catalog = AssetCatalog::new_read_only(&databases.assets)?;
+            self.scope = super::libraries::stored(&catalog, library_id)?.scope();
+        }
+        Ok(self)
     }
 }
 
@@ -92,9 +109,9 @@ pub(crate) fn prepare(request: Request) -> Result<Spec, ApiError> {
             "debugLimit must be greater than zero",
         ));
     }
-    let root = roots::resolve_root("image embeddings", &request.root)?;
     Ok(Spec {
-        root,
+        library_id: Some(request.library_id),
+        scope: PathScope::default(),
         force: request.force,
         retry_failed: false,
         debug_limit: request.debug_limit,
@@ -125,7 +142,6 @@ pub(crate) fn run(
             &assets,
             &mut images,
             embedder,
-            &spec.root,
             catalog,
             options,
             observer,
@@ -134,7 +150,7 @@ pub(crate) fn run(
             &assets,
             &mut images,
             embedder,
-            &spec.root,
+            &spec.scope,
             options,
             observer,
         ),
@@ -157,7 +173,7 @@ pub(crate) fn has_pending(
     let catalog = match catalog {
         Some(catalog) => catalog,
         None => {
-            owned = assets.under_root(&spec.root)?;
+            owned = assets.in_scope(&spec.scope)?;
             &owned
         }
     };
@@ -187,13 +203,13 @@ mod tests {
     }
 
     #[test]
-    fn root_is_required_and_force_defaults_off() {
+    fn library_is_required_and_force_defaults_off() {
         assert!(request(serde_json::json!({})).is_err());
-        let parsed = request(serde_json::json!({"root": "C:/gallery"})).unwrap();
+        let parsed = request(serde_json::json!({"libraryId": 1})).unwrap();
         assert!(!parsed.force);
         assert!(
             request(serde_json::json!({
-                "root": "C:/gallery",
+                "libraryId": 1,
                 "unknown": true
             }))
             .is_err()
@@ -202,11 +218,9 @@ mod tests {
 
     #[test]
     fn image_debug_limit_is_positive_and_optional() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().to_str().unwrap();
-        let parsed = request(serde_json::json!({"root": root, "debugLimit": 2000})).unwrap();
+        let parsed = request(serde_json::json!({"libraryId": 1, "debugLimit": 2000})).unwrap();
         assert_eq!(prepare(parsed).unwrap().debug_limit, Some(2000));
-        let parsed = request(serde_json::json!({"root": root, "debugLimit": 0})).unwrap();
+        let parsed = request(serde_json::json!({"libraryId": 1, "debugLimit": 0})).unwrap();
         assert!(prepare(parsed).is_err());
     }
 }

@@ -36,11 +36,11 @@ test('job helpers require a terminal event and report failed jobs', async () => 
   await once(server, 'listening')
   const endpoint = `http://127.0.0.1:${server.address().port}`
   try {
-    await assert.rejects(createAndWaitForJob(endpoint, 'test-token', 'catalogSync', {}), /without a terminal state/)
+    await assert.rejects(createAndWaitForJob(endpoint, 'test-token', 'libraryScan', {}), /without a terminal state/)
     status = 'failed'
-    await assert.rejects(createAndWaitForJob(endpoint, 'test-token', 'catalogSync', {}), /job failed/)
+    await assert.rejects(createAndWaitForJob(endpoint, 'test-token', 'libraryScan', {}), /job failed/)
     status = 'completed'
-    assert.equal((await createAndWaitForJob(endpoint, 'test-token', 'catalogSync', {})).status, status)
+    assert.equal((await createAndWaitForJob(endpoint, 'test-token', 'libraryScan', {})).status, status)
   } finally {
     await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
   }

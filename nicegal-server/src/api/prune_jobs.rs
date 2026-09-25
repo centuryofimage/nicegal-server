@@ -12,8 +12,11 @@ use nicegal_core::index::{
 use nicegal_core::thumbs::ThumbnailService;
 use serde::Deserialize;
 
+use nicegal_core::libraries::Library;
+use nicegal_core::scope::PathScope;
+
 use super::error::ApiError;
-use super::roots;
+use super::libraries;
 
 const PRUNE_BATCH_SIZE: usize = 128;
 
@@ -22,14 +25,15 @@ pub(super) struct ReconcileScope {
     root: PathBuf,
     recursive: bool,
     exclude: Vec<glob::Pattern>,
-    limited: bool,
+    /// Literal excluded folders, such as a library's exclusions, whose files the walk never saw.
+    exclude_dirs: nicegal_core::scope::PathScope,
 }
 
 pub(super) enum ReconcileInput<'a> {
     /// A full catalog pass returns every visited asset.
     Scanned(&'a [nicegal_core::assets::Asset]),
-    /// A delta pass returns only paths that the completed walk did not visit.
-    UnseenPaths(&'a [PathBuf]),
+    /// A directory check has already narrowed the possible removals to these assets.
+    Candidates(&'a [nicegal_core::assets::Asset]),
 }
 
 impl ReconcileScope {
@@ -38,12 +42,18 @@ impl ReconcileScope {
             root,
             recursive: options.subdirs,
             exclude: options.exclude.clone(),
-            limited: options.limit.is_some(),
+            exclude_dirs: nicegal_core::scope::PathScope::new(
+                options.exclude_dirs.clone(),
+                Vec::new(),
+            ),
         }
     }
 
     fn includes(&self, path: &camino::Utf8Path) -> bool {
         if !path.starts_with(&self.root) || (!self.recursive && path.parent() != Some(&self.root)) {
+            return false;
+        }
+        if self.exclude_dirs.contains(path) {
             return false;
         }
         !path
@@ -68,24 +78,18 @@ pub(super) fn reconcile(
     observer: &dyn IndexObserver,
 ) -> anyhow::Result<()> {
     cancel_if(observer.is_cancelled())?;
-    if scope.limited {
-        return Ok(());
-    }
     scope.root = nicegal_core::assets::canonicalize_path(&scope.root)?;
     ensure_root_available(&scope.root)?;
     let mut assets = AssetCatalog::new(&databases.assets)?;
     let candidates = match input {
         ReconcileInput::Scanned(scanned) => {
-            let seen = scanned.iter().map(|asset| asset.asset_id).collect::<Vec<_>>();
+            let seen = scanned
+                .iter()
+                .map(|asset| asset.asset_id)
+                .collect::<Vec<_>>();
             assets.unseen_under_root(&scope.root, seen)?
         }
-        ReconcileInput::UnseenPaths(paths) => paths
-            .iter()
-            .map(|path| assets.get_by_path(path))
-            .collect::<anyhow::Result<Vec<_>>>()?
-            .into_iter()
-            .flatten()
-            .collect(),
+        ReconcileInput::Candidates(candidates) => candidates.to_vec(),
     };
     let mut missing = Vec::new();
     // Complete all filesystem checks before deleting any row. An inaccessible subtree must not
@@ -165,31 +169,32 @@ fn confirmed_missing(path: &camino::Utf8Path, root: &camino::Utf8Path) -> anyhow
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct Request {
-    root: PathBuf,
+    library_id: i64,
     #[serde(default = "default_true")]
     dry_run: bool,
 }
 
 pub(super) struct Spec {
-    root: PathBuf,
+    library_id: i64,
     dry_run: bool,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct LibraryPurgeRequest {
-    root: PathBuf,
+    library_id: i64,
+    #[serde(default)]
+    folders: Vec<PathBuf>,
 }
 
 pub(super) struct LibraryPurgeSpec {
-    root: PathBuf,
+    library_id: i64,
+    folders: Vec<PathBuf>,
 }
 
 pub(super) fn prepare(request: Request) -> Result<Spec, ApiError> {
-    // A root must exist right now, so an unplugged drive is never mistaken for an empty library.
-    let root = roots::resolve_root("prune", &request.root)?;
     Ok(Spec {
-        root,
+        library_id: request.library_id,
         dry_run: request.dry_run,
     })
 }
@@ -197,8 +202,46 @@ pub(super) fn prepare(request: Request) -> Result<Spec, ApiError> {
 pub(super) fn prepare_library_purge(
     request: LibraryPurgeRequest,
 ) -> Result<LibraryPurgeSpec, ApiError> {
-    let root = roots::resolve_root("library purge", &request.root)?;
-    Ok(LibraryPurgeSpec { root })
+    if let Some(folder) = request.folders.iter().find(|folder| !folder.is_absolute()) {
+        return Err(ApiError::bad_request(format!(
+            "folder to purge must be absolute: {folder}"
+        )));
+    }
+    Ok(LibraryPurgeSpec {
+        library_id: request.library_id,
+        folders: request.folders,
+    })
+}
+
+impl Spec {
+    pub(super) fn library_id(&self) -> i64 {
+        self.library_id
+    }
+}
+
+impl LibraryPurgeSpec {
+    pub(super) fn library_id(&self) -> i64 {
+        self.library_id
+    }
+}
+
+/// The library's included folders that can be read right now. An offline folder is reported and
+/// left alone, so an unplugged drive is never mistaken for deleted files.
+fn available_folders(library: &Library, observer: &dyn IndexObserver) -> Vec<PathBuf> {
+    library
+        .include
+        .iter()
+        .filter_map(|folder| match ensure_root_available(&folder.path) {
+            Ok(()) => Some(folder.path.clone()),
+            Err(error) => {
+                observer.on_event(IndexEvent::Error {
+                    path: Some(folder.path.clone()),
+                    message: format!("skipped an unavailable folder: {error:#}"),
+                });
+                None
+            }
+        })
+        .collect()
 }
 
 pub(super) fn run(
@@ -210,9 +253,10 @@ pub(super) fn run(
     thumbnails: &ThumbnailService,
     observer: &dyn IndexObserver,
 ) -> anyhow::Result<()> {
-    ensure_root_available(&spec.root)?;
     let assets = AssetCatalog::new(asset_database)?;
-    let candidates = assets.under_root(&spec.root)?;
+    let library = libraries::stored(&assets, spec.library_id)?;
+    let folders = available_folders(&library, observer);
+    let candidates = assets.in_scope(&PathScope::new(folders.clone(), library.exclude.clone()))?;
     let mut ocr = DB::new(ocr_database)?;
     let mut images = ImageIndexDb::new(image_database, image_dimensions)?;
     observer.on_event(IndexEvent::PhaseChanged(IndexPhase::Pruning));
@@ -259,9 +303,11 @@ pub(super) fn run(
             }
             continue;
         }
-        // A removable root can disappear after job validation. Stop before interpreting any
-        // further missing children as deletions.
-        ensure_root_available(&spec.root)?;
+        // A removable folder can disappear during the job. Stop before interpreting any further
+        // missing children as deletions.
+        for folder in &folders {
+            ensure_root_available(folder)?;
+        }
         if spec.dry_run {
             observer.on_event(IndexEvent::Progress(IndexProgressDelta {
                 phase_completed: missing.len(),
@@ -300,11 +346,34 @@ pub(super) fn run_library_purge(
     thumbnails: &ThumbnailService,
     observer: &dyn IndexObserver,
 ) -> anyhow::Result<()> {
-    ensure_library_purge_root_available(&spec.root)?;
     let assets = AssetCatalog::new(asset_database)?;
-    // `under_root` uses a separator-delimited prefix, so a purge of `C:/photos` cannot select
-    // catalog rows from a sibling such as `C:/photos-old`.
-    let candidates = assets.under_root(&spec.root)?;
+    let library = libraries::stored(&assets, spec.library_id)?;
+    // A whole-library purge retains files another library covers. A folder purge runs after the
+    // edited definition is saved, so every current library (including this one) protects shared
+    // or still-included files. Original files are never touched.
+    let folder_purge = !spec.folders.is_empty();
+    let others = || -> anyhow::Result<Vec<PathScope>> {
+        Ok(assets
+            .libraries()?
+            .into_iter()
+            .filter(|other| folder_purge || other.id != library.id)
+            .map(|other| other.scope())
+            .collect())
+    };
+    let covered = |asset: &nicegal_core::assets::Asset, others: &[PathScope]| {
+        others.iter().any(|scope| scope.contains(&asset.path))
+    };
+    let initial = others()?;
+    let scope = if folder_purge {
+        PathScope::new(spec.folders, Vec::new())
+    } else {
+        library.scope()
+    };
+    let candidates = assets
+        .in_scope(&scope)?
+        .into_iter()
+        .filter(|asset| !covered(asset, &initial))
+        .collect::<Vec<_>>();
     let mut ocr = DB::new(ocr_database)?;
     let mut images = ImageIndexDb::new(image_database, image_dimensions)?;
     observer.on_event(IndexEvent::PhaseChanged(IndexPhase::Pruning));
@@ -316,28 +385,40 @@ pub(super) fn run_library_purge(
     });
 
     for chunk in candidates.chunks(PRUNE_BATCH_SIZE) {
+        // Libraries can be edited while this runs; a file another library took in since the job
+        // started keeps its data.
+        let others = others()?;
         let mut assets_to_delete = Vec::with_capacity(chunk.len());
+        let mut visited = 0;
         let mut cancelled = false;
         for asset in chunk {
             if observer.is_cancelled() {
                 cancelled = true;
                 break;
             }
-            assets_to_delete.push(asset);
+            visited += 1;
+            if !covered(asset, &others) {
+                assets_to_delete.push(asset);
+            }
         }
-        if assets_to_delete.is_empty() {
+        if visited == 0 {
             return cancel_if(cancelled);
         }
-        match delete_asset_batch(
-            &assets_to_delete,
-            &assets,
-            &mut ocr,
-            &mut images,
-            thumbnails,
-        ) {
+        let deleted = if assets_to_delete.is_empty() {
+            Ok(0)
+        } else {
+            delete_asset_batch(
+                &assets_to_delete,
+                &assets,
+                &mut ocr,
+                &mut images,
+                thumbnails,
+            )
+        };
+        match deleted {
             Ok(deleted) => observer.on_event(IndexEvent::Progress(IndexProgressDelta {
-                phase_completed: assets_to_delete.len(),
-                processed: assets_to_delete.len(),
+                phase_completed: visited,
+                processed: visited,
                 deleted,
                 ..IndexProgressDelta::default()
             })),
@@ -400,16 +481,6 @@ fn ensure_root_available(root: &PathBuf) -> anyhow::Result<()> {
         fs::read_dir(root).with_context(|| format!("reading library root: {root}"))?;
     if let Some(entry) = entries.next() {
         entry?;
-    }
-    Ok(())
-}
-
-fn ensure_library_purge_root_available(root: &PathBuf) -> anyhow::Result<()> {
-    let metadata = fs::metadata(root)
-        .map_err(anyhow::Error::from)
-        .with_context(|| format!("library purge root became unavailable: {root}"))?;
-    if !metadata.is_dir() {
-        anyhow::bail!("library purge root is no longer a directory: {root}");
     }
     Ok(())
 }
@@ -544,7 +615,7 @@ mod tests {
             ocr.search_text_vectors(
                 &[1.0, 0.0, 0.0],
                 TextEmbeddingSpace::OcrText,
-                &nicegal_core::db::SearchFilters::new(&library.root),
+                &nicegal_core::db::SearchFilters::under(&library.root),
                 10,
                 Default::default()
             )?
@@ -561,22 +632,14 @@ mod tests {
     }
 
     #[test]
-    fn automatic_reconciliation_preserves_cancelled_limited_and_unavailable_libraries()
-    -> anyhow::Result<()> {
+    fn automatic_reconciliation_preserves_cancelled_and_unavailable_libraries() -> anyhow::Result<()>
+    {
         let library = LibraryFixture::new()?;
         let removed = library.asset("removed.png")?;
         fs::remove_file(&removed.path)?;
         assert!(library.reconcile(
             IndexOptions::default(),
             &CancelBeforeSecondAsset(AtomicUsize::new(0))
-        )?);
-        assert!(library.catalog.get(removed.asset_id)?.is_some());
-        assert!(!library.reconcile(
-            IndexOptions {
-                limit: Some(10),
-                ..IndexOptions::default()
-            },
-            &NeverCancelled
         )?);
         assert!(library.catalog.get(removed.asset_id)?.is_some());
         fs::remove_dir(&library.root)?;
@@ -675,39 +738,85 @@ mod tests {
     #[test]
     fn prune_defaults_to_dry_run() {
         let request: Request = serde_json::from_value(serde_json::json!({
-            "root": "C:/gallery"
+            "libraryId": 1
         }))
         .unwrap();
         assert!(request.dry_run);
     }
 
-    #[test]
-    fn unavailable_root_is_rejected_before_job_creation() {
-        let missing = PathBuf::try_from(std::env::current_dir().unwrap())
-            .unwrap()
-            .join("definitely-missing-prune-root");
-        let error = prepare(Request {
-            root: missing,
-            dry_run: false,
+    /// A library over `folders` in the catalog at `asset_database`.
+    fn library(asset_database: &PathBuf, folders: &[&PathBuf]) -> anyhow::Result<i64> {
+        let mut catalog = AssetCatalog::new(asset_database)?;
+        let definition = nicegal_core::libraries::LibraryDefinition {
+            include: folders.iter().map(|folder| (*folder).clone()).collect(),
+            exclude: Vec::new(),
+            options: Default::default(),
+        };
+        Ok(match catalog.create_library(&definition, None)? {
+            nicegal_core::libraries::Created::New(library) => library.id,
+            nicegal_core::libraries::Created::Existing(library) => library.id,
         })
-        .err()
-        .expect("missing root should be rejected");
-        assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
-        assert_eq!(error.code, super::super::error::ErrorCode::InvalidRoot);
     }
 
     #[test]
-    fn library_purge_request_requires_only_a_root() {
+    fn pruning_skips_an_offline_folder_and_prunes_the_others() -> anyhow::Result<()> {
+        let temporary = TempDir::new()?;
+        let present = PathBuf::try_from(temporary.path().join("present"))?;
+        let offline = PathBuf::try_from(temporary.path().join("offline"))?;
+        fs::create_dir(&present)?;
+        fs::create_dir(&offline)?;
+        let kept = present.join("kept.png");
+        let deleted = present.join("deleted.png");
+        let unplugged = offline.join("unplugged.png");
+        for path in [&kept, &deleted, &unplugged] {
+            fs::write(path, [])?;
+        }
+        let asset_database = PathBuf::try_from(temporary.path().join("assets.db"))?;
+        let thumbnails =
+            ThumbnailService::new(&PathBuf::try_from(temporary.path().join("thumbnails.db"))?)?;
+        let catalog = AssetCatalog::new(&asset_database)?;
+        let [kept, deleted, unplugged] = [&kept, &deleted, &unplugged]
+            .map(|path| catalog.upsert(path, &fs::metadata(path).unwrap()).unwrap());
+        let library_id = library(&asset_database, &[&present, &offline])?;
+        fs::remove_file(&deleted.path)?;
+        fs::remove_dir_all(&offline)?;
+
+        run(
+            prepare(Request {
+                library_id,
+                dry_run: false,
+            })
+            .unwrap(),
+            &asset_database,
+            &PathBuf::try_from(temporary.path().join("ocr.db"))?,
+            &PathBuf::try_from(temporary.path().join("clip.db"))?,
+            512,
+            &thumbnails,
+            &NeverCancelled,
+        )?;
+
+        let catalog = AssetCatalog::new(&asset_database)?;
+        assert!(catalog.get(kept.asset_id)?.is_some());
+        assert!(catalog.get(deleted.asset_id)?.is_none());
+        assert!(
+            catalog.get(unplugged.asset_id)?.is_some(),
+            "an offline folder's entries are never pruned"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn library_purge_request_requires_only_a_library() {
         assert!(
             serde_json::from_value::<LibraryPurgeRequest>(serde_json::json!({
-                "root": "C:/gallery"
+                "libraryId": 1
             }))
             .is_ok()
         );
         assert!(serde_json::from_value::<LibraryPurgeRequest>(serde_json::json!({})).is_err());
         assert!(
             serde_json::from_value::<LibraryPurgeRequest>(serde_json::json!({
-                "root": "C:/gallery",
+                "libraryId": 1,
                 "dryRun": false
             }))
             .is_err()
@@ -734,10 +843,14 @@ mod tests {
         let catalog = AssetCatalog::new(&asset_database)?;
         let included = catalog.upsert(&inside, &fs::metadata(&inside)?)?;
         let excluded = catalog.upsert(&outside, &fs::metadata(&outside)?)?;
+        let library_id = library(&asset_database, &[&root])?;
 
         run_library_purge(
-            prepare_library_purge(LibraryPurgeRequest { root })
-                .expect("temporary root should prepare for library purge"),
+            prepare_library_purge(LibraryPurgeRequest {
+                library_id,
+                folders: Vec::new(),
+            })
+            .unwrap(),
             &asset_database,
             &ocr_database,
             &image_database,
@@ -770,10 +883,14 @@ mod tests {
         let catalog = AssetCatalog::new(&asset_database)?;
         let first = catalog.upsert(&first_path, &fs::metadata(&first_path)?)?;
         let second = catalog.upsert(&second_path, &fs::metadata(&second_path)?)?;
+        let library_id = library(&asset_database, &[&root])?;
 
         let error = run_library_purge(
-            prepare_library_purge(LibraryPurgeRequest { root })
-                .expect("temporary root should prepare for library purge"),
+            prepare_library_purge(LibraryPurgeRequest {
+                library_id,
+                folders: Vec::new(),
+            })
+            .unwrap(),
             &asset_database,
             &ocr_database,
             &image_database,
@@ -787,6 +904,104 @@ mod tests {
         let catalog = AssetCatalog::new(&asset_database)?;
         assert!(catalog.get(first.asset_id)?.is_none());
         assert!(catalog.get(second.asset_id)?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn library_purge_keeps_files_another_library_covers() -> anyhow::Result<()> {
+        let temporary = TempDir::new()?;
+        let photos = PathBuf::try_from(temporary.path().join("photos"))?;
+        let shared = photos.join("shared");
+        fs::create_dir_all(&shared)?;
+        let only_here = photos.join("only-here.png");
+        let in_both = shared.join("in-both.png");
+        fs::write(&only_here, [])?;
+        fs::write(&in_both, [])?;
+
+        let asset_database = PathBuf::try_from(temporary.path().join("assets.db"))?;
+        let thumbnails =
+            ThumbnailService::new(&PathBuf::try_from(temporary.path().join("thumbnails.db"))?)?;
+        let catalog = AssetCatalog::new(&asset_database)?;
+        let only_here = catalog.upsert(&only_here, &fs::metadata(&only_here)?)?;
+        let in_both = catalog.upsert(&in_both, &fs::metadata(&in_both)?)?;
+        let purged = library(&asset_database, &[&photos])?;
+        library(&asset_database, &[&shared])?;
+        // The folder going offline does not stop a purge of indexed data.
+        fs::remove_dir_all(&photos)?;
+
+        run_library_purge(
+            prepare_library_purge(LibraryPurgeRequest {
+                library_id: purged,
+                folders: Vec::new(),
+            })
+            .unwrap(),
+            &asset_database,
+            &PathBuf::try_from(temporary.path().join("ocr.db"))?,
+            &PathBuf::try_from(temporary.path().join("clip.db"))?,
+            512,
+            &thumbnails,
+            &NeverCancelled,
+        )?;
+
+        let catalog = AssetCatalog::new(&asset_database)?;
+        assert!(catalog.get(only_here.asset_id)?.is_none());
+        assert!(catalog.get(in_both.asset_id)?.is_some());
+        Ok(())
+    }
+
+    /// Adds a library over `folder` once the purge has chosen its candidates.
+    struct AddLibraryAfterDiscovery {
+        asset_database: PathBuf,
+        folder: PathBuf,
+    }
+
+    impl IndexObserver for AddLibraryAfterDiscovery {
+        fn on_event(&self, event: IndexEvent) {
+            if let IndexEvent::DiscoveryComplete { .. } = event {
+                library(&self.asset_database, &[&self.folder]).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn library_purge_keeps_files_a_library_added_during_the_purge_covers() -> anyhow::Result<()> {
+        let temporary = TempDir::new()?;
+        let photos = PathBuf::try_from(temporary.path().join("photos"))?;
+        let shared = photos.join("shared");
+        fs::create_dir_all(&shared)?;
+        let only_here = photos.join("only-here.png");
+        let taken = shared.join("taken.png");
+        fs::write(&only_here, [])?;
+        fs::write(&taken, [])?;
+
+        let asset_database = PathBuf::try_from(temporary.path().join("assets.db"))?;
+        let thumbnails =
+            ThumbnailService::new(&PathBuf::try_from(temporary.path().join("thumbnails.db"))?)?;
+        let catalog = AssetCatalog::new(&asset_database)?;
+        let only_here = catalog.upsert(&only_here, &fs::metadata(&only_here)?)?;
+        let taken = catalog.upsert(&taken, &fs::metadata(&taken)?)?;
+        let purged = library(&asset_database, &[&photos])?;
+
+        run_library_purge(
+            prepare_library_purge(LibraryPurgeRequest {
+                library_id: purged,
+                folders: Vec::new(),
+            })
+            .unwrap(),
+            &asset_database,
+            &PathBuf::try_from(temporary.path().join("ocr.db"))?,
+            &PathBuf::try_from(temporary.path().join("clip.db"))?,
+            512,
+            &thumbnails,
+            &AddLibraryAfterDiscovery {
+                asset_database: asset_database.clone(),
+                folder: shared,
+            },
+        )?;
+
+        let catalog = AssetCatalog::new(&asset_database)?;
+        assert!(catalog.get(only_here.asset_id)?.is_none());
+        assert!(catalog.get(taken.asset_id)?.is_some());
         Ok(())
     }
 }

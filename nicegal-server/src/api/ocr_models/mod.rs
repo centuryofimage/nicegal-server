@@ -60,6 +60,16 @@ impl ModelStore {
         self.models().is_some()
     }
 
+    pub(super) fn is_loaded_with(
+        &self,
+        detection: &ModelSource,
+        recognition: &ModelSource,
+    ) -> bool {
+        self.models().as_ref().is_some_and(|models| {
+            models.detection == *detection && models.recognition == *recognition
+        })
+    }
+
     pub(super) fn snapshot(&self) -> Option<Arc<Mutex<PaddleOcrPool>>> {
         self.models()
             .as_ref()

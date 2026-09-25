@@ -96,7 +96,7 @@ async fn create_job(
     ApiJson(request): ApiJson<job::Request>,
 ) -> Result<(StatusCode, Json<JobResponse>), ApiError> {
     let spec = JobSpec::ThumbnailGenerate(job::prepare(request)?);
-    let job = state.jobs.start(spec)?;
+    let job = super::jobs::start_job(&state, spec).await?;
     Ok((StatusCode::ACCEPTED, Json(job.response())))
 }
 

@@ -4,8 +4,9 @@ mod error;
 mod extract;
 mod image_embeddings;
 mod image_model;
-mod indexing;
 mod jobs;
+mod libraries;
+mod library_scan;
 pub(crate) mod models;
 mod ocr_models;
 mod prune_jobs;
@@ -127,6 +128,7 @@ pub(crate) fn router(state: AppState, authorization: HeaderValue) -> Router {
         .route("/v1/runtime", runtime::route())
         .route("/v1/assets", assets::route())
         .merge(catalog::routes())
+        .merge(libraries::routes())
         .route("/v1/thumbnails", thumbnails::route())
         .route("/v1/thumbnails/generate", thumbnails::generate_route())
         .route(
@@ -340,7 +342,17 @@ mod tests {
         }])
         .unwrap();
         drop(ocr);
-        drop(AssetCatalog::new(&databases.assets).unwrap());
+        AssetCatalog::new(&databases.assets)
+            .unwrap()
+            .create_library(
+                &nicegal_core::libraries::LibraryDefinition {
+                    include: vec![directory.clone()],
+                    exclude: Vec::new(),
+                    options: Default::default(),
+                },
+                None,
+            )
+            .unwrap();
         drop(ThumbnailDb::new(&databases.thumbnails).unwrap());
 
         let embedder = if prepare_models {
@@ -446,12 +458,13 @@ mod tests {
         (status, body)
     }
 
-    fn search_uri(temp: &TempDir, query: &str, kind: &str) -> String {
-        let root = temp.path().to_str().unwrap();
+    /// Every test router has one library, over its temp directory.
+    const FIXTURE_LIBRARY: i64 = 1;
+
+    fn search_uri(query: &str, kind: &str) -> String {
         format!(
-            "/v1/search?q={}&type={kind}&root={}",
-            urlencode(query),
-            urlencode(root)
+            "/v1/search?q={}&type={kind}&libraryId={FIXTURE_LIBRARY}",
+            urlencode(query)
         )
     }
 
@@ -479,13 +492,11 @@ mod tests {
         }
         let (status, _) = send(&router, Method::GET, "/v1/health").await;
         assert_eq!(status, StatusCode::OK);
-        let (status, body) =
-            send(&router, Method::GET, &search_uri(&temp, "hello", "simple")).await;
+        let (status, body) = send(&router, Method::GET, &search_uri("hello", "ocrSimple")).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["total"], 1);
         for kind in ["vector", "image"] {
-            let (status, body) =
-                send(&router, Method::GET, &search_uri(&temp, "hello", kind)).await;
+            let (status, body) = send(&router, Method::GET, &search_uri("hello", kind)).await;
             assert_eq!(status, StatusCode::CONFLICT, "{kind}: {body}");
             assert_eq!(body["error"]["code"], "models_not_ready");
         }
@@ -493,6 +504,91 @@ mod tests {
         for key in ["text", "clipImage", "clipText"] {
             assert_eq!(body[key]["state"], "notLoaded");
         }
+    }
+
+    #[tokio::test]
+    async fn path_search_uses_catalog_without_preparing_models() {
+        let temp = TempDir::new().unwrap();
+        let router = test_router_with_preparation(&temp, false);
+        let directory = PathBuf::try_from(temp.path().join("Trips 2025")).unwrap();
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("Café.jpg");
+        std::fs::write(&path, b"image").unwrap();
+        let catalog_path = PathBuf::try_from(temp.path().join("assets.db")).unwrap();
+        let mut catalog = AssetCatalog::new(&catalog_path).unwrap();
+        let asset = catalog.upsert(&path, &path.metadata().unwrap()).unwrap();
+        let root = PathBuf::try_from(temp.path().to_path_buf()).unwrap();
+        let empty = root.join("Empty folder");
+        std::fs::create_dir_all(&empty).unwrap();
+        catalog
+            .replace_directory_snapshot(
+                FIXTURE_LIBRARY,
+                &root,
+                "[]",
+                &[
+                    nicegal_core::libraries::DirectorySnapshot {
+                        path: root.clone(),
+                        modified_ns: 0,
+                    },
+                    nicegal_core::libraries::DirectorySnapshot {
+                        path: directory.clone(),
+                        modified_ns: 0,
+                    },
+                    nicegal_core::libraries::DirectorySnapshot {
+                        path: empty.clone(),
+                        modified_ns: 0,
+                    },
+                ],
+            )
+            .unwrap();
+        drop(catalog);
+
+        let (status, folders) = send(
+            &router,
+            Method::GET,
+            &format!("/v1/catalog/folders?libraryId={FIXTURE_LIBRARY}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{folders}");
+        assert!(
+            folders
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(empty.as_str()))
+        );
+
+        let (status, body) = send(&router, Method::GET, &search_uri("TRIPS", "path")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["total"], 1);
+        assert_eq!(body["results"][0]["assetId"], asset.asset_id);
+        assert_eq!(body["results"][0]["snippet"], path.as_str());
+        let (status, body) = send(&router, Method::GET, &search_uri("CAFÉ", "name")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["total"], 1);
+        assert_eq!(body["results"][0]["snippet"], "Café.jpg");
+        let (status, body) = send(&router, Method::GET, &search_uri("Trips", "name")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["total"], 0);
+        let other = PathBuf::try_from(temp.path().join("Trips 2025-old")).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let other_path = other.join("Café.jpg");
+        std::fs::write(&other_path, b"image").unwrap();
+        AssetCatalog::new(&catalog_path)
+            .unwrap()
+            .upsert(&other_path, &other_path.metadata().unwrap())
+            .unwrap();
+        let focused = format!(
+            "{}&folder={}",
+            search_uri("CAFÉ", "name"),
+            urlencode(directory.as_str())
+        );
+        let (status, body) = send(&router, Method::GET, &focused).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["total"], 1);
+        assert_eq!(body["results"][0]["assetId"], asset.asset_id);
+        let (status, body) = send(&router, Method::GET, "/v1/models").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["text"]["state"], "notLoaded");
     }
 
     #[tokio::test]
@@ -615,7 +711,10 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["code"], "invalid_request");
         assert!(
-            body["error"]["message"].as_str().unwrap().contains("root"),
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("libraryId"),
             "{body}"
         );
 
@@ -674,8 +773,7 @@ mod tests {
     async fn a_well_formed_search_returns_its_hits() {
         let temp = TempDir::new().unwrap();
         let router = test_router(&temp);
-        let (status, body) =
-            send(&router, Method::GET, &search_uri(&temp, "hello", "simple")).await;
+        let (status, body) = send(&router, Method::GET, &search_uri("hello", "ocrSimple")).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["total"], 1);
         assert_eq!(body["results"][0]["assetId"], 1);
@@ -686,11 +784,11 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let router = test_router(&temp);
         for (query, kind, expected) in [
-            ("ocr:\"unterminated", "simple", "unterminated string"),
-            ("AND", "match", "fts5: syntax error"),
-            ("col:foo", "match", "no such column"),
+            ("ocr:\"unterminated", "ocrSimple", "unterminated string"),
+            ("AND", "ocrMatch", "fts5: syntax error"),
+            ("col:foo", "ocrMatch", "no such column"),
         ] {
-            let (status, body) = send(&router, Method::GET, &search_uri(&temp, query, kind)).await;
+            let (status, body) = send(&router, Method::GET, &search_uri(query, kind)).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
             assert_eq!(body["error"]["code"], "query_syntax", "{query}");
             let message = body["error"]["message"].as_str().unwrap();
@@ -699,28 +797,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unusable_search_root_is_invalid_root() {
+    async fn searching_an_unknown_library_is_library_not_found() {
         let temp = TempDir::new().unwrap();
         let router = test_router(&temp);
-        let missing = temp.path().join("not-there");
-        let uri = format!(
-            "/v1/search?q=hello&type=image&root={}",
-            urlencode(missing.to_str().unwrap())
-        );
-        let (status, body) = send(&router, Method::GET, &uri).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(body["error"]["code"], "invalid_root");
-
-        let (status, body) = send(&router, Method::GET, "/v1/search?q=hello&root=relative").await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(body["error"]["code"], "invalid_root");
-        assert!(
-            body["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("absolute"),
-            "{body}"
-        );
+        let (status, body) = send(&router, Method::GET, "/v1/search?q=hello&libraryId=99").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], "library_not_found");
     }
 
     #[tokio::test]
@@ -730,7 +812,7 @@ mod tests {
         let (status, body) = send(
             &router,
             Method::GET,
-            &search_uri(&temp, "nothingmatchesthis", "simple"),
+            &search_uri("nothingmatchesthis", "ocrSimple"),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -747,7 +829,7 @@ mod tests {
         ocr.set_text_embedding_model(space, embedder.model().id(), embedder.dimensions(), true)
             .unwrap();
         let root = PathBuf::try_from(temp.path().to_path_buf()).unwrap();
-        let filters = nicegal_core::db::SearchFilters::new(&root);
+        let filters = nicegal_core::db::SearchFilters::under(&root);
         let pending = ocr
             .pending_text_embeddings(space, &filters, 100, 8192)
             .unwrap();
@@ -767,8 +849,17 @@ mod tests {
         uri: &str,
         body: serde_json::Value,
     ) -> (StatusCode, serde_json::Value) {
+        send_value(router, Method::POST, uri, body).await
+    }
+
+    async fn send_value(
+        router: &Router,
+        method: Method,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
         let request = Request::builder()
-            .method(Method::POST)
+            .method(method)
             .uri(uri)
             .header(header::AUTHORIZATION, TOKEN)
             .header(header::CONTENT_TYPE, "application/json")
@@ -781,13 +872,12 @@ mod tests {
     async fn vector_is_the_default_search_mode_and_is_empty_until_something_is_embedded() {
         let temp = TempDir::new().unwrap();
         let router = test_router_with_preparation(&temp, true);
-        let root = urlencode(temp.path().to_str().unwrap());
 
         // No `type=`: the default is vector, and nothing is embedded yet.
         let (status, body) = send(
             &router,
             Method::GET,
-            &format!("/v1/search?q=hello&root={root}"),
+            &format!("/v1/search?q=hello&libraryId={FIXTURE_LIBRARY}"),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -797,7 +887,7 @@ mod tests {
         let (status, body) = send(
             &router,
             Method::GET,
-            &format!("/v1/search?q=hello&root={root}"),
+            &format!("/v1/search?q=hello&libraryId={FIXTURE_LIBRARY}"),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -807,8 +897,7 @@ mod tests {
         // Vector hits carry a distance; the text modes do not.
         assert!(body["results"][0]["distance"].is_number(), "{body}");
 
-        let (status, body) =
-            send(&router, Method::GET, &search_uri(&temp, "hello", "simple")).await;
+        let (status, body) = send(&router, Method::GET, &search_uri("hello", "ocrSimple")).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(body["results"][0]["distance"].is_null(), "{body}");
     }
@@ -817,11 +906,12 @@ mod tests {
     async fn a_distance_ceiling_is_rejected_for_the_text_modes() {
         let temp = TempDir::new().unwrap();
         let router = test_router(&temp);
-        let root = urlencode(temp.path().to_str().unwrap());
         let (status, body) = send(
             &router,
             Method::GET,
-            &format!("/v1/search?q=hello&type=simple&root={root}&maxDistance=0.5"),
+            &format!(
+                "/v1/search?q=hello&type=ocrSimple&libraryId={FIXTURE_LIBRARY}&maxDistance=0.5"
+            ),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -845,11 +935,11 @@ mod tests {
             &router,
             "/v1/search",
             serde_json::json!({
-                "root": temp.path().to_str().unwrap(),
+                "libraryId": FIXTURE_LIBRARY,
                 "queries": [
                     {"key": "semantic", "type": "vector", "q": "hello"},
-                    {"key": "literal", "type": "simple", "q": "hello"},
-                    {"key": "nothing", "type": "simple", "q": "zzzznomatch"}
+                    {"key": "literal", "type": "ocrSimple", "q": "hello"},
+                    {"key": "nothing", "type": "ocrSimple", "q": "zzzznomatch"}
                 ],
                 "fuse": {"method": "rrf"}
             }),
@@ -863,9 +953,9 @@ mod tests {
         assert_eq!(queries[0]["type"], "vector");
         assert_eq!(queries[0]["total"], 1);
         assert_eq!(queries[1]["total"], 1);
-        for (index, kind) in [(0, "vector"), (1, "simple")] {
+        for (index, kind) in [(0, "vector"), (1, "ocrSimple")] {
             let (single_status, single) =
-                send(&router, Method::GET, &search_uri(&temp, "hello", kind)).await;
+                send(&router, Method::GET, &search_uri("hello", kind)).await;
             assert_eq!(single_status, StatusCode::OK, "{single}");
             assert_eq!(single["total"], queries[index]["total"]);
             assert_eq!(single["results"], queries[index]["results"]);
@@ -901,14 +991,14 @@ mod tests {
             &router,
             "/v1/search",
             serde_json::json!({
-                "root": temp.path().to_str().unwrap(),
-                "queries": [{"type": "simple", "q": "hello"}]
+                "libraryId": FIXTURE_LIBRARY,
+                "queries": [{"type": "ocrSimple", "q": "hello"}]
             }),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         // The key defaults to the mode name.
-        assert_eq!(body["queries"][0]["key"], "simple");
+        assert_eq!(body["queries"][0]["key"], "ocrSimple");
         assert!(body.get("fused").is_none(), "{body}");
         // Nothing has been embedded, so there is no stored model to report.
         assert!(body["model"].is_null(), "{body}");
@@ -918,16 +1008,14 @@ mod tests {
     async fn a_combined_search_rejects_an_empty_or_ambiguous_query_set() {
         let temp = TempDir::new().unwrap();
         let router = test_router(&temp);
-        let root = temp.path().to_str().unwrap();
-
         for body in [
-            serde_json::json!({"root": root, "queries": []}),
-            serde_json::json!({"root": root, "queries": [
-                {"key": "same", "type": "simple", "q": "a"},
-                {"key": "same", "type": "glob", "q": "b"}
+            serde_json::json!({"libraryId": FIXTURE_LIBRARY, "queries": []}),
+            serde_json::json!({"libraryId": FIXTURE_LIBRARY, "queries": [
+                {"key": "same", "type": "ocrSimple", "q": "a"},
+                {"key": "same", "type": "ocrGlob", "q": "b"}
             ]}),
-            serde_json::json!({"root": root, "queries": [
-                {"type": "simple", "q": "a", "weight": 0}
+            serde_json::json!({"libraryId": FIXTURE_LIBRARY, "queries": [
+                {"type": "ocrSimple", "q": "a", "weight": 0}
             ]}),
         ] {
             let (status, response) = post_json(&router, "/v1/search", body.clone()).await;
@@ -944,8 +1032,8 @@ mod tests {
             &router,
             "/v1/search",
             serde_json::json!({
-                "root": temp.path().to_str().unwrap(),
-                "queries": [{"type": "match", "q": "AND"}]
+                "libraryId": FIXTURE_LIBRARY,
+                "queries": [{"type": "ocrMatch", "q": "AND"}]
             }),
         )
         .await;
@@ -964,10 +1052,7 @@ mod tests {
     async fn image_embedding_coverage_is_available_without_loading_models() {
         let temp = TempDir::new().unwrap();
         let router = test_router(&temp);
-        let uri = format!(
-            "/v1/image-embeddings?root={}",
-            urlencode(temp.path().to_str().unwrap())
-        );
+        let uri = format!("/v1/image-embeddings?libraryId={FIXTURE_LIBRARY}");
         let (status, body) = send(&router, Method::GET, &uri).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["indexed"], 0);
@@ -980,10 +1065,7 @@ mod tests {
     async fn embedding_status_separates_an_unembedded_root_from_an_empty_one() {
         let temp = TempDir::new().unwrap();
         let router = test_router(&temp);
-        let uri = format!(
-            "/v1/text-embeddings?root={}",
-            urlencode(temp.path().to_str().unwrap())
-        );
+        let uri = format!("/v1/text-embeddings?libraryId={FIXTURE_LIBRARY}");
 
         let (status, body) = send(&router, Method::GET, &uri).await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -1014,14 +1096,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_embed_backfill_starts_a_job_and_a_bad_root_does_not() {
+    async fn an_embed_backfill_starts_a_job_and_an_unknown_library_does_not() {
         let temp = TempDir::new().unwrap();
         let router = test_router_with_preparation(&temp, true);
 
         let (status, body) = post_json(
             &router,
             "/v1/text-embeddings/generate",
-            serde_json::json!({"root": temp.path().to_str().unwrap()}),
+            serde_json::json!({"libraryId": FIXTURE_LIBRARY}),
         )
         .await;
         assert_eq!(status, StatusCode::ACCEPTED, "{body}");
@@ -1030,18 +1112,17 @@ mod tests {
         let (status, body) = post_json(
             &router,
             "/v1/text-embeddings/generate",
-            serde_json::json!({"root": "relative/path"}),
+            serde_json::json!({"libraryId": 99}),
         )
         .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(body["error"]["code"], "invalid_root");
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], "library_not_found");
     }
 
     #[tokio::test]
     async fn a_time_bound_without_a_timeline_is_refused() {
         let temp = TempDir::new().unwrap();
         let router = test_router(&temp);
-        let root = urlencode(temp.path().to_str().unwrap());
 
         // There is no default timeline: capture and modified answer different questions, so the
         // server refuses to pick one on the caller's behalf.
@@ -1049,7 +1130,7 @@ mod tests {
             let (status, body) = send(
                 &router,
                 Method::GET,
-                &format!("/v1/search?q=hello&type=simple&root={root}&{query}"),
+                &format!("/v1/search?q=hello&type=ocrSimple&libraryId={FIXTURE_LIBRARY}&{query}"),
             )
             .await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
@@ -1068,7 +1149,9 @@ mod tests {
         let (status, body) = send(
             &router,
             Method::GET,
-            &format!("/v1/search?q=hello&type=simple&root={root}&timeline=capture"),
+            &format!(
+                "/v1/search?q=hello&type=ocrSimple&libraryId={FIXTURE_LIBRARY}&timeline=capture"
+            ),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -1080,18 +1163,21 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let router = test_router_with_preparation(&temp, true);
         embed_everything(&temp);
-        let root = urlencode(temp.path().to_str().unwrap());
         // The fixture row has source_modified_ns = 1 and no EXIF capture time.
         let inside = "after=0&before=2&timeline=modified";
         let outside = "after=2&before=9&timeline=modified";
 
-        for kind in ["simple", "glob", "vector"] {
-            let query = if kind == "glob" { "*hello*" } else { "hello" };
+        for kind in ["ocrSimple", "ocrGlob", "vector"] {
+            let query = if kind == "ocrGlob" {
+                "*hello*"
+            } else {
+                "hello"
+            };
             let (status, body) = send(
                 &router,
                 Method::GET,
                 &format!(
-                    "/v1/search?q={}&type={kind}&root={root}&{inside}",
+                    "/v1/search?q={}&type={kind}&libraryId={FIXTURE_LIBRARY}&{inside}",
                     urlencode(query)
                 ),
             )
@@ -1103,7 +1189,7 @@ mod tests {
                 &router,
                 Method::GET,
                 &format!(
-                    "/v1/search?q={}&type={kind}&root={root}&{outside}",
+                    "/v1/search?q={}&type={kind}&libraryId={FIXTURE_LIBRARY}&{outside}",
                     urlencode(query)
                 ),
             )
@@ -1117,13 +1203,12 @@ mod tests {
     async fn instants_are_decimal_strings_and_a_reversed_range_is_refused() {
         let temp = TempDir::new().unwrap();
         let router = test_router(&temp);
-        let root = urlencode(temp.path().to_str().unwrap());
 
         let (status, body) = send(
             &router,
             Method::GET,
             &format!(
-                "/v1/search?q=hello&type=simple&root={root}&after=notanumber&timeline=modified"
+                "/v1/search?q=hello&type=ocrSimple&libraryId={FIXTURE_LIBRARY}&after=notanumber&timeline=modified"
             ),
         )
         .await;
@@ -1140,7 +1225,7 @@ mod tests {
             &router,
             Method::GET,
             &format!(
-                "/v1/search?q=hello&type=simple&root={root}&after=9&before=2&timeline=modified"
+                "/v1/search?q=hello&type=ocrSimple&libraryId={FIXTURE_LIBRARY}&after=9&before=2&timeline=modified"
             ),
         )
         .await;
@@ -1158,7 +1243,7 @@ mod tests {
             &router,
             Method::GET,
             &format!(
-                "/v1/search?q=hello&type=simple&root={root}&after=1717243200123456789&timeline=capture"
+                "/v1/search?q=hello&type=ocrSimple&libraryId={FIXTURE_LIBRARY}&after=1717243200123456789&timeline=capture"
             ),
         )
         .await;
@@ -1176,14 +1261,14 @@ mod tests {
             &router,
             "/v1/search",
             serde_json::json!({
-                "root": temp.path().to_str().unwrap(),
+                "libraryId": FIXTURE_LIBRARY,
                 "timeline": "modified",
                 "after": "2",
                 "queries": [
-                    {"key": "inherits", "type": "simple", "q": "hello"},
+                    {"key": "inherits", "type": "ocrSimple", "q": "hello"},
                     // Overriding replaces the whole filter rather than merging, so this query does
                     // not silently inherit `after` from the request.
-                    {"key": "overrides", "type": "simple", "q": "hello",
+                    {"key": "overrides", "type": "ocrSimple", "q": "hello",
                      "timeline": "modified", "after": "0", "before": "2"},
                     {"key": "vector", "type": "vector", "q": "hello"}
                 ]
@@ -1208,10 +1293,10 @@ mod tests {
             &router,
             "/v1/search",
             serde_json::json!({
-                "root": temp.path().to_str().unwrap(),
+                "libraryId": FIXTURE_LIBRARY,
                 "timeline": "modified",
                 "after": "0",
-                "queries": [{"key": "partial", "type": "simple", "q": "hello", "before": "2"}]
+                "queries": [{"key": "partial", "type": "ocrSimple", "q": "hello", "before": "2"}]
             }),
         )
         .await;
@@ -1261,10 +1346,7 @@ mod tests {
         }])
         .unwrap();
         std::fs::remove_file(&source).unwrap();
-        let uri = format!(
-            "/v1/catalog?root={}&timeline=capture",
-            urlencode(root.as_str())
-        );
+        let uri = format!("/v1/catalog?libraryId={FIXTURE_LIBRARY}&timeline=capture");
         let (status, listing) = send(&router, Method::GET, &uri).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(listing[0]["id"], asset.asset_id.to_string());
@@ -1276,7 +1358,7 @@ mod tests {
         let (_, count) = send(
             &router,
             Method::GET,
-            &format!("/v1/catalog/count?root={}", urlencode(root.as_str())),
+            &format!("/v1/catalog/count?libraryId={FIXTURE_LIBRARY}"),
         )
         .await;
         assert_eq!(count, 1);
@@ -1299,10 +1381,10 @@ mod tests {
         let (status, _) = send(&router, Method::GET, "/v1/catalog/metadata?assetId=999").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         for uri in [
-            "/v1/catalog?root=relative",
-            "/v1/catalog/count?root=relative",
+            "/v1/catalog",
+            "/v1/catalog/count",
             "/v1/catalog/metadata?assetId=0",
-            "/v1/catalog?root=C%3A%2F&timeline=wrong",
+            "/v1/catalog?libraryId=1&timeline=wrong",
         ] {
             assert_eq!(
                 send(&router, Method::GET, uri).await.0,
@@ -1402,5 +1484,548 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["error"]["code"], "asset_not_found");
+    }
+
+    fn library_dir(temp: &TempDir, name: &str) -> String {
+        let path = temp.path().join(name);
+        std::fs::create_dir_all(&path).unwrap();
+        let path = PathBuf::try_from(path).unwrap();
+        nicegal_core::assets::canonicalize_path(&path)
+            .unwrap()
+            .into_string()
+    }
+
+    #[tokio::test]
+    async fn libraries_are_created_listed_edited_and_deleted() {
+        let temp = TempDir::new().unwrap();
+        let router = test_router(&temp);
+        let photos = library_dir(&temp, "photos");
+        let private = library_dir(&temp, "photos/private");
+        let phone = library_dir(&temp, "phone");
+
+        let (status, created) = post_json(
+            &router,
+            "/v1/libraries",
+            serde_json::json!({ "include": [photos], "exclude": [private] }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let id = created["id"].as_i64().unwrap();
+        assert!(created.get("revision").is_none());
+        assert_eq!(created["include"][0]["path"], photos.as_str());
+        assert_eq!(created["include"][0]["scanPending"], true);
+        assert_eq!(
+            created["include"][0]["scanOutcome"],
+            serde_json::Value::Null
+        );
+        assert_eq!(created["exclude"][0], private.as_str());
+        assert_eq!(
+            (created["ocr"].clone(), created["image"].clone()),
+            (false.into(), true.into())
+        );
+        let scans_of = |jobs: &serde_json::Value, library: &serde_json::Value| {
+            jobs["jobs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|job| job["type"] == "libraryScan" && &job["libraryId"] == library)
+                .count()
+        };
+        let (_, jobs) = send(&router, Method::GET, "/v1/jobs").await;
+        assert_eq!(
+            scans_of(&jobs, &created["id"]),
+            0,
+            "creating a library starts no scan"
+        );
+        let (status, scan) = post_json(
+            &router,
+            "/v1/jobs",
+            serde_json::json!({ "type": "libraryScan", "params": { "libraryId": id, "pendingOnly": true } }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{scan}");
+        assert_eq!(scan["libraryId"], id);
+
+        let (status, listed) = send(&router, Method::GET, "/v1/libraries").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            listed.as_array().unwrap().last().unwrap()["id"],
+            created["id"]
+        );
+        let uri = format!("/v1/libraries/{id}");
+        assert_eq!(
+            send(&router, Method::GET, &uri).await.1["id"],
+            created["id"]
+        );
+
+        let edit = serde_json::json!({
+            "include": [photos, phone], "exclude": [], "ocr": true, "image": true
+        });
+        let (status, edited) = send_value(&router, Method::PUT, &uri, edit.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{edited}");
+        assert_eq!(edited["include"][1]["path"], phone.as_str());
+        assert_eq!(edited["exclude"], serde_json::json!([]));
+        // The new folder awaits its first scan; the one that kept its place keeps its state.
+        assert_eq!(edited["include"][1]["scanPending"], true);
+        assert_eq!(
+            edited["include"][1]["lastScanCompletedNs"],
+            serde_json::Value::Null
+        );
+
+        // Repeating an edit changes nothing.
+        let (status, repeated) = send_value(&router, Method::PUT, &uri, edit).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(repeated["id"], edited["id"]);
+        assert_eq!(repeated["ocr"], edited["ocr"]);
+        assert_eq!(repeated["include"][1]["path"], edited["include"][1]["path"]);
+
+        let (status, _) = send(&router, Method::DELETE, &uri).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        for method in [Method::GET, Method::DELETE] {
+            let (status, missing) = send(&router, method, &uri).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert_eq!(missing["error"]["code"], "library_not_found");
+        }
+    }
+
+    #[tokio::test]
+    async fn library_definitions_are_validated_before_anything_is_written() {
+        let temp = TempDir::new().unwrap();
+        let router = test_router(&temp);
+        let photos = library_dir(&temp, "photos");
+        let elsewhere = library_dir(&temp, "elsewhere");
+        let missing = temp.path().join("missing").to_str().unwrap().to_owned();
+
+        for (body, code) in [
+            (serde_json::json!({ "include": [] }), "invalid_request"),
+            (
+                serde_json::json!({ "include": ["relative"] }),
+                "invalid_root",
+            ),
+            (serde_json::json!({ "include": [missing] }), "invalid_root"),
+            (
+                serde_json::json!({ "include": [photos], "exclude": [elsewhere] }),
+                "invalid_request",
+            ),
+        ] {
+            let (status, error) = post_json(&router, "/v1/libraries", body.clone()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(error["error"]["code"], code, "{body}: {error}");
+        }
+        let (_, listed) = send(&router, Method::GET, "/v1/libraries").await;
+        assert_eq!(
+            listed.as_array().unwrap().len(),
+            1,
+            "only the fixture library"
+        );
+    }
+
+    #[tokio::test]
+    async fn imports_are_idempotent_and_offline_folders_stay_editable() {
+        let temp = TempDir::new().unwrap();
+        let router = test_router(&temp);
+        let offline = temp.path().join("unplugged").to_str().unwrap().to_owned();
+        let import = serde_json::json!({ "include": [offline], "importKey": offline, "ocr": true });
+
+        // An import may name a folder whose drive is disconnected.
+        let (status, first) = post_json(&router, "/v1/libraries", import.clone()).await;
+        assert_eq!(status, StatusCode::CREATED, "{first}");
+        let (status, again) = post_json(&router, "/v1/libraries", import).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(again["id"], first["id"]);
+        assert_eq!(again["include"][0]["path"], first["include"][0]["path"]);
+        assert_eq!(again["ocr"], first["ocr"]);
+
+        // Folders the library already has are not stat'ed, so its options remain editable.
+        let uri = format!("/v1/libraries/{}", first["id"]);
+        let (status, edited) = send_value(
+            &router,
+            Method::PUT,
+            &uri,
+            serde_json::json!({ "include": [offline], "ocr": false, "image": true }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{edited}");
+        assert_eq!(edited["ocr"], false);
+    }
+
+    #[tokio::test]
+    async fn library_reads_cover_every_folder_minus_exclusions_even_offline() {
+        let temp = TempDir::new().unwrap();
+        let router = test_router(&temp);
+        let photos = library_dir(&temp, "photos");
+        let private = library_dir(&temp, "photos/private");
+        let phone = library_dir(&temp, "phone");
+        let other = library_dir(&temp, "other");
+        let databases_dir = PathBuf::try_from(temp.path().to_path_buf()).unwrap();
+        let catalog = AssetCatalog::new(&databases_dir.join("assets.db")).unwrap();
+        let mut ids = std::collections::HashMap::new();
+        for (name, folder) in [
+            ("a", &photos),
+            ("b", &private),
+            ("c", &phone),
+            ("d", &other),
+        ] {
+            let path = PathBuf::from(folder.as_str()).join(format!("{name}.png"));
+            std::fs::write(&path, b"not really a png").unwrap();
+            let asset = catalog
+                .upsert(&path, &std::fs::metadata(&path).unwrap())
+                .unwrap();
+            ids.insert(name, asset);
+        }
+        drop(catalog);
+        let mut ocr = DB::new(&databases_dir.join("ocr.db")).unwrap();
+        ocr.save_results(
+            ["b", "c", "d"]
+                .into_iter()
+                .map(|name| OcrResult {
+                    asset_id: ids[name].asset_id,
+                    path: ids[name].path.clone(),
+                    fingerprint: ids[name].fingerprint,
+                    exif_taken_ns: None,
+                    width: 1,
+                    height: 1,
+                    contents: "needle".to_owned(),
+                })
+                .collect(),
+        )
+        .unwrap();
+        drop(ocr);
+
+        let (status, library) = post_json(
+            &router,
+            "/v1/libraries",
+            serde_json::json!({ "include": [photos, phone], "exclude": [private] }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{library}");
+        let id = library["id"].as_i64().unwrap();
+        let listed_ids = |body: &serde_json::Value, field: &str| {
+            let mut listed = body
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| {
+                    row[field]
+                        .as_str()
+                        .map_or_else(|| row[field].to_string(), str::to_owned)
+                })
+                .collect::<Vec<_>>();
+            listed.sort();
+            listed
+        };
+        let expected = |names: &[&str]| {
+            let mut expected = names
+                .iter()
+                .map(|name| ids[name].asset_id.to_string())
+                .collect::<Vec<_>>();
+            expected.sort();
+            expected
+        };
+
+        let (status, gallery) =
+            send(&router, Method::GET, &format!("/v1/catalog?libraryId={id}")).await;
+        assert_eq!(status, StatusCode::OK, "{gallery}");
+        assert_eq!(listed_ids(&gallery, "id"), expected(&["a", "c"]));
+        let (_, count) = send(
+            &router,
+            Method::GET,
+            &format!("/v1/catalog/count?libraryId={id}"),
+        )
+        .await;
+        assert_eq!(count, 2);
+
+        // A disconnected folder is still searchable from its cached index.
+        std::fs::remove_dir_all(&phone).unwrap();
+        let (status, found) = send(
+            &router,
+            Method::GET,
+            &format!("/v1/search?q=needle&type=ocrSimple&libraryId={id}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{found}");
+        assert_eq!(found["total"], 1);
+        assert_eq!(found["results"][0]["assetId"], ids["c"].asset_id);
+        let uri = format!(
+            "/v1/search?q=needle&type=ocrSimple&libraryId={id}&folder={}",
+            urlencode(phone.as_str())
+        );
+        let (status, focused) = send(&router, Method::GET, &uri).await;
+        assert_eq!(status, StatusCode::OK, "{focused}");
+        assert_eq!(focused["total"], 1);
+        let uri = format!(
+            "/v1/search?q=needle&type=ocrSimple&libraryId={id}&folder={}",
+            urlencode(private.as_str())
+        );
+        let (status, excluded) = send(&router, Method::GET, &uri).await;
+        assert_eq!(status, StatusCode::OK, "{excluded}");
+        assert_eq!(excluded["total"], 0);
+
+        for uri in [
+            format!("/v1/catalog?libraryId={}", id + 1),
+            format!("/v1/search?q=needle&type=ocrSimple&libraryId={}", id + 1),
+        ] {
+            let (status, missing) = send(&router, Method::GET, &uri).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+            assert_eq!(missing["error"]["code"], "library_not_found");
+        }
+    }
+
+    async fn wait_for_job(router: &Router, job: &serde_json::Value) -> serde_json::Value {
+        let uri = format!("/v1/jobs/{}", job["jobId"].as_str().unwrap());
+        for _ in 0..600 {
+            let (status, body) = send(router, Method::GET, &uri).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            if ["completed", "failed", "cancelled"].contains(&body["status"].as_str().unwrap()) {
+                return body;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("job did not finish");
+    }
+
+    #[tokio::test]
+    async fn a_scan_respells_a_folder_imported_while_offline() {
+        let temp = TempDir::new().unwrap();
+        let router = test_router(&temp);
+        // A spelling canonicalization would change, for a folder that does not exist yet.
+        let spelled = format!("{}/./later/", temp.path().to_str().unwrap());
+        let (status, library) = post_json(
+            &router,
+            "/v1/libraries",
+            serde_json::json!({ "include": [spelled], "importKey": spelled, "image": false }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{library}");
+        let stored = library["include"][0]["path"].as_str().unwrap().to_owned();
+        assert!(!stored.ends_with(['/', '\\']), "{stored}");
+        if cfg!(windows) {
+            assert!(!stored.contains('/'), "{stored}");
+        }
+
+        // The drive comes back.
+        let later = library_dir(&temp, "later");
+        std::fs::write(PathBuf::from(later.as_str()).join("a.mp4"), b"video").unwrap();
+        let id = library["id"].as_i64().unwrap();
+        let (status, job) = post_json(
+            &router,
+            "/v1/jobs",
+            serde_json::json!({ "type": "libraryScan", "params": { "libraryId": id } }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{job}");
+        let job = wait_for_job(&router, &job).await;
+        assert_eq!(job["status"], "completed", "{job}");
+
+        let (_, library) = send(&router, Method::GET, &format!("/v1/libraries/{id}")).await;
+        assert_eq!(library["include"][0]["path"], later.as_str());
+        assert_eq!(library["include"][0]["scanPending"], false);
+        let (_, count) = send(
+            &router,
+            Method::GET,
+            &format!("/v1/catalog/count?libraryId={id}"),
+        )
+        .await;
+        assert_eq!(
+            count, 1,
+            "the library shows the files cataloged under the canonical path"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_library_scan_catalogs_every_folder_and_reports_each_one() {
+        let temp = TempDir::new().unwrap();
+        let router = test_router(&temp);
+        let photos = library_dir(&temp, "photos");
+        let private = library_dir(&temp, "photos/private");
+        let phone = library_dir(&temp, "phone");
+        let unplugged = library_dir(&temp, "unplugged");
+        for (folder, name) in [(&photos, "a.mp4"), (&private, "b.mp4"), (&phone, "c.mp4")] {
+            std::fs::write(
+                PathBuf::from(folder.as_str()).join(name),
+                b"not really a video",
+            )
+            .unwrap();
+        }
+        // OCR is on, but nothing here is an image, so no OCR model is needed or loaded.
+        let (status, library) = post_json(
+            &router,
+            "/v1/libraries",
+            serde_json::json!({
+                "include": [photos, phone, unplugged], "exclude": [private],
+                "ocr": true, "image": false
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{library}");
+        let id = library["id"].as_i64().unwrap();
+        std::fs::remove_dir(&unplugged).unwrap();
+
+        let (status, job) = post_json(
+            &router,
+            "/v1/jobs",
+            serde_json::json!({ "type": "libraryScan", "params": { "libraryId": id } }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{job}");
+        let job = wait_for_job(&router, &job).await;
+        assert_eq!(job["status"], "completed", "{job}");
+        assert_eq!(
+            job["indexStages"],
+            serde_json::json!({"ocr": true, "image": false, "text": true})
+        );
+        let folders = job["folders"].as_array().unwrap();
+        let states = folders
+            .iter()
+            .map(|folder| {
+                (
+                    folder["path"].as_str().unwrap(),
+                    folder["state"].as_str().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            states,
+            [
+                (photos.as_str(), "completed"),
+                (phone.as_str(), "completed"),
+                (unplugged.as_str(), "unavailable")
+            ]
+        );
+        assert_eq!(
+            folders[0]["discovered"], 1,
+            "the excluded folder is never walked"
+        );
+        assert_eq!(folders[0]["cataloged"], 1);
+        assert!(
+            folders[2]["error"]
+                .as_str()
+                .unwrap()
+                .contains("cannot read folder")
+        );
+        assert_eq!(job["progress"]["modelsLoaded"], 0);
+
+        let (_, gallery) = send(&router, Method::GET, &format!("/v1/catalog?libraryId={id}")).await;
+        let mut names = gallery
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["displayName"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(names, ["a.mp4", "c.mp4"]);
+
+        let (_, library) = send(&router, Method::GET, &format!("/v1/libraries/{id}")).await;
+        let include = library["include"].as_array().unwrap();
+        for folder in &include[..2] {
+            assert_eq!(folder["scanPending"], false, "{folder}");
+            assert_eq!(folder["scanOutcome"], serde_json::Value::Null);
+            assert_eq!(folder["scanError"], serde_json::Value::Null);
+            assert!(folder["lastScanCompletedNs"].is_string(), "{folder}");
+        }
+        assert_eq!(
+            include[2]["scanPending"], true,
+            "an offline folder stays pending"
+        );
+        assert_eq!(include[2]["scanOutcome"], "unavailable");
+        assert!(include[2]["scanError"].is_string());
+
+        // Only the offline folder is left for a pending-only scan.
+        let (_, job) = post_json(
+            &router,
+            "/v1/jobs",
+            serde_json::json!({ "type": "libraryScan", "params": { "libraryId": id, "pendingOnly": true } }),
+        )
+        .await;
+        let job = wait_for_job(&router, &job).await;
+        let paths = job["folders"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|folder| folder["path"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, [unplugged.as_str()]);
+
+        let (status, missing) = post_json(
+            &router,
+            "/v1/jobs",
+            serde_json::json!({ "type": "libraryScan", "params": { "libraryId": id + 1 } }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(missing["error"]["code"], "library_not_found");
+    }
+
+    #[tokio::test]
+    async fn automatic_scan_checks_nested_changes_without_advancing_the_full_scan_clock() {
+        let temp = TempDir::new().unwrap();
+        let router = test_router(&temp);
+        let root = library_dir(&temp, "automatic");
+        let nested = library_dir(&temp, "automatic/nested");
+        let sibling = library_dir(&temp, "automatic/sibling");
+        std::fs::write(PathBuf::from(nested.as_str()).join("old.mp4"), b"video").unwrap();
+        std::fs::write(PathBuf::from(sibling.as_str()).join("keep.mp4"), b"video").unwrap();
+        let (status, library) = post_json(
+            &router,
+            "/v1/libraries",
+            serde_json::json!({
+                "include": [root], "image": false
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{library}");
+        let id = library["id"].as_i64().unwrap();
+        let scan = |mode: &str| {
+            serde_json::json!({
+                "type": "libraryScan", "params": { "libraryId": id, "scanMode": mode }
+            })
+        };
+        let (_, first) = post_json(&router, "/v1/jobs", scan("full")).await;
+        assert_eq!(wait_for_job(&router, &first).await["status"], "completed");
+        let (_, before) = send(&router, Method::GET, &format!("/v1/libraries/{id}")).await;
+        let full_clock = before["include"][0]["lastScanCompletedNs"].clone();
+
+        let (_, unchanged) = post_json(&router, "/v1/jobs", scan("fast")).await;
+        let unchanged = wait_for_job(&router, &unchanged).await;
+        assert_eq!(unchanged["status"], "completed", "{unchanged}");
+        assert_eq!(unchanged["folders"][0]["scanMode"], "fast");
+        assert_eq!(unchanged["folders"][0]["cataloged"], 0);
+
+        std::fs::remove_file(PathBuf::from(nested.as_str()).join("old.mp4")).unwrap();
+        std::fs::write(PathBuf::from(nested.as_str()).join("new.mp4"), b"video").unwrap();
+        let (_, changed) = post_json(&router, "/v1/jobs", scan("fast")).await;
+        let changed = wait_for_job(&router, &changed).await;
+        assert_eq!(changed["status"], "completed", "{changed}");
+        assert_eq!(changed["folders"][0]["scanMode"], "fast");
+        let (_, gallery) = send(&router, Method::GET, &format!("/v1/catalog?libraryId={id}")).await;
+        let mut names = gallery
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|asset| asset["displayName"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(names, ["keep.mp4", "new.mp4"]);
+
+        let added = library_dir(&temp, "automatic/added");
+        std::fs::write(PathBuf::from(added.as_str()).join("added.mp4"), b"video").unwrap();
+        let (_, added_job) = post_json(&router, "/v1/jobs", scan("fast")).await;
+        let added_job = wait_for_job(&router, &added_job).await;
+        assert_eq!(added_job["status"], "completed", "{added_job}");
+        std::fs::remove_dir_all(&added).unwrap();
+        let (_, removed_job) = post_json(&router, "/v1/jobs", scan("fast")).await;
+        let removed_job = wait_for_job(&router, &removed_job).await;
+        assert_eq!(removed_job["status"], "completed", "{removed_job}");
+        let (_, gallery) = send(&router, Method::GET, &format!("/v1/catalog?libraryId={id}")).await;
+        let mut names = gallery
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|asset| asset["displayName"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(names, ["keep.mp4", "new.mp4"]);
+        let (_, after) = send(&router, Method::GET, &format!("/v1/libraries/{id}")).await;
+        assert_eq!(after["include"][0]["lastScanCompletedNs"], full_clock);
     }
 }

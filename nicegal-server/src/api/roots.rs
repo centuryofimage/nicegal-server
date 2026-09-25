@@ -1,4 +1,4 @@
-//! Validation for caller-supplied search, indexing, and pruning roots.
+//! Validation for caller-supplied indexing and pruning roots.
 
 use std::fs;
 

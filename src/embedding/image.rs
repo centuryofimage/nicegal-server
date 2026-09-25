@@ -450,12 +450,8 @@ impl ImageEmbedder {
                 .with_execution_providers(vec![configured.dispatch])
                 .with_intra_threads(configured.intra_threads.get());
             let backend = if deepghs {
-                ImageEmbedding::try_new_from_deepghs_path(
-                    &image,
-                    &preprocessor_config,
-                    init,
-                )
-                .context("loading DeepGHS image ONNX encoder")?
+                ImageEmbedding::try_new_from_deepghs_path(&image, &preprocessor_config, init)
+                    .context("loading DeepGHS image ONNX encoder")?
             } else {
                 ImageEmbedding::try_new_from_path(&image, &preprocessor_config, init)
                     .context("loading local image ONNX encoder")?

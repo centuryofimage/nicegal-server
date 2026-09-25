@@ -72,6 +72,17 @@ pub struct VideoSample {
 }
 
 pub fn probe(path: &Path) -> Result<VideoMetadata> {
+    probe_with_budget(path, crate::imaging::video::ProbeBudget::Full)
+}
+
+pub(crate) fn probe_catalog(path: &Path) -> Result<VideoMetadata> {
+    probe_with_budget(path, crate::imaging::video::ProbeBudget::Catalog)
+}
+
+fn probe_with_budget(
+    path: &Path,
+    probe_budget: crate::imaging::video::ProbeBudget,
+) -> Result<VideoMetadata> {
     let span = tracing::debug_span!("video_probe", path = %path);
     let _entered = span.enter();
     catch_unwind(AssertUnwindSafe(|| {
@@ -79,6 +90,7 @@ pub fn probe(path: &Path) -> Result<VideoMetadata> {
             path,
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
+            probe_budget,
         )?;
         Ok(reader.metadata().clone())
     }))
@@ -161,6 +173,7 @@ fn samples_with_options_cancelled(
             path,
             Arc::clone(&cancelled),
             Arc::clone(&aborted),
+            crate::imaging::video::ProbeBudget::Full,
         )?;
         reader.samples(&options)
     }))

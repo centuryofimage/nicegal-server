@@ -19,19 +19,6 @@ CREATE INDEX assets_modified_idx
     ON assets(source_modified_ns, asset_id);
 CREATE INDEX assets_taken_idx
     ON assets(COALESCE(exif_taken_ns, source_modified_ns), asset_id);
-CREATE VIRTUAL TABLE asset_path_fts USING fts5(path, tokenize='trigram', detail='none');
-CREATE TRIGGER asset_path_fts_insert AFTER INSERT ON assets BEGIN
-    INSERT INTO asset_path_fts(rowid, path)
-        VALUES (new.asset_id, replace(new.path, char(92), '/'));
-END;
-CREATE TRIGGER asset_path_fts_update AFTER UPDATE OF path ON assets BEGIN
-    DELETE FROM asset_path_fts WHERE rowid = old.asset_id;
-    INSERT INTO asset_path_fts(rowid, path)
-        VALUES (new.asset_id, replace(new.path, char(92), '/'));
-END;
-CREATE TRIGGER asset_path_fts_delete AFTER DELETE ON assets BEGIN
-    DELETE FROM asset_path_fts WHERE rowid = old.asset_id;
-END;
 CREATE TABLE decode_failure_state(
     asset_id INTEGER PRIMARY KEY,
     source_modified_ns INTEGER NOT NULL,
@@ -58,8 +45,7 @@ CREATE TABLE libraries(
 );
 -- Included and excluded folders, in display order. For included folders a scan is outstanding
 -- while scan_requested > scan_completed; a scan records the request number it started from, so a
--- request made during the scan is not lost when it finishes. scan_outcome is why the latest attempt
--- stopped short, a fixed value beside the scan_error text; both clear when a scan completes.
+-- request made during the scan is not lost when it finishes.
 CREATE TABLE library_folders(
     library_id INTEGER NOT NULL,
     path TEXT NOT NULL,
@@ -70,17 +56,7 @@ CREATE TABLE library_folders(
     scan_error TEXT,
     -- Unix nanoseconds when a scan of this folder last finished completely.
     last_scan_completed_ns INTEGER,
-    scan_outcome TEXT
-        CHECK(scan_outcome IN ('unavailable', 'incomplete', 'cancelled', 'failed')),
     PRIMARY KEY(library_id, path)
 ) WITHOUT ROWID;
-CREATE TABLE library_directory_snapshots(
-    library_id INTEGER NOT NULL,
-    folder_path TEXT NOT NULL,
-    path TEXT NOT NULL,
-    modified_ns INTEGER NOT NULL,
-    scope_key TEXT NOT NULL,
-    PRIMARY KEY(library_id, folder_path, path)
-) WITHOUT ROWID;
-PRAGMA user_version = 10;
+PRAGMA user_version = 7;
 COMMIT;

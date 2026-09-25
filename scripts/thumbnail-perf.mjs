@@ -1,4 +1,4 @@
-import { spawnServer, createAndWaitForJob, readReadyMessage, stopChild, withTimeout } from './server-harness.mjs'
+import { spawnServer, createAndWaitForJob, createLibrary, readReadyMessage, stopChild, withTimeout } from './server-harness.mjs'
 import { randomBytes } from 'node:crypto'
 import { mkdtemp, realpath, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -66,20 +66,22 @@ try {
     throw new Error(`unexpected server readiness response: ${JSON.stringify(ready)}`)
   }
 
+  // A library with no search indexes only catalogs.
+  const libraryId = await createLibrary(ready.endpoint, token, { include: [corpus], ocr: false, image: false })
   const catalog = await createAndWaitForJob(
     ready.endpoint,
     token,
-    'catalogSync',
-    { root: corpus },
+    'libraryScan',
+    { libraryId },
     () => stderrTail
   )
   if (catalog.status !== 'completed') {
-    throw new Error(`catalogSync ended as ${catalog.status}: ${JSON.stringify(catalog)}`)
+    throw new Error(`libraryScan ended as ${catalog.status}: ${JSON.stringify(catalog)}`)
   }
 
   const assetIds = readImageAssetIds(assetDatabasePath)
   if (assetIds.length === 0) {
-    throw new Error(`catalogSync completed without image assets under ${corpus}`)
+    throw new Error(`libraryScan completed without image assets under ${corpus}`)
   }
 
   const effectiveBatchSize = Math.min(options.batchSize, assetIds.length)

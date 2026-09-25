@@ -5,15 +5,16 @@ use std::sync::Once;
 use anyhow::{Context, Result, bail};
 use camino::{Utf8Path as Path, Utf8PathBuf as PathBuf};
 use rusqlite::types::Value;
-use rusqlite::{Connection, OptionalExtension, ToSql, params_from_iter};
+use rusqlite::{Connection, OptionalExtension, params_from_iter};
 use sqlite_vec::sqlite3_vec_init;
 use tracing::{Span, field, info, instrument};
 
 use crate::assets::{SourceFingerprint, Timeline};
 use crate::schema::{check_schema_read_only, open_schema_with_migrations};
+use crate::scope::PathScope;
+pub(crate) use crate::storage::bind_named;
 use crate::storage::{
-    READ_ONLY_FLAGS, configure_reader, configure_writer, maintain, path_prefix_like,
-    validate_asset_ids,
+    READ_ONLY_FLAGS, configure_reader, configure_writer, maintain, validate_asset_ids,
 };
 
 const SCHEMA_VERSION: i32 = 10;
@@ -136,29 +137,29 @@ impl TimeRange {
 /// re-derived in each mode's SQL. [`SearchFilters::bind`] is what makes that safe: it emits the
 /// `WHERE` fragments and the parameters they reference *together*, so the two can never drift
 /// apart the way hand-numbered positional parameters do.
-#[derive(Debug, Clone, Copy)]
-pub struct SearchFilters<'a> {
-    /// Only assets underneath this directory.
-    pub root: &'a Path,
-    /// A directory to leave out, matched as `<glob>/**` against the stored path.
-    pub exclude_glob: Option<&'a str>,
+#[derive(Debug, Clone)]
+pub struct SearchFilters {
+    /// Only assets inside this scope.
+    pub scope: PathScope,
     /// Restrict to a span on one timeline. `None` searches every instant.
     pub time: Option<TimeRange>,
+    /// Case-insensitive substring of the indexed full path.
+    pub path_contains: Option<String>,
 }
 
-impl<'a> SearchFilters<'a> {
-    /// Filters with no bounds beyond the root, which is the whole indexed tree.
-    pub fn new(root: &'a Path) -> Self {
+impl SearchFilters {
+    /// Filters with no bounds beyond the scope.
+    pub fn new(scope: PathScope) -> Self {
         Self {
-            root,
-            exclude_glob: None,
+            scope,
             time: None,
+            path_contains: None,
         }
     }
 
-    pub fn with_exclude(mut self, exclude_glob: Option<&'a str>) -> Self {
-        self.exclude_glob = exclude_glob;
-        self
+    /// Everything underneath one directory.
+    pub fn under(root: &Path) -> Self {
+        Self::new(PathScope::root(root))
     }
 
     pub fn with_time(mut self, time: Option<TimeRange>) -> Self {
@@ -166,39 +167,51 @@ impl<'a> SearchFilters<'a> {
         self
     }
 
-    /// Render the filters as SQL fragments plus the named parameters they bind, against `scope`'s
-    /// rows. Which rows a search narrows is the only thing that differs between the OCR store and
-    /// the asset catalog; the fragments themselves are these and only these.
-    pub(crate) fn bind(&self, scope: FilterScope) -> Result<BoundFilters> {
-        let mut sql = String::new();
-        let mut params = Vec::new();
+    pub fn with_path_contains(mut self, path: Option<&str>) -> Self {
+        self.path_contains = path
+            .filter(|value| !value.is_empty())
+            .map(|value| value.replace('\\', "/").to_lowercase());
+        self
+    }
 
-        sql.push_str(&format!(
-            "\n               AND {} LIKE :root ESCAPE '#'",
-            scope.path_column
-        ));
-        params.push((":root", Value::Text(path_prefix_like(self.root))));
+    /// Render the filters as SQL fragments plus the named parameters they bind, against `rows`.
+    /// Which rows a search narrows is the only thing that differs between the OCR store and the
+    /// asset catalog; the fragments themselves are these and only these.
+    pub(crate) fn bind(&self, rows: FilterScope) -> Result<BoundFilters> {
+        let scope = self.scope.bind(rows.path_column);
+        let mut sql = format!(
+            "
+               AND {}",
+            scope.sql
+        );
+        let mut params = scope.params;
 
-        if let Some(exclude) = self.exclude_glob {
+        if let Some(needle) = &self.path_contains {
             sql.push_str(&format!(
-                "\n               AND NOT rust_glob(:exclude || '/**', {})",
-                scope.path_column
+                " AND nicegal_path_contains({}, :path_contains)",
+                rows.path_column
             ));
-            params.push((":exclude", Value::Text(exclude.to_owned())));
+            params.push((":path_contains".to_owned(), Value::Text(needle.clone())));
         }
 
         if let Some(time) = self.time {
             time.validate()?;
             // The expression matches an index created beside the scoped table, one per timeline,
             // so a bounded search is a range scan rather than a table scan.
-            let instant = time.timeline.expression(scope.table);
+            let instant = time.timeline.expression(rows.table);
             if let Some(after) = time.after_ns {
-                sql.push_str(&format!("\n               AND {instant} >= :after_ns"));
-                params.push((":after_ns", Value::Integer(after)));
+                sql.push_str(&format!(
+                    "
+               AND {instant} >= :after_ns"
+                ));
+                params.push((":after_ns".to_owned(), Value::Integer(after)));
             }
             if let Some(before) = time.before_ns {
-                sql.push_str(&format!("\n               AND {instant} < :before_ns"));
-                params.push((":before_ns", Value::Integer(before)));
+                sql.push_str(&format!(
+                    "
+               AND {instant} < :before_ns"
+                ));
+                params.push((":before_ns".to_owned(), Value::Integer(before)));
             }
         }
 
@@ -207,8 +220,8 @@ impl<'a> SearchFilters<'a> {
 }
 
 /// The rows a [`SearchFilters`] narrows: the table its time filters order, and the qualified path
-/// column its root and exclude filters match. Named once here so the same filter cannot render
-/// one way for the OCR store and another way for the asset catalog.
+/// column its scope matches. Named once here so the same filter cannot render one way for the OCR
+/// store and another way for the asset catalog.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FilterScope {
     /// The table, schema-qualified when it lives in an attached database.
@@ -238,34 +251,25 @@ impl FilterScope {
 pub(crate) struct BoundFilters {
     /// `AND`-joined fragments, ready to append to a `WHERE` clause that already has a term.
     pub(crate) sql: String,
-    pub(crate) params: Vec<(&'static str, Value)>,
+    pub(crate) params: Vec<(String, Value)>,
 }
 
 impl BoundFilters {
     /// The filter parameters plus a mode's own, in one list to bind.
-    fn extend<const N: usize>(
+    pub(crate) fn extend<const N: usize>(
         &self,
         extra: [(&'static str, Value); N],
-    ) -> Vec<(&'static str, Value)> {
+    ) -> Vec<(String, Value)> {
         extend_params(self.params.clone(), extra)
     }
 }
 
 fn extend_params<const N: usize>(
-    mut params: Vec<(&'static str, Value)>,
+    mut params: Vec<(String, Value)>,
     extra: [(&'static str, Value); N],
-) -> Vec<(&'static str, Value)> {
-    params.extend(extra);
+) -> Vec<(String, Value)> {
+    params.extend(extra.map(|(name, value)| (name.to_owned(), value)));
     params
-}
-
-/// rusqlite rejects a named parameter the statement does not mention, so the owned list is only
-/// borrowed as `ToSql` at the point of binding.
-pub(crate) fn bind_named<'a>(params: &'a [(&'static str, Value)]) -> Vec<(&'a str, &'a dyn ToSql)> {
-    params
-        .iter()
-        .map(|(name, value)| (*name, value as &dyn ToSql))
-        .collect()
 }
 
 /// Which coordinate system a vector belongs to.
@@ -334,14 +338,12 @@ impl DB {
         }
         register_vector_extension();
         let conn = Connection::open(path)?;
-        configure_writer(&conn)?;
-        configure_vector_reads(&conn)?;
+        configure_vector_writer(&conn)?;
         // `ocr_embedding_state` cascades from `ocr_results`, which SQLite only honours with
         // enforcement switched on. It is per-connection, so writers must set it every open.
         conn.pragma_update(None, "foreign_keys", true)?;
         #[cfg(feature = "regex")]
         register_regex(&conn)?;
-        register_glob(&conn)?;
         register_word_glob(&conn)?;
 
         open_schema_with_migrations(
@@ -362,7 +364,6 @@ impl DB {
         configure_vector_reads(&conn)?;
         #[cfg(feature = "regex")]
         register_regex(&conn)?;
-        register_glob(&conn)?;
         register_word_glob(&conn)?;
         check_schema_read_only(&conn, SCHEMA_LABEL, SCHEMA_VERSION)?;
         Ok(Self { conn })
@@ -585,9 +586,13 @@ impl DB {
             "UPDATE ocr_results SET mark_delete = FALSE WHERE mark_delete = TRUE",
             [],
         )?;
+        let scope = PathScope::root(path).bind("source_path");
         self.conn.execute(
-            "UPDATE ocr_results SET mark_delete = TRUE WHERE source_path LIKE ?1 ESCAPE '#'",
-            [path_prefix_like(path)],
+            &format!(
+                "UPDATE ocr_results SET mark_delete = TRUE WHERE {}",
+                scope.sql
+            ),
+            bind_named(&scope.params).as_slice(),
         )?;
         Ok(())
     }
@@ -678,7 +683,7 @@ impl DB {
     pub fn search(
         &mut self,
         queries: Vec<&str>,
-        filters: &SearchFilters<'_>,
+        filters: &SearchFilters,
         limit: usize,
         kind: SearchType,
     ) -> Result<Vec<SearchResult>> {
@@ -742,7 +747,7 @@ impl DB {
     pub fn search_count(
         &mut self,
         queries: Vec<&str>,
-        filters: &SearchFilters<'_>,
+        filters: &SearchFilters,
         kind: SearchType,
     ) -> Result<usize> {
         if kind == SearchType::Glob {
@@ -771,7 +776,7 @@ impl DB {
     fn search_glob(
         &mut self,
         queries: Vec<&str>,
-        filters: &SearchFilters<'_>,
+        filters: &SearchFilters,
         limit: usize,
     ) -> Result<Vec<SearchResult>> {
         let bound = filters.bind(FilterScope::OCR_ROWS)?;
@@ -832,11 +837,7 @@ impl DB {
         Ok(results)
     }
 
-    fn search_glob_count(
-        &mut self,
-        queries: Vec<&str>,
-        filters: &SearchFilters<'_>,
-    ) -> Result<usize> {
+    fn search_glob_count(&mut self, queries: Vec<&str>, filters: &SearchFilters) -> Result<usize> {
         let bound = filters.bind(FilterScope::OCR_ROWS)?;
         let mut statement = self.conn.prepare_cached(&format!(
             r#"
@@ -869,7 +870,7 @@ impl DB {
     pub fn search_with_count(
         &mut self,
         queries: Vec<&str>,
-        filters: &SearchFilters<'_>,
+        filters: &SearchFilters,
         limit: usize,
         kind: SearchType,
     ) -> Result<(usize, Vec<SearchResult>)> {
@@ -1128,7 +1129,7 @@ impl DB {
     pub fn text_embedding_coverage(
         &self,
         space: TextEmbeddingSpace,
-        filters: &SearchFilters<'_>,
+        filters: &SearchFilters,
     ) -> Result<TextEmbeddingCoverage> {
         let bound = filters.bind(FilterScope::OCR_ROWS)?;
         let mut statement = self.conn.prepare_cached(&format!(
@@ -1160,7 +1161,7 @@ impl DB {
     pub fn pending_text_embeddings(
         &self,
         space: TextEmbeddingSpace,
-        filters: &SearchFilters<'_>,
+        filters: &SearchFilters,
         limit: usize,
         max_content_bytes: usize,
     ) -> Result<Vec<PendingTextEmbedding>> {
@@ -1225,7 +1226,7 @@ impl DB {
         &mut self,
         vector: &[f32],
         space: TextEmbeddingSpace,
-        filters: &SearchFilters<'_>,
+        filters: &SearchFilters,
         limit: usize,
         options: TextVectorSearchOptions,
     ) -> Result<(usize, Vec<TextVectorSearchResult>)> {
@@ -1493,6 +1494,17 @@ pub(crate) fn configure_vector_reads(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Set the page size before a new vector store enters WAL mode. Existing databases keep their
+/// original page size; SQLite cannot change it while they are in WAL mode anyway.
+pub(crate) fn configure_vector_writer(conn: &Connection) -> Result<()> {
+    let pages: i64 = conn.pragma_query_value(None, "page_count", |row| row.get(0))?;
+    if pages == 0 {
+        conn.pragma_update(None, "page_size", 65_536)?;
+    }
+    configure_writer(conn)?;
+    configure_vector_reads(conn)
+}
+
 /// `sqlite-vec` ships as a statically linked SQLite extension. `sqlite3_auto_extension` installs
 /// it into every connection this process opens afterwards, so it has to run before the first open
 /// and exactly once.
@@ -1569,32 +1581,6 @@ fn register_regex(db: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Register the `rust_glob` scalar the exclude filter needs. The image index's read-only search
-/// connection registers the same function, since its filters run against an attached catalog
-/// rather than the OCR store.
-pub(crate) fn register_glob(db: &Connection) -> Result<()> {
-    use glob::Pattern;
-    use rusqlite::functions::FunctionFlags;
-    use std::sync::Arc;
-    db.create_scalar_function(
-        "rust_glob",
-        2,
-        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
-        move |ctx| {
-            assert_eq!(ctx.len(), 2, "called with unexpected number of arguments");
-            let pattern: Arc<Pattern> = ctx.get_or_create_aux(0, |value| -> Result<_> {
-                Ok(Pattern::new(value.as_str()?)?)
-            })?;
-            let text = ctx
-                .get_raw(1)
-                .as_str()
-                .map_err(|error| rusqlite::Error::UserFunctionError(error.into()))?;
-            Ok(pattern.matches(text))
-        },
-    )?;
-    Ok(())
-}
-
 fn register_word_glob(db: &Connection) -> Result<()> {
     use glob::Pattern;
     use rusqlite::functions::FunctionFlags;
@@ -1624,6 +1610,43 @@ fn register_word_glob(db: &Connection) -> Result<()> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn vector_page_size_applies_only_to_new_databases() -> Result<()> {
+        let temp = TempDir::new()?;
+        let fresh_path = temp.path().join("fresh.db");
+        let fresh = Connection::open(&fresh_path)?;
+        configure_vector_writer(&fresh)?;
+        fresh.execute_batch("CREATE TABLE marker(id INTEGER PRIMARY KEY)")?;
+        assert_eq!(
+            fresh.pragma_query_value(None, "page_size", |row| row.get::<_, i64>(0))?,
+            65_536
+        );
+        assert_eq!(
+            fresh.pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))?,
+            "wal"
+        );
+        drop(fresh);
+
+        let existing_path = temp.path().join("existing.db");
+        let existing = Connection::open(&existing_path)?;
+        existing.pragma_update(None, "page_size", 4_096)?;
+        existing.execute_batch("CREATE TABLE marker(id INTEGER PRIMARY KEY)")?;
+        assert_eq!(
+            existing.pragma_query_value(None, "page_size", |row| row.get::<_, i64>(0))?,
+            4_096
+        );
+        configure_vector_writer(&existing)?;
+        assert_eq!(
+            existing.pragma_query_value(None, "page_size", |row| row.get::<_, i64>(0))?,
+            4_096
+        );
+        assert_eq!(
+            existing.pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))?,
+            "wal"
+        );
+        Ok(())
+    }
 
     const SPACE: TextEmbeddingSpace = TextEmbeddingSpace::OcrText;
 
@@ -1775,7 +1798,7 @@ mod tests {
         ];
         for (kind, query, expected) in cases {
             let error = db
-                .search_with_count(vec![query], &SearchFilters::new(&root), 10, kind)
+                .search_with_count(vec![query], &SearchFilters::under(&root), 10, kind)
                 .expect_err(query);
             assert_eq!(query_syntax_message(&error), Some(expected), "{query}");
         }
@@ -1790,7 +1813,7 @@ mod tests {
         let error = db
             .search_with_count(
                 vec!["(unclosed"],
-                &SearchFilters::new(&root),
+                &SearchFilters::under(&root),
                 10,
                 SearchType::Regex,
             )
@@ -1807,7 +1830,7 @@ mod tests {
         let (mut db, root) = searchable_db(&temp)?;
         let (total, results) = db.search_with_count(
             vec!["hello"],
-            &SearchFilters::new(&root),
+            &SearchFilters::under(&root),
             10,
             SearchType::Simple,
         )?;
@@ -1833,7 +1856,7 @@ mod tests {
             result(&temp, 2, "Andrew only.")?,
             result(&temp, 3, "A CATalogue is on the shelf.")?,
         ])?;
-        let filters = SearchFilters::new(Path::from_path(temp.path()).unwrap());
+        let filters = SearchFilters::under(Path::from_path(temp.path()).unwrap());
 
         let mut found = |pattern: &str| -> Result<(usize, Vec<i64>)> {
             let (total, results) =
@@ -1862,7 +1885,7 @@ mod tests {
             result(&temp, 1, "receipt receipt receipt")?,
             result(&temp, 2, "receipt")?,
         ])?;
-        let filters = SearchFilters::new(Path::from_path(temp.path()).unwrap());
+        let filters = SearchFilters::under(Path::from_path(temp.path()).unwrap());
 
         // FTS5 bm25() is ascending (more negative is a better match), and `search` already orders
         // by it — the repeated term should score at least as well as the single occurrence.
@@ -2045,14 +2068,14 @@ mod tests {
             Some((true, false))
         );
         assert!(
-            db.pending_text_embeddings(SPACE, &SearchFilters::new(&root), 10, 4096)?
+            db.pending_text_embeddings(SPACE, &SearchFilters::under(&root), 10, 4096)?
                 .iter()
                 .any(|row| row.asset_id == 1)
         );
         let (_, hits) = db.search_text_vectors(
             &[1.0, 0.0, 0.0],
             SPACE,
-            &SearchFilters::new(&root),
+            &SearchFilters::under(&root),
             10,
             TextVectorSearchOptions::default(),
         )?;
@@ -2073,7 +2096,7 @@ mod tests {
         let (_, hits) = db.search_text_vectors(
             &[1.0, 0.0, 0.0],
             SPACE,
-            &SearchFilters::new(&root),
+            &SearchFilters::under(&root),
             10,
             TextVectorSearchOptions::default(),
         )?;
@@ -2087,7 +2110,7 @@ mod tests {
             Some((false, false))
         );
         assert!(
-            !db.pending_text_embeddings(SPACE, &SearchFilters::new(&root), 10, 4096)?
+            !db.pending_text_embeddings(SPACE, &SearchFilters::under(&root), 10, 4096)?
                 .iter()
                 .any(|row| row.asset_id == 4)
         );
@@ -2116,7 +2139,7 @@ mod tests {
         let (total, results) = db.search_text_vectors(
             &[1.0, 0.0, 0.0],
             SPACE,
-            &SearchFilters::new(&root),
+            &SearchFilters::under(&root),
             10,
             TextVectorSearchOptions::default(),
         )?;
@@ -2138,7 +2161,7 @@ mod tests {
         let (total, hits) = db.search_text_vectors(
             &[1.0, 0.0, 0.0],
             SPACE,
-            &SearchFilters::new(&root),
+            &SearchFilters::under(&root),
             0,
             TextVectorSearchOptions::default(),
         )?;
@@ -2147,7 +2170,7 @@ mod tests {
         let (total, hits) = db.search_text_vectors(
             &[0.0, 0.0, 1.0],
             SPACE,
-            &SearchFilters::new(&root),
+            &SearchFilters::under(&root),
             10,
             TextVectorSearchOptions {
                 max_distance: Some(0.0),
@@ -2170,7 +2193,7 @@ mod tests {
         let (total, results) = db.search_text_vectors(
             &[1.0, 0.0, 0.0],
             SPACE,
-            &SearchFilters::new(&root),
+            &SearchFilters::under(&root),
             10,
             options,
         )?;
@@ -2181,7 +2204,7 @@ mod tests {
         let (total, results) = db.search_text_vectors(
             &[1.0, 0.0, 0.0],
             SPACE,
-            &SearchFilters::new(&root),
+            &SearchFilters::under(&root),
             1,
             options,
         )?;
@@ -2210,7 +2233,7 @@ mod tests {
         let (total, results) = db.search_text_vectors(
             &[1.0, 0.0, 0.0],
             SPACE,
-            &SearchFilters::new(&root).with_exclude(Some(excluded.as_str())),
+            &SearchFilters::new(PathScope::root(&root).with_exclude([excluded.clone()])),
             10,
             TextVectorSearchOptions::default(),
         )?;
@@ -2222,7 +2245,7 @@ mod tests {
         let (total, results) = db.search_text_vectors(
             &[1.0, 0.0, 0.0],
             SPACE,
-            &SearchFilters::new(&elsewhere),
+            &SearchFilters::under(&elsewhere),
             10,
             TextVectorSearchOptions::default(),
         )?;
@@ -2239,7 +2262,7 @@ mod tests {
         let (total, results) = db.search_text_vectors(
             &[1.0, 0.0, 0.0],
             SPACE,
-            &SearchFilters::new(&root),
+            &SearchFilters::under(&root),
             10,
             TextVectorSearchOptions::default(),
         )?;
@@ -2256,7 +2279,7 @@ mod tests {
             .search_text_vectors(
                 &[1.0, 0.0],
                 SPACE,
-                &SearchFilters::new(&root),
+                &SearchFilters::under(&root),
                 10,
                 TextVectorSearchOptions::default(),
             )
@@ -2293,7 +2316,7 @@ mod tests {
         let temp = TempDir::new()?;
         let (mut db, root) = embedded_db(&temp)?;
         assert_eq!(
-            db.text_embedding_coverage(SPACE, &SearchFilters::new(&root))?,
+            db.text_embedding_coverage(SPACE, &SearchFilters::under(&root))?,
             TextEmbeddingCoverage {
                 indexed: 3,
                 embedded: 3,
@@ -2305,20 +2328,20 @@ mod tests {
         rescanned.fingerprint.modified_ns += 1;
         db.save_results(vec![rescanned])?;
 
-        let coverage = db.text_embedding_coverage(SPACE, &SearchFilters::new(&root))?;
+        let coverage = db.text_embedding_coverage(SPACE, &SearchFilters::under(&root))?;
         assert_eq!(coverage.embedded, 2);
         assert_eq!(coverage.pending(), 1);
         let (total, results) = db.search_text_vectors(
             &[1.0, 0.0, 0.0],
             SPACE,
-            &SearchFilters::new(&root),
+            &SearchFilters::under(&root),
             10,
             TextVectorSearchOptions::default(),
         )?;
         assert_eq!(total, 2, "the stale vector does not answer searches");
         assert_eq!(ids(&results), vec![2, 3]);
 
-        let pending = db.pending_text_embeddings(SPACE, &SearchFilters::new(&root), 10, 4096)?;
+        let pending = db.pending_text_embeddings(SPACE, &SearchFilters::under(&root), 10, 4096)?;
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].asset_id, 1);
         assert_eq!(pending[0].content, "due north, rescanned");
@@ -2332,12 +2355,12 @@ mod tests {
             }],
         )?;
         assert_eq!(
-            db.text_embedding_coverage(SPACE, &SearchFilters::new(&root))?
+            db.text_embedding_coverage(SPACE, &SearchFilters::under(&root))?
                 .pending(),
             0
         );
         assert!(
-            db.pending_text_embeddings(SPACE, &SearchFilters::new(&root), 10, 4096)?
+            db.pending_text_embeddings(SPACE, &SearchFilters::under(&root), 10, 4096)?
                 .is_empty()
         );
         Ok(())
@@ -2350,7 +2373,7 @@ mod tests {
 
         db.delete_asset(2)?;
         assert_eq!(
-            db.text_embedding_coverage(SPACE, &SearchFilters::new(&root))?
+            db.text_embedding_coverage(SPACE, &SearchFilters::under(&root))?
                 .embedded,
             2
         );
@@ -2362,7 +2385,7 @@ mod tests {
         let (total, results) = db.search_text_vectors(
             &[1.0, 0.0, 0.0],
             SPACE,
-            &SearchFilters::new(&root),
+            &SearchFilters::under(&root),
             10,
             TextVectorSearchOptions::default(),
         )?;
@@ -2383,7 +2406,7 @@ mod tests {
             .expect_err("silently discarding an embedded library is not acceptable");
         assert!(format!("{error}").contains("explicit reset"), "{error}");
         assert_eq!(
-            db.text_embedding_coverage(SPACE, &SearchFilters::new(&root))?
+            db.text_embedding_coverage(SPACE, &SearchFilters::under(&root))?
                 .embedded,
             3
         );
@@ -2397,12 +2420,12 @@ mod tests {
             })
         );
         assert_eq!(
-            db.text_embedding_coverage(SPACE, &SearchFilters::new(&root))?
+            db.text_embedding_coverage(SPACE, &SearchFilters::under(&root))?
                 .embedded,
             0
         );
         assert_eq!(
-            db.pending_text_embeddings(SPACE, &SearchFilters::new(&root), 10, 4096)?
+            db.pending_text_embeddings(SPACE, &SearchFilters::under(&root), 10, 4096)?
                 .len(),
             3
         );
@@ -2418,7 +2441,7 @@ mod tests {
         )?;
         db.set_text_embedding_model(SPACE, "other-model", 4, false)?;
         assert_eq!(
-            db.text_embedding_coverage(SPACE, &SearchFilters::new(&root))?
+            db.text_embedding_coverage(SPACE, &SearchFilters::under(&root))?
                 .embedded,
             1
         );
@@ -2435,7 +2458,7 @@ mod tests {
         let (total, results) = reader.search_text_vectors(
             &[0.0, 1.0, 0.0],
             SPACE,
-            &SearchFilters::new(&root),
+            &SearchFilters::under(&root),
             10,
             TextVectorSearchOptions::default(),
         )?;
@@ -2474,7 +2497,7 @@ mod tests {
         }
     }
 
-    fn found(db: &mut DB, filters: &SearchFilters<'_>) -> Result<Vec<i64>> {
+    fn found(db: &mut DB, filters: &SearchFilters) -> Result<Vec<i64>> {
         let results = db.search(vec!["needle"], filters, 40, SearchType::Simple)?;
         Ok(results.iter().map(|hit| hit.asset_id).collect())
     }
@@ -2483,25 +2506,35 @@ mod tests {
     fn a_time_range_is_half_open_on_the_modified_timeline() -> Result<()> {
         let temp = TempDir::new()?;
         let (mut db, root) = timed_db(&temp)?;
-        let base = SearchFilters::new(&root);
+        let base = SearchFilters::under(&root);
 
         // No range at all is every instant.
         assert_eq!(found(&mut db, &base)?, vec![3, 2, 1]);
 
         // `after` is inclusive and `before` is exclusive, so a bound landing exactly on a row
         // includes it at the bottom and excludes it at the top.
-        let range = base.with_time(Some(on(Timeline::Modified, Some(2 * HOUR), Some(3 * HOUR))));
+        let range =
+            base.clone()
+                .with_time(Some(on(Timeline::Modified, Some(2 * HOUR), Some(3 * HOUR))));
         assert_eq!(found(&mut db, &range)?, vec![2]);
 
-        let open_top = base.with_time(Some(on(Timeline::Modified, Some(2 * HOUR), None)));
+        let open_top = base
+            .clone()
+            .with_time(Some(on(Timeline::Modified, Some(2 * HOUR), None)));
         assert_eq!(found(&mut db, &open_top)?, vec![3, 2]);
 
-        let open_bottom = base.with_time(Some(on(Timeline::Modified, None, Some(2 * HOUR))));
+        let open_bottom =
+            base.clone()
+                .with_time(Some(on(Timeline::Modified, None, Some(2 * HOUR))));
         assert_eq!(found(&mut db, &open_bottom)?, vec![1]);
 
         // Adjacent half-open ranges tile without double-counting the boundary instant.
-        let lower = base.with_time(Some(on(Timeline::Modified, None, Some(2 * HOUR))));
-        let upper = base.with_time(Some(on(Timeline::Modified, Some(2 * HOUR), None)));
+        let lower = base
+            .clone()
+            .with_time(Some(on(Timeline::Modified, None, Some(2 * HOUR))));
+        let upper = base
+            .clone()
+            .with_time(Some(on(Timeline::Modified, Some(2 * HOUR), None)));
         let mut tiled = found(&mut db, &lower)?;
         tiled.extend(found(&mut db, &upper)?);
         tiled.sort_unstable();
@@ -2513,21 +2546,25 @@ mod tests {
     fn the_two_timelines_place_the_same_asset_differently() -> Result<()> {
         let temp = TempDir::new()?;
         let (mut db, root) = timed_db(&temp)?;
-        let base = SearchFilters::new(&root);
+        let base = SearchFilters::under(&root);
 
         // Asset 2 was modified inside the window but captured a year before it.
         let window = (Some(0), Some(4 * HOUR));
         assert_eq!(
             found(
                 &mut db,
-                &base.with_time(Some(on(Timeline::Modified, window.0, window.1)))
+                &base
+                    .clone()
+                    .with_time(Some(on(Timeline::Modified, window.0, window.1)))
             )?,
             vec![3, 2, 1]
         );
         assert_eq!(
             found(
                 &mut db,
-                &base.with_time(Some(on(Timeline::Capture, window.0, window.1)))
+                &base
+                    .clone()
+                    .with_time(Some(on(Timeline::Capture, window.0, window.1)))
             )?,
             vec![3, 1],
             "capture time puts asset 2 outside the window"
@@ -2538,7 +2575,9 @@ mod tests {
         assert_eq!(
             found(
                 &mut db,
-                &base.with_time(Some(on(Timeline::Capture, Some(-2 * YEAR), Some(0))))
+                &base
+                    .clone()
+                    .with_time(Some(on(Timeline::Capture, Some(-2 * YEAR), Some(0))))
             )?,
             vec![2]
         );
@@ -2561,7 +2600,7 @@ mod tests {
                 .collect(),
         )?;
 
-        let filters = SearchFilters::new(&root).with_time(Some(on(
+        let filters = SearchFilters::under(&root).with_time(Some(on(
             Timeline::Modified,
             Some(2 * HOUR),
             Some(3 * HOUR),
@@ -2604,7 +2643,7 @@ mod tests {
     fn a_reversed_range_is_rejected_rather_than_silently_empty() -> Result<()> {
         let temp = TempDir::new()?;
         let (mut db, root) = timed_db(&temp)?;
-        let filters = SearchFilters::new(&root).with_time(Some(on(
+        let filters = SearchFilters::under(&root).with_time(Some(on(
             Timeline::Modified,
             Some(3 * HOUR),
             Some(HOUR),
@@ -2626,8 +2665,7 @@ mod tests {
         moved.path = excluded.join("3.png");
         db.save_results(vec![moved])?;
 
-        let filters = SearchFilters::new(&root)
-            .with_exclude(Some(excluded.as_str()))
+        let filters = SearchFilters::new(PathScope::root(&root).with_exclude([excluded.clone()]))
             .with_time(Some(on(Timeline::Modified, Some(2 * HOUR), None)));
         assert_eq!(found(&mut db, &filters)?, vec![2]);
         Ok(())
@@ -2643,7 +2681,7 @@ mod tests {
             result(&temp, catalog_id, "haystack needle")?,
         ])?;
 
-        let root = SearchFilters::new(Path::from_path(temp.path()).unwrap());
+        let root = SearchFilters::under(Path::from_path(temp.path()).unwrap());
         let results = db.search(vec!["needle"], &root, 40, SearchType::Simple)?;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].asset_id, catalog_id);

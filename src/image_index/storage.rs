@@ -1,12 +1,10 @@
 use crate::assets::{Asset, MediaKind, SourceFingerprint};
 use crate::db::{
     FilterScope, SearchFilters, UNBOUNDED_DISTANCE, bind_named, configure_vector_reads,
-    register_glob, register_vector_extension, vector_to_blob,
+    configure_vector_writer, register_vector_extension, vector_to_blob,
 };
 use crate::schema::{check_schema_read_only, open_schema_with_migrations};
-use crate::storage::{
-    READ_ONLY_FLAGS, configure_reader, configure_writer, maintain, validate_asset_ids,
-};
+use crate::storage::{READ_ONLY_FLAGS, configure_reader, maintain, validate_asset_ids};
 use anyhow::{Context, Result, bail};
 use camino::{Utf8Path as Path, Utf8PathBuf as PathBuf};
 use rusqlite::types::Value;
@@ -100,8 +98,7 @@ impl ImageIndexDb {
         register_vector_extension();
         let conn = Connection::open(path)
             .with_context(|| format!("opening image embedding database: {path}"))?;
-        configure_writer(&conn)?;
-        configure_vector_reads(&conn)?;
+        configure_vector_writer(&conn)?;
         open_schema_with_migrations(
             &conn,
             SCHEMA_LABEL,
@@ -136,7 +133,6 @@ impl ImageIndexDb {
         db.conn
             .execute("ATTACH DATABASE ?1 AS catalog", [catalog.as_str()])
             .with_context(|| format!("attaching the asset catalog: {catalog}"))?;
-        register_glob(&db.conn)?;
         Ok(db)
     }
 
@@ -435,7 +431,7 @@ impl ImageIndexDb {
     pub fn search_vectors(
         &self,
         vector: &[f32],
-        filters: &SearchFilters<'_>,
+        filters: &SearchFilters,
         limit: usize,
         options: &ImageVectorSearchOptions,
     ) -> Result<(usize, Vec<ImageVectorHit>)> {
@@ -473,20 +469,19 @@ impl ImageIndexDb {
 
         // Materialize only IDs, distances and tie breakers: scalar reads from vec0 open a
         // vector blob per evaluation. Counting and sorting must reuse those scores.
-        let mut shared = bound.params;
-        shared.push((":query", Value::Blob(vector_to_blob(vector))));
-        shared.push((
-            ":max_distance",
-            Value::Real(options.max_distance.unwrap_or(UNBOUNDED_DISTANCE)),
-        ));
-
-        let mut params = shared;
-        params.push((
-            ":limit",
-            Value::Integer(
-                i64::try_from(limit).context("search limit exceeds SQLite's integer range")?,
+        let params = bound.extend([
+            (":query", Value::Blob(vector_to_blob(vector))),
+            (
+                ":max_distance",
+                Value::Real(options.max_distance.unwrap_or(UNBOUNDED_DISTANCE)),
             ),
-        ));
+            (
+                ":limit",
+                Value::Integer(
+                    i64::try_from(limit).context("search limit exceeds SQLite's integer range")?,
+                ),
+            ),
+        ]);
 
         let mut statement = self.conn.prepare_cached(&format!(
             r#"{scored}
@@ -534,7 +529,7 @@ impl ImageIndexDb {
     }
 
     /// Current image-search coverage, including videos, excluding stale vectors and other roots.
-    pub fn coverage(&self, filters: &SearchFilters<'_>) -> Result<(usize, usize)> {
+    pub fn coverage(&self, filters: &SearchFilters) -> Result<(usize, usize)> {
         let bound = filters.bind(FilterScope::CATALOG_ROWS)?;
         let sql = format!(
             "SELECT count(*), count(image_embedding_state.asset_id) \
@@ -885,7 +880,7 @@ mod sample_tests {
         db.save_video_embeddings(&video(2), vec![(400, vec![0.8, 0.6])])?;
         assert_eq!(db.vector_count()?, 4);
         let reader = ImageIndexDb::new_read_only(&index, 2, &catalog)?;
-        let filters = SearchFilters::new(Path::new("C:/gallery"));
+        let filters = SearchFilters::under(Path::new("C:/gallery"));
         let (total, hits) = reader.search_vectors(
             &[1.0, 0.0],
             &filters,
@@ -895,6 +890,15 @@ mod sample_tests {
         assert_eq!(total, 2);
         assert_eq!(hits.len(), 1);
         assert_eq!((hits[0].asset_id, hits[0].timestamp_ms), (1, Some(100)));
+        let filtered = filters.clone().with_path_contains(Some("VIDEO2.MP4"));
+        let (filtered_total, filtered_hits) = reader.search_vectors(
+            &[1.0, 0.0],
+            &filtered,
+            1,
+            &ImageVectorSearchOptions::default(),
+        )?;
+        assert_eq!(filtered_total, 1);
+        assert_eq!(filtered_hits[0].asset_id, 2);
         assert_eq!(reader.coverage(&filters)?, (2, 2));
         assert!(reader.is_asset_indexed(1)?);
         assert!(reader.current_vector(1)?.is_none());
@@ -946,7 +950,7 @@ mod sample_tests {
         assert!(reader.is_asset_indexed(1)?);
         let (total, hits) = reader.search_vectors(
             &[1.0, 0.0],
-            &SearchFilters::new(Path::new("C:/gallery")),
+            &SearchFilters::under(Path::new("C:/gallery")),
             10,
             &ImageVectorSearchOptions::default(),
         )?;
@@ -1047,7 +1051,7 @@ mod sample_tests {
         let reader = ImageIndexDb::new_read_only(&index_path, 2, &catalog_path)?;
         let (total, hits) = reader.search_vectors(
             &[1.0, 0.0],
-            &SearchFilters::new(&gallery),
+            &SearchFilters::under(&gallery),
             10,
             &ImageVectorSearchOptions::default(),
         )?;

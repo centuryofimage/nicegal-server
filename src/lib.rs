@@ -7,6 +7,7 @@ pub mod hub;
 pub mod image_index;
 pub mod imaging;
 pub mod index;
+pub mod libraries;
 #[cfg(feature = "logging")]
 pub mod logging;
 pub mod metadata;
@@ -14,6 +15,7 @@ pub mod ocr;
 pub mod poster;
 pub mod runtime;
 mod schema;
+pub mod scope;
 mod storage;
 pub mod thumbs;
 pub mod video;

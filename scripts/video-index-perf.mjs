@@ -4,7 +4,7 @@ import { randomBytes } from 'node:crypto'
 import { mkdir, mkdtemp, readFile, realpath, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { spawnServer, readReadyMessage, sseSnapshots, stopChild, withTimeout } from './server-harness.mjs'
+import { createLibrary, spawnServer, readReadyMessage, sseSnapshots, stopChild, withTimeout } from './server-harness.mjs'
 
 const repository = join(dirname(fileURLToPath(import.meta.url)), '..')
 const options = Object.fromEntries(process.argv.slice(2).map(argument => {
@@ -16,8 +16,6 @@ const corpus = await realpath(options.corpus ?? join(repository, '..', 'testdata
 const executable = await realpath(options.executable ?? join(repository, 'target', 'release', 'nicegal-server.exe'))
 const outputRoot = resolve(options.output ?? join(repository, 'target', 'video-index-perf'))
 const image = options.image !== 'false'
-const jobType = options.job ?? 'catalogSync'
-assert.ok(['catalogSync', 'libraryIndex'].includes(jobType), `unsupported job type: ${jobType}`)
 const rustLog = process.env.RUST_LOG ??
   'nicegal_core=trace,nicegal_server=trace,tower_http=info,hyper=warn,h2=warn,tower=warn,rustls=warn'
 await mkdir(outputRoot, { recursive: true })
@@ -35,11 +33,10 @@ try {
   const started = performance.now()
   const cpuBefore = cpuSeconds(child.pid)
   const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json' }
+  const libraryId = await createLibrary(endpoint, token, { include: [corpus], ocr: false, image })
   const created = await fetch(`${endpoint}/v1/jobs`, {
     method: 'POST', headers,
-    body: JSON.stringify({ type: jobType, params: {
-      root: corpus, image, ...(jobType === 'libraryIndex' ? { ocr: false } : {})
-    } })
+    body: JSON.stringify({ type: 'libraryScan', params: { libraryId } })
   })
   assert.equal(created.status, 202, await created.clone().text())
   let job = await created.json()
@@ -73,7 +70,7 @@ try {
   const phaseTraceMs = Object.fromEntries(['scan', 'catalog', 'image_index']
     .filter(name => spans[name])
     .map(name => [name, spans[name].totalMs]))
-  const report = { corpus, executable, image, jobType, rustLog, elapsedMs, cpuMs,
+  const report = { corpus, executable, image, rustLog, elapsedMs, cpuMs,
     averageCores: cpuMs / elapsedMs, phaseTraceMs, progress: job.progress, status: job.status,
     errors: job.errors, spans }
   await writeFile(join(stateDirectory, 'profile.json'), JSON.stringify(report, null, 2) + '\n')

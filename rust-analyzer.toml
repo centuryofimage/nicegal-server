@@ -1,0 +1,2 @@
+[cargo]
+extraEnv = { VCPKG_ROOT = "C:\\Users\\bepvt\\vcpkg", VCPKGRS_TRIPLET = "x64-win-llvm-static-md-release", LIBCLANG_PATH = "C:\\Program Files\\Microsoft Visual Studio\\18\\Community\\VC\\Tools\\Llvm\\x64\\bin", FFMPEG_DIR = "C:\\Users\\bepvt\\vcpkg\\packages\\ffmpeg_x64-win-llvm-static-md-release" }

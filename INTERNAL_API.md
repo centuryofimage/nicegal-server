@@ -11,8 +11,10 @@ Electron owns the configured database paths. Rust owns catalog and metadata poli
 
 | Frontend operation | Interface |
 | --- | --- |
-| Enumerate/sort the library | `GET /v1/catalog?root=...&timeline=modified\|capture` |
-| Count a library | `GET /v1/catalog/count?root=...` |
+| Define libraries and their folders; clients request scans | `/v1/libraries`, see [Libraries](#libraries) |
+| Enumerate/sort the library | `GET /v1/catalog?libraryId=...&timeline=modified\|capture` |
+| List indexed folders for the tree | `GET /v1/catalog/folders?libraryId=...` |
+| Count a library | `GET /v1/catalog/count?libraryId=...` |
 | Inspect a photo or video | `GET /v1/catalog/metadata?assetId=...` |
 | Poll for catalog changes | `GET /v1/catalog/revision` |
 | Load thumbnail blobs | Read-only SQLite on `thumbnails.db`, normally behind `thumb://` |
@@ -20,7 +22,7 @@ Electron owns the configured database paths. Rust owns catalog and metadata poli
 | Search several ways at once | `POST /v1/search` |
 | Underline what matched in an OCR result | `highlights`, see [Highlights](#highlights) |
 | Check vector-search coverage | `GET /v1/text-embeddings` |
-| Check visual-search coverage | `GET /v1/image-embeddings?root=...` — `{total,indexed}`; cataloged images and videos with current vectors for the active image model, excluding stale fingerprints |
+| Check visual-search coverage | `GET /v1/image-embeddings?libraryId=...` — `{total,indexed}`; cataloged images and videos with current vectors for the active image model, excluding stale fingerprints |
 | Start, monitor, and cancel work | `/v1/jobs` |
 | Backfill thumbnail variants | `POST /v1/thumbnails/generate`, then poll the returned job |
 | Explicitly backfill OCR text embeddings | `POST /v1/text-embeddings/generate`, then poll the returned job |
@@ -62,7 +64,7 @@ wait for download or compilation. OCR continues to use `GET /v1/ocr/models` and 
 `POST /v1/jobs` with `{"type":"modelPrepare","params":{}}` prepares the text, CLIP image,
 and paired CLIP text sessions without indexing a root. It is the Settings prepare/retry action.
 An `imageEmbed` job prepares the CLIP pair; `textEmbed` prepares the text session; an
-`libraryIndex` job with `embed:true` prepares all three. Already prepared sessions are reused.
+`libraryScan` prepares whichever of them its pending work needs. Already prepared sessions are reused.
 Failed jobs can be retried by starting the same request again. Preparation uses the usual
 single-active-job scheduling and reports failures through both the job error and model status.
 
@@ -110,10 +112,10 @@ are part of the desktop read contract. Any table or column shape change requires
 bump; readers should reject versions they do not support.
 
 Writable startup connections apply supported migrations in one transaction. Asset catalog
-versions 2–5 upgrade to 6; OCR version 8 upgrades to 9. Read-only connections require the
+versions 2–7 upgrade to 8; OCR version 8 upgrades to 9. Read-only connections require the
 current version and never migrate. Unsupported versions are rejected without changes.
 
-## Asset catalog schema (version 6)
+## Asset catalog schema (version 8)
 
 The asset catalog owns canonical identity. `asset_id` is stable across rescans and source changes
 because updates conflict on the unique absolute path without replacing the row.
@@ -181,6 +183,58 @@ SELECT asset_id, path, source_modified_ns, source_created_ns, exif_taken_ns, sou
 transaction as every changed catalog row and does not change for an unchanged fingerprint, so a
 `GET /v1/catalog/revision` can cheaply poll it before refreshing the listing.
 
+### Libraries
+
+Library definitions live in the catalog database (version 8). A library owns no assets: its scope
+is the union of its included folders minus its excluded folders, evaluated against `assets.path`
+on every read. Editing folders therefore writes only these rows; overlapping libraries share every
+cataloged file and its search data, and removing a folder or library never deletes indexed data.
+
+```sql
+CREATE TABLE libraries(
+    library_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scan_sequence INTEGER NOT NULL CHECK(scan_sequence >= 0),
+    index_ocr INTEGER NOT NULL CHECK(index_ocr IN (0, 1)),
+    index_image INTEGER NOT NULL CHECK(index_image IN (0, 1)),
+    import_key TEXT UNIQUE
+);
+CREATE TABLE library_folders(
+    library_id INTEGER NOT NULL,
+    path TEXT NOT NULL,
+    excluded INTEGER NOT NULL CHECK(excluded IN (0, 1)),
+    position INTEGER NOT NULL CHECK(position >= 0),
+    scan_requested INTEGER NOT NULL CHECK(scan_requested >= 0),
+    scan_completed INTEGER NOT NULL CHECK(scan_completed >= 0),
+    scan_error TEXT,
+    last_scan_completed_ns INTEGER,
+    scan_outcome TEXT
+        CHECK(scan_outcome IN ('unavailable', 'incomplete', 'cancelled', 'failed')),
+    PRIMARY KEY(library_id, path)
+) WITHOUT ROWID;
+```
+
+Path membership is one rule, `scope::PathScope`, shared by catalog listing, counts, search,
+coverage, reconciliation, and deletion: a literal, case-sensitive prefix ending at a path separator
+(`/` or `\` on Windows, `/` elsewhere). `D:\Photos` covers `D:\Photos\a.png` but not
+`D:\Photos-old\a.png` or `D:\Photos` itself, and SQL wildcard characters in folder names are
+literal. Stored paths are canonical, so callers pass canonical folders. Each folder renders as a
+byte range on the path column, which SQLite answers from the path index. An exclusion wins over
+every include.
+
+An included folder has an outstanding scan while `scan_requested > scan_completed`. Creating a
+library requests a scan of each folder. An edit requests scans only where visible files can grow:
+new includes, includes that contained a removed exclusion, and every include when OCR or image
+indexing is switched on. Hiding files (removing a folder, adding an exclusion, switching an index
+off) requests nothing. Each request takes the next `scan_sequence` number, and a scan completes
+only the request number it started from. Numbers are never reused, so neither a request made
+during a scan nor a folder removed and re-added during one is marked complete by it. These
+counters are internal; the API reports `scanPending`, `scanOutcome`, and `scanError`.
+`scan_outcome` is why the latest attempt stopped short, and `scan_error` its text; NULL means no
+failed attempt, and a complete scan clears both. Version 8 added `scan_outcome`; a version-7 folder
+with a `scan_error` migrates to `failed` and keeps its text. The backend never starts a
+scan on its own: a client decides when a library is brought up to date, normally with a
+`pendingOnly` scan when the user creates, edits, or opens it.
+
 ## OCR schema (version 9)
 
 OCR is a derived store for eligible images only. Videos are excluded even during force, rescan,
@@ -218,7 +272,7 @@ the two timeline expressions exactly, so a time-bounded search is a range scan.
 
 ### Search filters
 
-The root, the exclusion, and the time range are one value (`db::SearchFilters`) shared by every
+The path scope (see [Libraries](#libraries)) and the time range are one value (`db::SearchFilters`) shared by every
 search mode rather than re-derived per mode. It renders its `WHERE` fragments and the named
 parameters they bind *together*, so a filter cannot reach one mode's SQL without its parameter. Any
 new filter is added once there and every mode — FTS, glob, regex, OCR vectors, and image vectors —
@@ -404,6 +458,12 @@ successful backfill for that library explicitly requests `sweepStale`.
 
 ## Local HTTP API
 
+**Reads address a library.** `GET /v1/catalog`, `GET /v1/catalog/count`, both search forms,
+`GET /v1/text-embeddings`, and `GET /v1/image-embeddings` require `libraryId`; an unknown library
+is `404 library_not_found`. The read covers the library's stored scope, its included folders minus
+its exclusions (see [Libraries](#libraries)), and never touches the filesystem, so a library whose
+folders are offline still lists, counts, and searches its cached index.
+
 Version 1 routes:
 
 - `GET /v1/health`
@@ -416,6 +476,11 @@ Version 1 routes:
       "activeRuntimeDistribution": "directml",
       "onnxRuntimeBuildInfo": "ORT Build Info: ...",
       "configuredExecutionProvider": "openvino",
+      "indexVideos": true,
+      "ocrModels": {
+        "detection": { "modelId": "PaddlePaddle/PP-OCRv6_small_det_onnx", "revision": "main", "filename": "inference.onnx", "configFilename": "inference.yml" },
+        "recognition": { "modelId": "PaddlePaddle/PP-OCRv6_small_rec_onnx", "revision": "main", "filename": "inference.onnx", "configFilename": "inference.yml" }
+      },
       "restartRequired": true
     },
     "ocrModelsLoaded": false
@@ -425,11 +490,16 @@ Version 1 routes:
   `activeRuntimeDistribution` identifies the ONNX Runtime DLL set actually loaded for it;
   `onnxRuntimeBuildInfo` is ONNX Runtime's own release/commit/build-flags diagnostic string;
   `configuredExecutionProvider` is the persisted choice for the next launch. They differ after a
-  setting changes and while a command-line provider override is in effect. `ocrModelsLoaded`
+  setting changes and while a command-line provider override is in effect. `indexVideos` and
+  `ocrModels` are the saved defaults every scan uses unless its request supplies them. `ocrModelsLoaded`
   avoids a follow-up request when the client only needs to decide whether OCR indexing is available;
   use `GET /v1/ocr/models` for loaded model identities and their actual session provider.
-- `GET /v1/runtime` returns the `runtime` object shown above. `PUT /v1/runtime` accepts exactly
-  `{"executionProvider":"cpu"|"directml"|"openvino"|"webgpu"}` and persists that selection.
+- `GET /v1/runtime` returns the `runtime` object shown above. `PUT /v1/runtime` accepts
+  `executionProvider`, `imageModel`, `indexVideos`, and `ocrModels` (the pair shape shown under
+  Jobs). Scan options persist in `runtime.json`; explicit scans may also supply them and update
+  the saved choices. The built-in defaults are video indexing enabled and the PaddleOCR v6 small
+  detector/recognizer pair. The frontend can omit both options on ordinary scans.
+  The execution provider selection persists for the next launch.
   Saved selections absent from the current build migrate to its bundled default at startup;
   explicit unsupported selections are rejected. Retired CUDA/MIGraphX settings also migrate.
   The runtime's `availableExecutionProviders` lists choices supported by this platform and build;
@@ -437,18 +507,67 @@ Version 1 routes:
   same runtime object with `restartRequired: true` when a restart is needed. It never tries to
   unload or replace ONNX Runtime in the current process. The desktop applies both
   provider and model selections through its shared backend restart flow, leaving
-  the app open. Updates are rejected while a job is active.
-- `GET /v1/catalog?root=<absolute-root>&timeline=modified|capture` returns the desktop gallery
+  the app open. Provider and image-model updates are rejected while a job is active; scan-option
+  updates can be saved while work runs and apply to scans that start afterwards.
+- `GET /v1/catalog?libraryId=<id>&timeline=modified|capture` returns the desktop gallery
   array, including videos. `timeline` defaults to modified; capture falls back to modified when
   image EXIF or video container creation time is absent.
-  Both sorts descend with asset ID as the descending tie-breaker. Root matching uses literal path
-  boundaries (not SQL wildcards); trailing separators are accepted. Reads do not stat the root,
-  so offline libraries still show saved rows. Each row has `id`, `path`, `displayName`, `extension`,
+  Both sorts descend with asset ID as the descending tie-breaker. Each row has `id`, `path`, `displayName`, `extension`,
   `modifiedNs`, `createdNs`, `captureNs`, `sourceSize`, `mediaKind`, `mediaFormat`, `width`, `height`,
   `animated`, `frameCount`, `durationMs`. IDs, nanosecond timestamps and byte sizes are decimal
   strings; unavailable timestamps/dimensions/frame count/duration are null.
-- `GET /v1/catalog/count?root=<absolute-root>` returns a JSON integer without materializing rows.
+- `GET /v1/catalog/count?libraryId=<id>` returns a JSON integer without materializing rows.
   `GET /v1/catalog/revision` returns a decimal-string revision.
+- `GET /v1/catalog/folders?libraryId=<id>` returns a sorted JSON array of directory paths from
+  completed scan snapshots, plus configured included roots. It includes empty directories and
+  filters excluded paths. A newly added root appears immediately; its subfolders appear after its
+  first complete scan. No source directory is walked by this read.
+- `GET /v1/libraries` lists every library in creation order; `GET /v1/libraries/<id>` returns one.
+  A library is
+  ```json
+  {
+    "id": 3,
+    "include": [{
+      "path": "D:\\Photos",
+      "scanPending": false,
+      "scanOutcome": null,
+      "scanError": null,
+      "lastScanCompletedNs": "1790000000000000000"
+    }],
+    "exclude": ["D:\\Photos\\Private"],
+    "ocr": false,
+    "image": true
+  }
+  ```
+  Libraries have no stored name; clients derive a label from the folders. `scanPending` means the folder was added or an edit revealed more
+  of it (a removed exclusion, or OCR or image indexing switched on) and no complete `libraryScan`
+  of it has finished since. `scanOutcome` is why the latest scan of the folder stopped short:
+  `unavailable` (the folder is offline or unreadable), `incomplete` (unreadable entries, or the
+  walk reached its `debugLimit`), `cancelled`, or `failed` (cleanup or any other job failure); null
+  when no attempt failed. `scanError` is human-readable detail for it, not meant to be parsed.
+  Both clear on the next complete scan, and a new scan request for the folder clears them too.
+  `lastScanCompletedNs` is when a complete full scan last finished, as decimal Unix nanoseconds.
+  `ocr` and `image` choose which search indexes `libraryScan` maintains for the library, so a
+  client saves a changed choice here before starting a scan; the scan request has no such
+  options.
+  `POST /v1/libraries` accepts `{include, exclude?, ocr?, image?, importKey?}` and returns `201`
+  with the new library. `ocr` defaults to false and `image` to true. Folders are canonicalized and
+  must exist, except in a request with `importKey`, which keeps a missing folder so an import can
+  preserve a library on a disconnected drive. A missing folder is stored with the platform's
+  separators and no trailing separator; its case and links cannot be resolved offline, so the first
+  `libraryScan` that finds the folder reachable replaces it (and its exclusions) with the canonical
+  spelling, keeping its scan state. Repeating a request with the same `importKey` returns the
+  existing library with `200` and changes nothing. Creating a library starts no scan; its folders
+  are `scanPending` until a client requests one.
+  `PUT /v1/libraries/<id>` accepts `{include, exclude?, ocr, image}`, replaces the definition, and
+  returns the updated library. Folders the library already has are not re-read, so an offline
+  folder stays editable. There is no edit conflict check: the server serves one client, so the
+  last write wins. An edit starts no scan; folders it revealed are `scanPending` until a client
+  requests one.
+  `DELETE /v1/libraries/<id>` returns `204` and keeps every cataloged file and its search data.
+  Definitions need at least one included folder, may not repeat a folder, and each exclusion must
+  be inside an included folder; an included folder inside an exclusion is rejected. These return
+  `400 invalid_request`; a relative, missing, or non-directory folder is `400 invalid_root`.
 - `GET /v1/catalog/metadata?assetId=<positive-id>` returns `{asset, file, ocrState, ocrText,
   textState, imageIndexed, decodeFailed}`. `asset` has the gallery shape above. `file` contains `sourceState`
   (`current`, `changed`, `missing`, `unavailable`), Windows `attributes`, selected image `exif`
@@ -476,11 +595,15 @@ Version 1 routes:
 - `POST /v1/assets` accepts `{"assetIds":[...]}` for up to 512 known catalog IDs and returns
   `{"assets":[...], "missingAssetIds":[...]}` in request order. It does not stat files or enumerate
   a root, so the renderer can resolve visible search/gallery rows in bounded batches.
-- `GET /v1/search?q=<query>&type=vector|image|simple|match|glob|regex&root=<absolute-path>&limit=<n>`
+- `GET /v1/search?q=<query>&type=vector|image|name|path|ocrSimple|ocrMatch|ocrGlob|regex&libraryId=<id>&limit=<n>`
   runs **one** mode and returns
   `{total, results: [{assetId, timestampMs?, snippet, rank, distance?, highlights?}]}`. `total`
   counts all matches before the requested result cap; the default cap is 100,000 and the maximum is
-  250,000. `rank` is the 1-based position in this mode's own ranking. `distance` is present only for
+  250,000. `rank` is the 1-based position in this mode's own ranking. An optional
+  `folder=<absolute-directory>` intersects every mode with a literal,
+  separator-delimited subtree inside the library. The same top-level `folder` field is available
+  in `POST /v1/search`; filtering happens before each mode's result limit. Exclusions still win,
+  and a folder outside the library returns zero results. `distance` is present only for
   `type=vector` and `type=image` and is a cosine distance (0 identical, 1 orthogonal, 2 opposite)
   in that mode's distinct vector space. `type=vector` searches OCR-text vectors; `type=image`
   embeds `q` with the active image model's paired CPU text encoder and searches that model's current
@@ -488,9 +611,8 @@ Version 1 routes:
   hits carry the best-matching sample's actual `timestampMs` (still-image hits omit it). There is
   one hit per asset, and `total` counts assets after choosing each video's best sample. Resolve
   metadata through `POST /v1/assets` and use the timestamp for an exact matched-frame thumbnail.
-  Simple and match text modes retain FTS
-  rank order; glob ranks assets by matching-token count, then recency. For
-  `type=glob`, `q` is matched case-insensitively against each complete OCR word token: `*` matches
+  `ocrSimple` and `ocrMatch` retain FTS rank order; `ocrGlob` ranks assets by matching-token
+  count, then recency. For `type=ocrGlob`, `q` is matched case-insensitively against each complete OCR word token: `*` matches
   any number of characters and `?` matches one. Thus `dre*` is a word-prefix search (it does not
   match `andrew`), while `*cat*` finds a word containing `cat`. The backend scans the FTS5 word
   vocabulary and follows matching term postings rather than scanning every OCR text blob; glob
@@ -498,49 +620,54 @@ Version 1 routes:
   all — see [Highlights](#highlights) for what is claimed about a snippet's contents and what is
   only estimated. `q` is capped at 4096 bytes. **`type` now defaults to `vector`**; the text
   modes and image mode are opt-in. `maxDistance=<0..2>` bounds either vector neighbourhood and is
-  rejected for the text modes. Image mode applies `root`, `exclude`, and time filters to the asset
+  rejected for the text modes. Image mode applies the library scope and time filters to the asset
   catalog and excludes an embedding as soon as its source fingerprint is stale. `before`, `after`,
   and `timeline` bound the search in time; see
   [Time filtering](#time-filtering). A query SQLite cannot parse is `400 query_syntax` carrying
-  SQLite's own message, and an unusable root is `400 invalid_root`; see [Errors](#errors).
+  SQLite's own message; see [Errors](#errors).
   OCR-mode `highlights` marks where in `snippet` this query matched; image hits omit it because
   they have no OCR snippet. See [Highlights](#highlights).
+  `type=name` searches the filename, and `type=path` searches the stored full media path, as
+  case-insensitive literal substrings inside the selected library. Both use the catalog's path
+  trigram index for suitable terms and a scoped scan for short or wildcard-character terms.
+  Path separators are normalized; the matched name or path is returned as the snippet.
+  Name hits use numeric, case-insensitive ordering for ASCII filenames with asset ID as a stable
+  tie-breaker. Non-ASCII names currently use lowercase lexical order, which can differ from the
+  renderer's former locale-aware sort.
+  Optional `pathContains=<text>` on GET, or top-level `pathContains` on POST, filters every mode
+  by a case-insensitive literal substring of the full indexed path. It normalizes path separators
+  and applies before each mode's result limit. It can be combined with `folder`, time bounds, and
+  any search type. The path text is capped at 4096 bytes.
 - `POST /v1/search` runs several modes and optionally fuses them. OCR modes share one OCR-store
   snapshot; `type=image` reads its independent CLIP index on a separate read-only connection. This
   is the route for a client that searches more than one way at once; see
   [Combined search](#combined-search)
-- `GET /v1/text-embeddings?root=<absolute-path>` reports what vector search can currently answer for:
+- `GET /v1/text-embeddings?libraryId=<id>` reports what vector search can currently answer for:
   `{embedder: {model, dimensions}, stored: {model, dimensions} | null, indexed, embedded, pending}`.
   `embedder` is what this build produces, `stored` is what the database holds (null before the first
   backfill), and a difference between them means the next text embed job discards and rebuilds. This is
   how the UI tells "nothing matched" apart from "nothing has been embedded"
 - `POST /v1/text-embeddings/generate` starts the text embedding backfill job. Its JSON body is
-  `{root, force:false, batchSize?}`. `force` re-embeds rows that already have a current vector;
+  `{libraryId, force:false, batchSize?}`. `force` re-embeds rows that already have a current vector;
   `batchSize` is 1 to 512 and is additionally clamped to what the backend accepts, so omitting it
   is normally right. The same job can be created through `POST /v1/jobs` with type `textEmbed`
 - `POST /v1/jobs` starts a typed background job and returns `202 Accepted`. Types are
-  `modelPrepare`, `ocrModelLoad`, `libraryIndex`, `catalogSync`, `thumbnailGenerate`, `textEmbed`, `imageEmbed`,
-  `pruneMissing`, and `libraryPurge`
-- `catalogSync` accepts `{root, image?:boolean, scan?:{recursive?,exclude?,debugLimit?}}`.
-  It walks the requested scope once, compares cataloged paths with filesystem metadata, and
-  catalogs only new or changed files. After a complete walk it verifies unseen catalog paths and
-  removes confirmed missing assets from the catalog and derived stores. An incomplete or limited
-  walk never deletes unseen assets. With `image:true`, new or changed images are passed to CLIP
-  in the same job without another directory scan; no OCR or text embedding runs.
-  For older installed frontends, `scan.newOnly` is accepted but ignored.
+  `modelPrepare`, `ocrModelLoad`, `libraryScan`, `thumbnailGenerate`, `textEmbed`, `imageEmbed`,
+  `pruneMissing`, and `libraryPurge`. Every type except `modelPrepare` and `ocrModelLoad` takes a
+  `libraryId`; an unknown library is `404 library_not_found` and no job is created. A job reads its
+  library's folders when it runs. `imageEmbed` accepts `{libraryId, force:false, debugLimit?}`
 - `GET /v1/jobs` lists the active and retained recent jobs
 - `GET /v1/jobs/<job-id>` returns one job's current state and progress
 - `GET /v1/jobs/<job-id>/events` streams `snapshot` server-sent events whenever job state changes
 - `DELETE /v1/jobs/<job-id>` requests cooperative cancellation
 - `POST /v1/thumbnails/generate` starts a thumbnail backfill job. Its JSON body is
-  `{root, buckets:[1024], force:false, sweepStale:false, timeline:"modified",
-  range:{fromNs,toNs}}`; `root` is required and must name an existing absolute directory.
-  It is canonicalized, then only catalog assets below that root are selected before applying
+  `{libraryId, buckets:[1024], force:false, sweepStale:false, timeline:"modified",
+  range:{fromNs,toNs}}`. Only catalog assets in the library's scope are selected before applying
   `timeline`, `range`, and `buckets`. `timeline` is `modified` or `capture`; capture uses
   `COALESCE(exif_taken_ns, source_modified_ns)`. Range bounds are optional decimal strings
   containing Unix nanoseconds, with an inclusive `fromNs` and exclusive `toNs`. `sweepStale`
   still requires an unbounded backfill of every bucket, and removes stale generators only for
-  the selected root's assets. The same job can be created through `POST /v1/jobs` with type
+  the library's assets. The same job can be created through `POST /v1/jobs` with type
   `thumbnailGenerate`
 - `POST /v1/thumbnails` synchronously ensures variants for a visible image set. Its body is
   `{assetIds:[...], requiredSize:<physical-pixels>}` with at most 512 IDs before deduplication.
@@ -605,8 +732,7 @@ per-mode weights do not belong in a query string.
 
 ```json
 {
-  "root": "C:/gallery",
-  "exclude": "C:/gallery/tmp",
+  "libraryId": 3,
   "limit": 100,
   "queries": [
     { "key": "semantic", "type": "vector", "q": "coffee receipt", "maxDistance": 1.2, "weight": 2 },
@@ -616,8 +742,8 @@ per-mode weights do not belong in a query string.
         { "assetId": 202, "weight": -1 },
         { "text": "a coffee on a marble table", "weight": 2 }
       ] } },
-    { "key": "literal",  "type": "simple", "q": "coffee" },
-    { "key": "files",    "type": "glob",   "q": "*invoice*", "limit": 50,
+    { "key": "literal",  "type": "ocrSimple", "q": "coffee" },
+    { "key": "files",    "type": "ocrGlob",   "q": "*invoice*", "limit": 50,
       "timeline": "modified", "after": "1717243200000000000" }
   ],
   "timeline": "capture",
@@ -641,7 +767,7 @@ one. `weight` must be positive and defaults to 1. Omitting `fuse` returns the pe
                     "highlights": [{ "start": 12, "end": 18, "kind": "exact" }] }] },
     { "key": "visual", "type": "image", "total": 24,
       "results": [{ "assetId": 52, "snippet": "", "rank": 1, "distance": 0.18 }] },
-    { "key": "literal", "type": "simple", "total": 12,
+    { "key": "literal", "type": "ocrSimple", "total": 12,
       "results": [{ "assetId": 41, "snippet": "coffee ...", "rank": 1,
                     "highlights": [{ "start": 0, "end": 6, "kind": "indexed" }] }] }
   ],
@@ -672,7 +798,7 @@ direction:
 
 ```json
 {
-  "root": "C:/gallery",
+  "libraryId": 3,
   "queries": [{
     "key": "visual",
     "type": "image",
@@ -693,8 +819,8 @@ Every component has exactly one source: a positive `assetId`, non-empty `text`, 
 nonzero `weight` whose magnitude is at most 100. At most 16 components may participate, including
 the legacy `q` text when present. Asset IDs are read from the active model's image index and must
 have a current catalog fingerprint; missing, stale, or not-yet-indexed assets reject the request
-rather than silently changing its meaning. Reference assets do **not** need to sit under `root`:
-`root`, `exclude`, and timeline filters constrain returned results, not the examples used to
+rather than silently changing its meaning. Reference assets do **not** need to be in the library:
+the library scope and timeline filters constrain returned results, not the examples used to
 compose the query. Component resolution and the image-index scan share one read transaction, so an
 asset cannot be accepted as current and then become stale halfway through that same request.
 
@@ -712,7 +838,7 @@ rejected.
 
 The existing `q` field remains a backward-compatible positive text component for `type=image`.
 It is optional only when `imageQuery.components` supplies at least one component. OCR `vector`,
-`simple`, `match`, `glob`, and `regex` still require `q` and reject `imageQuery`. `GET /v1/search`
+`ocrSimple`, `ocrMatch`, `ocrGlob`, `path`, and `regex` still require `q` and reject `imageQuery`. `GET /v1/search`
 does not accept components; use POST for structured composition.
 
 External images are native-picker snapshots sent as standard padded base64 (no data-URL prefix).
@@ -736,8 +862,8 @@ cosine distance are not on a common scale and cannot be made comparable by norma
 defaults to 60. `sources` names the modes that returned the asset, which is the signal the fused
 list exists to surface. Ties break on ascending `assetId`, so the order is deterministic.
 
-A root that has never been indexed, a mode with no matches, and a library with nothing embedded are
-all empty results rather than errors. A query SQLite cannot parse fails the whole request with
+A library that has never been indexed, a mode with no matches, and a library with nothing embedded
+are all empty results rather than errors. A query SQLite cannot parse fails the whole request with
 `400 query_syntax`, since a partial ranking would be misleading.
 
 ### Highlights
@@ -757,8 +883,8 @@ non-overlapping, in reading order. They are characters rather than UTF-8 bytes b
 slicing them is JavaScript, and OCR text carries accents and curly quotes. The field is omitted
 when there is nothing to highlight.
 
-The two routes to that field are not equally trustworthy, which is what `kind` is for. `simple` and
-`match` come from FTS5, which *knows* which terms it matched: it wraps them in delimiters, and the
+The two routes to that field are not equally trustworthy, which is what `kind` is for. `ocrSimple` and
+`ocrMatch` come from FTS5, which *knows* which terms it matched: it wraps them in delimiters, and the
 server converts those markers into spans and hands back the cleaned text. **Their snippets no longer
 contain `[` and `]`** — that markup became the spans. OCR `vector` has no such report — it returns
 a ranking and no reason for it — so its spans are estimated after retrieval by matching the query's
@@ -810,9 +936,9 @@ user-input problem is never reported as a `500`.
 | `asset_not_found` | 404 | The catalog has no matching path or ID, or the source file is gone |
 | `thumbnail_not_found` | 404 | No current variant exists for the asset |
 | `job_not_found` | 404 | The job never existed or is no longer retained |
+| `library_not_found` | 404 | No library has the requested ID |
 | `method_not_allowed` | 405 | The route exists but not for this method |
 | `job_busy` | 409 | Another resource-intensive job is already active |
-| `ocr_models_not_loaded` | 409 | `libraryIndex` was requested before a detector and recognizer were loaded |
 | `payload_too_large` | 413 | The body exceeded 48 MiB for search, or 8 MiB for other routes |
 | `unsupported_media_type` | 415 | A JSON route received a body that was not JSON |
 | `shutting_down` | 503 | The server is shutting down and will not start another job |
@@ -826,9 +952,9 @@ structural rather than a message match: the search statements are static, so a S
 raised while *executing* one is always attributable to the bound query, while a preparation-stage
 failure stays an `internal_error`.
 
-A search root that exists but has never been indexed is not an error. `{"total": 0, "results": []}`
-is the honest answer, and the gallery already knows from its own catalog whether that root has been
-scanned. The same holds for a root whose text has never been embedded; `GET /v1/text-embeddings` is how
+A library that has never been indexed is not an error. `{"total": 0, "results": []}` is the
+honest answer, and the gallery already knows from its own catalog whether its folders have been
+scanned. The same holds for a library whose text has never been embedded; `GET /v1/text-embeddings` is how
 the UI distinguishes that case from "nothing matched".
 
 Vector search has no notion of "no matches". It ranks every embedded row by distance and returns
@@ -838,14 +964,22 @@ text modes have no such parameter and reject it.
 
 ### Jobs
 
-The server currently runs one resource-intensive job at a time, including `catalogSync`. Starting
-another returns `409 Conflict` with the error code `job_busy`. Job state is held in memory for the
-server's lifetime, with at most 32 recent jobs retained. Electron should retain the returned
+The server runs one resource-intensive job at a time. Other job types return `409 Conflict` with
+`job_busy` while one runs. A `libraryScan` instead returns `202` with status `queued` if the worker
+is occupied, so a client can request a scan without first waiting for the slot. At most one scan
+waits, and the newest request wins: a request for the queued library returns the same job ID and
+merges into it (`scanMode: "full"` wins over `"fast"`; a request without `pendingOnly` wins over
+one with it; `force` and `retryFailed` stay enabled if
+either request enabled them), while a request for another library cancels the queued scan and
+takes its place. A queued scan lives only in server memory; the folders it would have scanned stay
+`scanPending` for the next request. Job state is held in memory for
+the server's lifetime, with at most 32 recent jobs retained. Electron should retain the returned
 `jobId`, or rediscover it with the collection GET, then poll the item GET while the status is
 nonterminal. For live UI counters, prefer the SSE item-events route: it sends the current snapshot
 immediately, coalesces updates for slow consumers so they receive the newest state, sends a
 keepalive every 15 seconds, and closes after delivering a terminal snapshot. The regular item GET
-is the reconnect and non-streaming fallback.
+is the reconnect and non-streaming fallback. Every library job snapshot, including entries from
+`GET /v1/jobs`, has `libraryId`; jobs not tied to a library omit it.
 
 Job creation uses a stable typed envelope so future OCR inference, CLIP, thumbnail, or maintenance
 jobs can share the lifecycle API. Download and compile a PaddleOCR detector and recognizer by
@@ -903,206 +1037,87 @@ optimization for the configured ONNX Runtime execution provider and kept in serv
 `executionProvider` is the provider the sessions were actually compiled for, not the one requested:
 a build that falls back reports `cpu`.
 
-To scan a library into the primary catalog for browsing before any OCR preparation, create this
-model-free job:
+### Library scans
+
+`libraryScan` brings one library up to date: it walks and catalogs the library's folders, removes
+confirmed-missing files, and then runs the search indexes the library has enabled.
 
 ```json
 {
-  "type": "catalogSync",
+  "type": "libraryScan",
   "params": {
-    "root": "C:/absolute/gallery",
-    "scan": {
-      "recursive": true,
-      "exclude": ["*/.cache", "*/.thumb*"]
-    }
+    "libraryId": 3,
+    "retryFailed": false
   }
 }
 ```
 
-`root` is required, must name an existing absolute directory, and is canonicalized before scanning.
-`scan` is optional; `recursive` defaults to true and `exclude` defaults to the two patterns shown.
-`debugLimit`, when supplied, must be a positive integer and caps the number of catalogable media
-discovered for a development run. Production callers omit it to scan the complete root. It walks
-the production scanner and then upserts catalogable media with the normal fingerprint and
-canonical-path rules. Each changed row and its catalog_meta.revision increment commit
-independently, so the existing direct SQLite readers can see a partial, internally consistent
-catalog while the job is still running. Existing paths retain
-their stable `assetId`; unchanged fingerprints are no-ops and do not advance the revision.
+Only `libraryId` is required. `scanMode` is `"full"` by default. `"fast"` runs a full scan for
+each included folder whose last full scan is at least 24 hours old, is pending, has a failed
+attempt, or lacks a valid directory snapshot. Other folders stat their known directories and
+enumerate only changed ones. A quick check does not advance `lastScanCompletedNs`. The client
+requests automatic scans at startup and when the rolling full-scan deadline passes; the server
+does not schedule them itself. The library's stored `ocr` and `image` options decide which indexes
+run (see the library endpoints), so save a changed choice with `PUT /v1/libraries/<id>` before
+scanning. OCR text always gets its text embeddings.
 
-`catalogSync` never loads OCR models or generates OCR text. With `image:true`, it embeds newly
-cataloged or changed visual assets; video embedding also writes their sampled thumbnails and
-gallery poster. Without `image:true`, it only catalogs and reconciles. A completed
-scan now automatically removes confirmed-deleted catalog entries and their OCR/text-vector,
-CLIP-vector, and thumbnail records. Unavailable roots, traversal errors,
-cancelled scans, and any `debugLimit` preserve existing entries. Recursive and exclusion scope also
-apply to reconciliation; an excluded folder's descendants are retained. Filesystem checks finish
-before deletion starts, with root and file availability checked again before each bounded batch.
-The delta walk tracks paths it visits and looks up only the paths left unseen for deletion checks.
-Full library indexing uses a connection-local temporary `WITHOUT ROWID` table of visited asset IDs
-to select unseen rows without rewriting persistent catalog rows.
-Derived stores are deleted first, so an interrupted cross-database deletion retains the catalog
-entry for the next update to finish. Its worker phase order is
-`scanning` → `cataloging` → optional `pruning` → `finished`; it shares ordinary cooperative cancellation and the single
-active-job slot with every other job. Cancellation leaves already committed catalog rows visible and
-stops before another scan entry or catalog upsert.
+**Folders.** An explicit scan walks every included folder once, recursively; a folder nested inside another
+included folder is covered by that walk. The library's excluded folders are skipped with their
+whole subtree, as are the default `*/.cache` and `*/.thumb*` folders; a directory link or junction
+that resolves into an excluded folder is skipped too. Before walking, a reachable folder stored
+with a non-canonical spelling (from an offline import) is respelled canonically. `pendingOnly: true`
+walks only folders with `scanPending` set, including ones whose last scan failed; it is what a
+client may request when a library is created or edited. It is independent of `scanMode`. A folder that is
+offline or unreadable is reported `unavailable` and skipped; the other folders still scan and its
+cached entries are never removed. After a complete walk of a folder, catalog entries inside it
+(and outside its exclusions) whose files are confirmed missing are removed with their OCR, vectors,
+and thumbnails; files are rechecked before each deletion batch. A walk with unreadable entries,
+one that reaches its `debugLimit`, or cancellation is incomplete and removes nothing.
 
-After the pair is loaded, scan and OCR a gallery root with:
+**Models load only for work that needs them.** Image vectors are prepared only when cataloged
+files lack current vectors, OCR runs only for images without current text, and text embeddings
+only for text without current vectors. The OCR pair is downloaded and loaded inside the job, and
+only when some image needs recognition and the loaded pair differs from `ocrModels` (the same shape
+as an `ocrModelLoad` request). When omitted, the saved pair is used, including after restart or
+provider fallback. A scan that finds nothing to do loads no
+model at all.
 
-```json
-{
-  "type": "libraryIndex",
-  "params": {
-    "root": "C:/absolute/gallery",
-    "embed": true,
-    "scan": {
-      "recursive": true,
-      "exclude": ["*/.cache", "*/.thumb*"],
-      "force": false,
-      "cleanup": false,
-      "maxDimensions": { "width": 12000, "height": 12000 }
-    }
-  }
-}
-```
+**Options.** `indexVideos` defaults to the saved runtime setting (initially true) and includes video frames in image indexing; videos are
+cataloged either way. `force` re-runs OCR for images that already have current text. `retryFailed`
+retries sources whose earlier decode failed. `maxDimensions` skips OCR for larger images without
+removing earlier text. `debugLimit` caps each folder's walk for development runs; a walk that reaches it with files
+left over is incomplete, and one that finishes under it counts as complete.
 
-`embed` is optional and defaults to `true`. After a successful, uncancelled OCR run (including its
-existing cleanup step and the same automatic missing-file reconciliation as `catalogSync`), the same
-job first incrementally embeds pending CLIP image vectors and then
-pending `ocrText` vectors under the root. Both use fingerprint-aware backlogs and do not
-force-rebuild current vectors. Set `"embed": false` to finish after OCR. Embedding item failures
-are retained in this job's `errors` and increase its `failed` counter; they remain pending for a
-later retry. Still-image thumbnails remain lazy; video embedding eagerly writes sampled
-thumbnails and the first-frame gallery poster.
-
-`scan` and all its fields are optional. `recursive` defaults to true and the two exclusions shown
-are the defaults. `force` defaults to false. When true, it re-runs OCR for every otherwise eligible
-image under the requested root, including unchanged OCR rows and unchanged source revisions whose
-image decode previously failed. It still honors `recursive`, `exclude`, and `maxDimensions`, and it
-does not force-rebuild current image or OCR-text vectors. A normal run already retries OCR inference
-failures, because they leave no OCR row; cached decode failures retry when their source fingerprint
-changes or when `force` is true. `cleanup` is the legacy OCR-only sweep and applies only to complete
-recursive scans with no exclusions; automatic confirmed-missing cleanup does not require this flag.
-Sources removed between discovery and OCR/CLIP decoding count as skipped rather than failed and do
-not acquire cached decode failures. Permission, malformed-media, and inference errors remain visible.
-`maxDimensions` is optional and skips larger images without removing an earlier good OCR
-result. A request made before model preparation returns `409 ocr_models_not_loaded`.
-
-Discovery and cataloging finish before OCR starts. Image decoding is reported as part of the OCR
-phase, decoder completion may differ from filesystem order, recognition is batched, and OCR rows
-are committed every 32 images. With the default `embed: true`, phase order is `scanning` →
-`cataloging` → `ocr` → `cleanup` → optional `pruning` → `imageEmbedding` → `textEmbedding` → `finished`; `cleanup` is
-retained in its existing place, before image and text embedding. With `embed: false`, it is `scanning` →
-`cataloging` → `ocr` → `cleanup` → optional `pruning` → `finished`. Thumbnail generation remains a separate job.
-
-Start or retry CLIP image ingestion without rerunning OCR through the generic job endpoint:
+**Progress.** Snapshots carry `indexStages: {ocr, image, text}` from the library and a `folders`
+list in walk order:
 
 ```json
-{
-  "type": "imageEmbed",
-  "params": {
-    "root": "C:/absolute/gallery",
-    "force": false
-  }
-}
+"folders": [
+  { "path": "D:\\Photos", "scanMode": "full", "state": "completed", "discovered": 812, "cataloged": 12, "failed": 0, "error": null },
+  { "path": "E:\\Phone", "state": "unavailable", "discovered": 0, "cataloged": 0, "failed": 0,
+    "error": "cannot read folder E:\\Phone: ..." }
+]
 ```
 
-`force` defaults to false and overwrites current vectors for assets under the requested root.
+A folder moves `queued` → `scanning` → `scanned` (walked, cataloged, and cleaned up) →
+`completed` (every enabled index has caught up). A walk that could not finish ends `incomplete`,
+an offline folder `unavailable`, a cleanup failure `failed`, and a cancelled walk `cancelled`; each
+of these carries `error`. `discovered`, `cataloged`, and `failed` count that folder's walk; `cataloged` includes files that
+were already current, as the job-wide counter does. The
+job-wide `phase` and `progress` describe the current step as for every job; the library-wide
+steps after the walks (image embedding, OCR, text embedding) are not attributed to one folder.
+Only `completed` folders clear `scanPending`; completed full scans record `lastScanCompletedNs`,
+while completed automatic directory checks leave it unchanged. Other outcomes record
+`scanOutcome` and `scanError` on the library and stay pending. A folder edit made while a scan runs stays pending
+after the scan finishes.
 
-Start an OCR-text embedding backfill through its feature endpoint:
+Phase order is, per folder, `scanning` → `cataloging` → optional `pruning`, then
+`imageEmbedding` (image libraries), optional `downloadingModels` → `loadingModels`, `ocr`, and
+`textEmbedding` (OCR libraries), then `finished`. Each model-preparation step appears only when
+that model is needed. Catalog rows commit in batches during `cataloging`, so the gallery can show
+new files while the scan continues; OCR rows commit every 32 images. Thumbnail generation remains a
+separate job.
 
-```http
-POST /v1/text-embeddings/generate
-Content-Type: application/json
-
-{
-  "root": "C:/absolute/gallery",
-  "force": false
-}
-```
-
-The response is `202 Accepted` with a regular job snapshot whose `type` is `textEmbed`. The equivalent
-generic job request is:
-
-```json
-{
-  "type": "textEmbed",
-  "params": {
-    "root": "C:/absolute/gallery",
-    "force": false,
-    "batchSize": 128
-  }
-}
-```
-
-`batchSize` is optional and normally should be omitted so the configured backend chooses its
-preferred maximum. If supplied, it must be between 1 and 512 and is clamped to the backend limit.
-`force` defaults to false; true discards current OCR-text vectors before rebuilding them. A model
-identifier or dimension change also replaces the stored embedding space automatically. Use
-`GET /v1/text-embeddings?root=<absolute-path>` before or after the job to inspect `indexed`, `embedded`,
-and `pending` coverage.
-
-The create and item endpoints return this shape:
-
-```json
-{
-  "jobId": "1",
-  "type": "ocrModelLoad",
-  "status": "running",
-  "phase": "downloadingModels",
-  "progress": {
-    "discovered": 0,
-    "total": null,
-    "phaseCompleted": 0,
-    "processed": 0,
-    "cataloged": 0,
-    "thumbnailsGenerated": 0,
-    "thumbnailFailures": 0,
-    "pruneCandidates": 0,
-    "embedded": 0,
-    "indexed": 0,
-    "skipped": 0,
-    "failed": 0,
-    "deleted": 0,
-    "downloadedBytes": 7340032,
-    "downloadTotalBytes": 9880512,
-    "modelsLoaded": 0
-  },
-  "errors": []
-}
-```
-
-Statuses are `queued`, `running`, `cancelling`, `cancelled`, `completed`, and `failed`. Terminal
-statuses are `cancelled`, `completed`, and `failed`. `total` is a `u64` and **phase-local**: it is
-reset to `null` whenever a worker phase changes, then becomes a known denominator only for phases
-that can count their work. `phaseCompleted`, a new `u64`, is also reset at every worker phase
-change and is the only generic numerator for `total`. The terminal `finished` snapshot retains its
-last worker-phase values. A UI must use `phaseCompleted / total` when the table says a denominator
-is known, rather than dividing lifetime counters such as `processed`, `indexed`, or `embedded` by
-it. Those lifetime counters never reset and remain useful for labels and final summaries.
-
-`discovered` is phase-local only while scanning: it is the count of catalogable media found so far.
-`processed`, `cataloged`, `thumbnailsGenerated`, `thumbnailFailures`, `pruneCandidates`, `embedded`,
-`indexed`, `skipped`, `failed`, and `deleted` are lifetime counters for the job. `errors` retains up
-to 100 item failures. A failed job also contains an `error` string.
-
-`itemsPerSecond` measures completed work per second since the current phase began and resets
-on phase changes. During OCR it excludes that phase's skipped assets, so a resumed job's
-previously indexed images advance progress without inflating OCR speed. It is `null` until
-non-skipped OCR work completes. The progress bar still includes skipped assets.
-
-During model downloads, `progress.download` optionally identifies the **current file**:
-`{modelId, filename, downloadedBytes, totalBytes}`. `totalBytes: 0` means the size is
-not known yet. Use this file's byte ratio in preference to the enclosing phase's
-item counts. This applies to PaddleOCR, BGE, and all image-search model families,
-including the Windows fallback transport. Cache hits do not emit download progress;
-the field disappears after the file resolves and while sessions load. Embedding jobs
-keep `loadingModels` and their model-step counters throughout, so file transfers do
-not reset the preparation count. Retries reset the current file's bytes; they do not
-double-count the legacy OCR transfer totals.
-
-Updates are throttled to about 100 ms, with initial and final reports. The user's
-2026-09-14 follow-up restored this time-based cadence, superseding the intervening
-request for one callback per MiB. Settings → Search and the top-bar job display both
 show these updates.
 
 | Job type | Phase | Fields that move in the phase | `total` in the phase | Honest within-phase UI |
@@ -1111,33 +1126,30 @@ show these updates.
 | `ocrModelLoad` | `downloadingModels` | `downloadedBytes`, `downloadTotalBytes`; `processed` advances after each ONNX inference file resolves; transfer totals accumulate only for network downloads | `null` | Use `downloadedBytes / downloadTotalBytes` only when `downloadTotalBytes > 0`; otherwise show indeterminate download/cache preparation. |
 | `ocrModelLoad` | `loadingModels` | `modelsLoaded`, `phaseCompleted` | `2` (detector and recognizer sessions) | `phaseCompleted / total` or “loading N of 2”. |
 | `ocrModelLoad` | `finished` | None | Last value is retained until the terminal snapshot | Terminal state, no progress bar. |
-| `catalogSync` | `scanning` | `discovered`; when walking ends, `total` and `phaseCompleted` become the final discovered count | `null` while walking; final count of catalogable media when discovery completes | Show “discovered N” while indeterminate; the final scan snapshot is complete. |
-| `catalogSync` | `cataloging` | `phaseCompleted`; `cataloged` for successful upserts and `failed` for failed metadata/upserts | Count of media discovered by scanning | `phaseCompleted / total`. |
-| `catalogSync` | `finished` | None | Last value is retained until the terminal snapshot | Terminal state, no progress bar. |
-| `libraryIndex` | `scanning` | `discovered`; when walking ends, `total` and `phaseCompleted` become the final discovered count | `null` while walking; final count of catalogable media when discovery completes | Show “discovered N” while indeterminate; the final scan snapshot is complete. |
-| `libraryIndex` | `cataloging` | `phaseCompleted`; `cataloged` for successful upserts and `failed` for failed metadata/upserts | Count of media discovered by scanning | `phaseCompleted / total`. |
-| `libraryIndex` | `ocr` | `phaseCompleted`, `processed`, `skipped`, `failed`; `indexed` advances when committed OCR chunks save | Count of successfully cataloged media, including non-OCR images that are skipped | `phaseCompleted / total`; display cumulative `indexed` separately if useful. |
-| `libraryIndex` | `cleanup` | `phaseCompleted`, `deleted` | `1` (the one cleanup sweep, even if cleanup was disabled and deletes zero rows) | A one-step completion indicator, or simply “finalizing”. |
-| `catalogSync` or `libraryIndex` | `pruning` | `phaseCompleted`, `pruneCandidates`, `deleted` | Confirmed-missing entries in the completed scan scope | `phaseCompleted / total`; `pruneCandidates` reports the confirmed count and `deleted` reports rows actually removed after the per-batch recheck. Phase is omitted when nothing is missing. |
-| `libraryIndex` with `embed: true` | `imageEmbedding` | `phaseCompleted`, `processed`, `embedded`, `failed` | Pending current CLIP image vectors under the root | `phaseCompleted / total`; `embedded` remains cumulative for the job. |
-| `libraryIndex` with `embed: true` | `textEmbedding` | `phaseCompleted`, `processed`, `embedded`, `skipped`, `failed` | Pending current `ocrText` vectors under the root | `phaseCompleted / total`; `embedded` remains cumulative for the job. |
-| `libraryIndex` | `finished` | None | Last value is retained until the terminal snapshot | Terminal state, no progress bar. |
-| `textEmbed` | `textEmbedding` | `phaseCompleted`, `processed`, `embedded`, `skipped`, `failed` | Pending current `ocrText` vectors under the requested root after an optional force clear | `phaseCompleted / total`; a zero backlog is immediately complete. |
+| `libraryScan` | `scanning` | `discovered` (also on the current folder); when a folder's walk ends, `total` and `phaseCompleted` become its discovered count | `null` while walking; the folder's final count when its walk ends | Show “discovered N” per folder while indeterminate. |
+| `libraryScan` | `cataloging` | `phaseCompleted`; `cataloged` and `failed` (also on the current folder) | Media discovered in the folder | `phaseCompleted / total`. |
+| `libraryScan` | `pruning` | `phaseCompleted`, `pruneCandidates`, `deleted` | Confirmed-missing entries in the folder | `phaseCompleted / total`. Omitted when nothing is missing. |
+| `libraryScan` | `imageEmbedding` | `phaseCompleted`, `processed`, `embedded`, `failed` | Pending current image vectors among the scanned files | `phaseCompleted / total`. |
+| `libraryScan` | `downloadingModels`, `loadingModels` | As for `ocrModelLoad` | As for `ocrModelLoad` | Shown only when the OCR pair must be loaded. |
+| `libraryScan` | `ocr` | `phaseCompleted`, `processed`, `skipped`, `failed`; `indexed` advances when committed OCR chunks save | Scanned files, including those skipped as current or not images | `phaseCompleted / total`. |
+| `libraryScan` | `textEmbedding` | `phaseCompleted`, `processed`, `embedded`, `skipped`, `failed` | Pending current `ocrText` vectors in the library | `phaseCompleted / total`. |
+| `libraryScan` | `finished` | None | Last value is retained until the terminal snapshot | Terminal state; `folders` holds each folder's outcome. |
+| `textEmbed` | `textEmbedding` | `phaseCompleted`, `processed`, `embedded`, `skipped`, `failed` | Pending current `ocrText` vectors in the library after an optional force clear | `phaseCompleted / total`; a zero backlog is immediately complete. |
 | `textEmbed` | `finished` | None | Last value is retained until the terminal snapshot | Terminal state, no progress bar. |
-| `imageEmbed` | `imageEmbedding` | `phaseCompleted`, `processed`, `embedded`, `failed` | Pending current CLIP image vectors under the requested root | `phaseCompleted / total`; a zero backlog is immediately complete. |
+| `imageEmbed` | `imageEmbedding` | `phaseCompleted`, `processed`, `embedded`, `failed` | Pending current CLIP image vectors in the library | `phaseCompleted / total`; a zero backlog is immediately complete. |
 | `imageEmbed` | `finished` | None | Last value is retained until the terminal snapshot | Terminal state, no progress bar. |
 | `thumbnailGenerate` | `thumbnails` | `phaseCompleted`, `processed`, `thumbnailsGenerated`, `thumbnailFailures` | Target assets selected by its request | `phaseCompleted / total`; `thumbnailsGenerated` may exceed the numerator because one asset can produce several buckets. |
 | `thumbnailGenerate` | `finished` | None | Last value is retained until the terminal snapshot | Terminal state, no progress bar. |
-| `pruneMissing` | `pruning` | `phaseCompleted`, `processed`, `pruneCandidates`, `deleted`, `skipped`, `failed` | Catalog candidates under the requested root | `phaseCompleted / total`; `pruneCandidates` is the subset found missing, not the numerator. |
+| `pruneMissing` | `pruning` | `phaseCompleted`, `processed`, `pruneCandidates`, `deleted`, `skipped`, `failed` | Catalog candidates in the library's available folders | `phaseCompleted / total`; `pruneCandidates` is the subset found missing, not the numerator. |
 | `pruneMissing` | `finished` | None | Last value is retained until the terminal snapshot | Terminal state, no progress bar. |
-| `libraryPurge` | `pruning` | `phaseCompleted`, `processed`, `deleted`, `failed` | Catalog assets under the requested root | `phaseCompleted / total`; `deleted` and `failed` are cumulative per-asset outcomes. |
+| `libraryPurge` | `pruning` | `phaseCompleted`, `processed`, `deleted`, `failed` | Library assets no other library covers | `phaseCompleted / total`; `deleted` and `failed` are cumulative per-asset outcomes. |
 | `libraryPurge` | `finished` | None | Last value is retained until the terminal snapshot | Terminal state, no progress bar. |
 
-A `libraryIndex` does not enter `textEmbedding` when `embed` is false, and cancellation after OCR but
-before or during text embedding leaves the job cancelled without starting more text embedding batches.
+Cancellation after OCR but before or during text embedding leaves a `libraryScan` cancelled without
+starting more text embedding batches, and its folders stay pending.
 
 Cancellation is cooperative between model files, scan entries, catalog entries, image decodes,
-inference calls, embedding batches, and library-purge assets. `catalogSync` checks it before the
+inference calls, embedding batches, and library-purge assets. `libraryScan` checks it before the
 next walk entry and catalog upsert, preserving every prior committed row without starting derived
 work. `libraryPurge` checks before beginning its next asset, so cancellation can leave a partial
 purge but never begins another asset after it is requested. `hf-hub` 0.4 has no cancellation token
@@ -1168,37 +1180,41 @@ offline storage. To inspect or delete them, create a typed job:
 {
   "type": "pruneMissing",
   "params": {
-    "root": "E:/Photos",
+    "libraryId": 3,
     "dryRun": true
   }
 }
 ```
 
-The root must be an absolute, currently existing directory, so an unplugged drive cannot be
-mistaken for an empty library. `dryRun` defaults to true. A dry run reports `pruneCandidates`
-without deleting; the caller must explicitly send `"dryRun": false` to remove rows. Deletion is
-scoped to catalog paths below the canonical root. OCR and thumbnail rows are removed before the
+Only the library's folders that are readable right now are checked; an offline folder is reported
+in `errors` and its entries are kept, so an unplugged drive cannot be mistaken for deleted files.
+Excluded folders are not checked. `dryRun` defaults to true. A dry run reports `pruneCandidates`
+without deleting; the caller must explicitly send `"dryRun": false` to remove rows. Deletion stops
+if a checked folder disappears during the job. OCR and thumbnail rows are removed before the
 catalog row, and each catalog deletion increments `catalog_meta.revision`.
 
-To destructively remove every cataloged asset for one library, create a `libraryPurge` job:
+To remove one library's indexed data, create a `libraryPurge` job:
 
 ```json
 {
   "type": "libraryPurge",
   "params": {
-    "root": "E:/Photos"
+    "libraryId": 3
   }
 }
 ```
 
-`root` is required, absolute, currently existing, and canonicalized before the assets are selected.
-Only catalog paths below that canonical directory are eligible; paths under same-prefix sibling
-directories are never selected. For each asset, OCR text/text vectors and CLIP image vectors are
+The purge selects the library's catalog assets (its folders minus its exclusions) and keeps every
+asset another library also covers, so shared files stay searchable there. Coverage is rechecked
+before each deletion batch, so a folder another library gains while the purge runs keeps its
+data. Original files are never
+touched, so the library's folders need not be available. The library definition itself is left in
+place; delete it with `DELETE /v1/libraries/<id>` afterwards. For each asset, OCR text/text vectors and CLIP image vectors are
 deleted first, then all thumbnails, and finally its catalog row. Each completed catalog deletion advances
 `catalog_meta.revision`. The work is not cross-database atomic: a deletion failure leaves the
 catalog row in place, and cancellation may leave already completed assets removed. Re-running the
-same root is safe and resumes from the rows that remain. Unregistering a library without deleting
-data is renderer-local and does not create a backend job.
+purge is safe and resumes from the rows that remain. Deleting a library without purging keeps all
+of its indexed data.
 
 After every resource-intensive job, the server removes derived rows whose catalog IDs no longer
 exist, runs bounded incremental vacuum and `PRAGMA optimize` on all four stores, and requests a
@@ -1214,14 +1230,14 @@ From the `nicegal-server` directory:
 dev.cmd test --locked --workspace
 dev.cmd build --locked -p nicegal-server
 node scripts/rpc-smoke.mjs
-node scripts/gallery-api-playground.mjs [TESTDATA_ROOT] [SERVER_EXE] [--keep]
+node scripts/gallery-api-playground.mjs [SERVER_EXE] --root=../testdata --exclude=video [--ocr] [--no-image] [--keep]
 ```
 
-The playground is a temporary manual validation tool rather than a framework integration test. It
-indexes `../testdata/pink` by default, consumes live job SSE, reads both catalog timeline orders
-through `node:sqlite`, runs modified/capture thumbnail ranges, exercises search and single-asset
-lookup, and summarizes thumbnail buckets. It never invokes pruning. `--keep` preserves its
-temporary databases for inspection.
+The playground is a manual walkthrough rather than a framework integration test. It creates a
+library over `--root` with the given exclusions, scans it (printing each folder's state and which
+models loaded), checks that no excluded file reached the catalog, runs an image search, rescans to
+show that nothing is reloaded or re-indexed, then removes the exclusions and runs a `pendingOnly`
+scan that picks up the revealed files. `--keep` preserves its temporary databases for inspection.
 
 The Windows build packages ONNX Runtime libraries; model weights are downloaded separately
 when a model preparation or indexing request requires them.
@@ -1234,9 +1250,9 @@ models}`. Top-level `restartRequired` covers both the provider and model. Each c
 placed under `NICEGAL_LOCAL_MODELS_DIR`.
 
 `PUT /v1/runtime` accepts `{"imageModel":"facebook/metaclip-2-worldwide-b32"}`
-and returns runtime status. `executionProvider` and `imageModel` are optional,
-but at least one must be supplied. Unknown or unavailable models are rejected, as are
-changes while an indexing job is active. The caller restarts the backend to
+and returns runtime status. `executionProvider`, `imageModel`, `indexVideos`, and `ocrModels`
+are optional, but at least one must be supplied. Unknown or unavailable image models are rejected,
+as are provider or image-model changes while an indexing job is active. The caller restarts the backend to
 activate the selection. Provider and image-model selections persist together in the runtime
 configuration, so a combined update either saves both selections or neither. Existing
 `image-model.json` files are read when the runtime record has no `imageModel`; the next
@@ -1252,14 +1268,11 @@ Existing vectors remain valid and are not automatically rebuilt.
 
 ### Selective indexing
 
-`libraryIndex.params` accepts `ocr` and `image` booleans, both enabled by default.
-`ocr:false,image:true` catalogs files and runs only image embeddings, without loading PaddleOCR
-or BGE. `ocr:true,image:false` runs OCR and its text embeddings, without loading the image model
-or its text tower. Both false is rejected. Selection survives desktop restart and provider fallback.
-The legacy `embed:false` still disables text embeddings and defaults image indexing to off;
-an explicit `image` overrides that legacy default. Existing indexed results are retained when
-a search type is unchecked; reconciliation still removes missing files after a complete scan.
-This supersedes the earlier always-all-models indexing description for selective requests.
+A library's `ocr` and `image` options select its indexes. `image` alone catalogs files and runs
+only image embeddings, without loading PaddleOCR or BGE. `ocr` alone runs OCR and its text
+embeddings, without loading the image model or its text tower. With both off, a scan only
+catalogs and cleans up. Existing indexed results are retained when an index is switched off;
+cleanup still removes missing files after a complete walk.
 
-Index job snapshots include `indexStages: {ocr, image, text}` so progress displays only stages
-that will run, including when a client attaches to an existing job.
+`libraryScan` snapshots include `indexStages: {ocr, image, text}` so progress displays only stages
+that can run, including when a client attaches to an existing job.

@@ -7,10 +7,13 @@ use camino::Utf8PathBuf as PathBuf;
 use nicegal_core::db::{DB, SearchFilters, TextEmbedding, TextEmbeddingSpace};
 use nicegal_core::embedding::TextEmbedder;
 use nicegal_core::index::{IndexEvent, IndexObserver, IndexPhase, IndexProgressDelta};
+use nicegal_core::scope::PathScope;
 use serde::Deserialize;
 
+use nicegal_core::assets::AssetCatalog;
+
 use super::super::error::ApiError;
-use super::super::roots;
+use super::super::{Databases, libraries};
 
 /// Request-level bound; the embedder's own batch limit may be smaller.
 const MAX_BATCH_SIZE: usize = 512;
@@ -23,7 +26,7 @@ const SPACE: TextEmbeddingSpace = TextEmbeddingSpace::OcrText;
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct Request {
-    root: PathBuf,
+    library_id: i64,
     /// Re-embed text that already has a current vector. Used after a model change that kept the
     /// same identifier, which the store cannot detect on its own.
     #[serde(default)]
@@ -34,22 +37,39 @@ pub(crate) struct Request {
 
 #[derive(Debug)]
 pub(crate) struct Spec {
-    root: PathBuf,
+    /// Set for a standalone job; its scope is read from the library when the job runs.
+    library_id: Option<i64>,
+    scope: PathScope,
     force: bool,
     batch_size: Option<usize>,
     debug_limit: Option<usize>,
 }
 
 impl Spec {
-    /// Build the incremental default used after a library index run. The root was already resolved
-    /// when its index-job request was accepted.
-    pub(crate) fn pending_for(root: PathBuf, debug_limit: Option<usize>) -> Self {
+    /// Build the incremental default used after a library scan.
+    pub(crate) fn pending_for(scope: PathScope, debug_limit: Option<usize>) -> Self {
         Self {
-            root,
+            library_id: None,
+            scope,
             force: false,
             batch_size: None,
             debug_limit,
         }
+    }
+}
+
+impl Spec {
+    pub(crate) fn library_id(&self) -> Option<i64> {
+        self.library_id
+    }
+
+    /// Read a standalone job's library scope.
+    pub(crate) fn resolve(mut self, databases: &Databases) -> anyhow::Result<Self> {
+        if let Some(library_id) = self.library_id {
+            let catalog = AssetCatalog::new_read_only(&databases.assets)?;
+            self.scope = libraries::stored(&catalog, library_id)?.scope();
+        }
+        Ok(self)
     }
 }
 
@@ -63,9 +83,9 @@ pub(crate) fn prepare(request: Request) -> Result<Spec, ApiError> {
             "text embedding batchSize must be between 1 and {MAX_BATCH_SIZE}"
         )));
     }
-    let root = roots::resolve_root("text embeddings", &request.root)?;
     Ok(Spec {
-        root,
+        library_id: Some(request.library_id),
+        scope: PathScope::default(),
         force: request.force,
         batch_size: request.batch_size,
         debug_limit: None,
@@ -97,7 +117,7 @@ pub(crate) fn run(
         .min(embedder.max_batch_size());
 
     observer.on_event(IndexEvent::PhaseChanged(IndexPhase::TextEmbedding));
-    let filters = SearchFilters::new(&spec.root);
+    let filters = SearchFilters::new(spec.scope.clone());
     let backlog = ocr.text_embedding_coverage(SPACE, &filters)?.pending();
     let backlog = spec.debug_limit.map_or(backlog, |limit| backlog.min(limit));
     observer.on_event(IndexEvent::Discovered { count: backlog });
@@ -174,7 +194,7 @@ pub(crate) fn has_pending(
     dimensions: usize,
 ) -> anyhow::Result<bool> {
     let ocr = DB::new(ocr_database)?;
-    let filters = SearchFilters::new(&spec.root);
+    let filters = SearchFilters::new(spec.scope.clone());
     let stored = ocr.text_embedding_model(SPACE)?;
     if stored
         .as_ref()
@@ -196,17 +216,16 @@ mod tests {
     }
 
     #[test]
-    fn the_root_is_required_and_unknown_fields_are_rejected() {
+    fn the_library_is_required_and_unknown_fields_are_rejected() {
         assert!(request(serde_json::json!({})).is_err());
-        assert!(request(serde_json::json!({"root": "C:/gallery", "nope": 1})).is_err());
-        assert!(request(serde_json::json!({"root": "C:/gallery"})).is_ok());
+        assert!(request(serde_json::json!({"libraryId": 1, "nope": 1})).is_err());
+        assert!(request(serde_json::json!({"libraryId": 1})).is_ok());
     }
 
     #[test]
     fn the_batch_size_is_bounded() {
         for size in [0, MAX_BATCH_SIZE + 1] {
-            let parsed =
-                request(serde_json::json!({"root": "C:/gallery", "batchSize": size})).unwrap();
+            let parsed = request(serde_json::json!({"libraryId": 1, "batchSize": size})).unwrap();
             let error = prepare(parsed).expect_err("an unbounded batch is rejected");
             assert!(error.message.contains("batchSize"), "{error:?}");
         }
