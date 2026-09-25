@@ -506,12 +506,8 @@ fn detection_input(
     }
     let resize_width = aligned_dimension(width, ratio);
     let resize_height = aligned_dimension(height, ratio);
-    let resized = crate::imaging::resize_rgb_bytes(
-        image,
-        resize_width,
-        resize_height,
-        OCR_RESIZE_ALGORITHM,
-    )?;
+    let resized =
+        crate::imaging::resize_rgb_bytes(image, resize_width, resize_height, OCR_RESIZE_ALGORITHM)?;
     let plane = usize::try_from(resize_width)? * usize::try_from(resize_height)?;
     input.resize(plane * 3, 0.0);
     // `(v / 255 - mean) / std` is two divisions per channel per pixel — over five million of them

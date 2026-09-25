@@ -290,17 +290,18 @@ fn default_config_filename() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nicegal_core::runtime::ExecutionProvider;
     use tempfile::TempDir;
 
     #[test]
     fn a_provider_that_worked_before_cannot_fall_back_after_restart() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let path = camino::Utf8PathBuf::try_from(temp.path().join("runtime.json"))?;
-        let store = ModelStore::new(ExecutionProvider::Directml);
         let runtime = RuntimeSettings::load(path.clone(), None)?;
+        // The platform's default provider: DirectML on Windows, WebGPU or OpenVINO on Linux.
+        let provider = runtime.active_execution_provider();
+        let store = ModelStore::new(provider);
         assert!(runtime_options(&store, &runtime).allow_cpu_fallback);
-        runtime.record_working_provider(ExecutionProvider::Directml)?;
+        runtime.record_working_provider(provider)?;
 
         let restarted = RuntimeSettings::load(path, None)?;
         assert!(!runtime_options(&store, &restarted).allow_cpu_fallback);

@@ -253,6 +253,11 @@ mod tests {
                 )
                 .expect("the bundled CPU runtime initializes");
             }
+            // Elsewhere the bundled loader leaves the environment alone; dev.sh copies the
+            // runtime next to test binaries in target/<profile>/deps.
+            #[cfg(not(windows))]
+            crate::runtime::initialize_bundled_runtime(crate::runtime::ExecutionProvider::Cpu)
+                .expect("the bundled CPU runtime initializes");
             TextEmbedder::load(&TextEmbedderOptions::default()).expect("the default embedder loads")
         });
         &EMBEDDER

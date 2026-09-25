@@ -38,7 +38,28 @@ pub struct ThumbnailDb {
 
 /// Encoded poster buckets are prepared off the SQLite writer thread.
 pub struct EncodedVideoSamples {
-    rows: Vec<(i64, Vec<poster::StaticPoster>)>,
+    rows: Vec<(i64, Vec<(u16, poster::StaticPoster)>)>,
+}
+
+impl EncodedVideoSamples {
+    /// Drop frames that indexing discarded. The first frame is the gallery poster and is
+    /// always kept.
+    pub fn retain_timestamps(&mut self, keep: &std::collections::HashSet<i64>) {
+        let mut index = 0;
+        self.rows.retain(|(timestamp_ms, _)| {
+            index += 1;
+            index == 1 || keep.contains(timestamp_ms)
+        });
+    }
+}
+
+/// Size buckets stored for the indexed frame at `index`; the first is the gallery poster.
+fn video_frame_buckets(index: usize) -> &'static [u16] {
+    if index == 0 {
+        &super::SIZE_BUCKETS
+    } else {
+        &super::VIDEO_FRAME_SIZE_BUCKETS
+    }
 }
 
 pub fn encode_video_samples(
@@ -73,13 +94,13 @@ pub fn encode_video_samples_with_output(
         if !seen_timestamps.insert(sample.timestamp_ms) {
             continue;
         }
-        let posters = poster::raster_buckets_with_output_at(
-            &asset.path,
-            &sample.raster,
-            &super::SIZE_BUCKETS,
-            output,
-        )?;
-        rows.push((sample.timestamp_ms, posters));
+        let buckets = video_frame_buckets(rows.len());
+        let posters =
+            poster::raster_buckets_with_output_at(&asset.path, &sample.raster, buckets, output)?;
+        rows.push((
+            sample.timestamp_ms,
+            buckets.iter().copied().zip(posters).collect(),
+        ));
     }
     Ok(EncodedVideoSamples { rows })
 }
@@ -186,7 +207,7 @@ impl ThumbnailDb {
     }
 
     /// Replace all indexed samples for this video and refresh its default gallery poster.
-    /// Each timestamp has every public size bucket, encoded from the decoded raster.
+    /// The first timestamp has every public size bucket; later ones omit the largest.
     pub fn store_video_samples(&self, asset: &Asset, samples: &[video::VideoSample]) -> Result<()> {
         self.store_video_samples_with_output(asset, samples, video::VideoOutputOptions::default())
     }
@@ -232,7 +253,7 @@ impl ThumbnailDb {
                 "INSERT INTO video_thumbnails (asset_id, timestamp_ms, size_bucket, sampling_version, source_modified_ns, source_size, width, height, encoding, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
             )?;
             for (timestamp_ms, posters) in &encoded.rows {
-                for (&bucket, poster) in super::SIZE_BUCKETS.iter().zip(posters) {
+                for (bucket, poster) in posters {
                     insert.execute((
                         asset.asset_id,
                         timestamp_ms,
@@ -250,7 +271,7 @@ impl ThumbnailDb {
         }
         // The first indexed frame is also the standard gallery poster, readable by the
         // unchanged desktop thumbnail reader.
-        for (&bucket, poster) in super::SIZE_BUCKETS.iter().zip(&encoded.rows[0].1) {
+        for (bucket, poster) in &encoded.rows[0].1 {
             tx.execute(
                 "INSERT INTO thumbnails (asset_id, size_bucket, generator_version, source_modified_ns, source_size, width, height, encoding, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(asset_id, size_bucket, generator_version) DO UPDATE SET source_modified_ns=excluded.source_modified_ns, source_size=excluded.source_size, width=excluded.width, height=excluded.height, encoding=excluded.encoding, data=excluded.data",
                 (asset.asset_id, bucket, super::GENERATOR_VERSION, asset.fingerprint.modified_ns,
@@ -292,7 +313,7 @@ impl ThumbnailDb {
         .transpose()
     }
 
-    /// Whether every indexed frame still has all persisted sizes and the gallery poster.
+    /// Whether every indexed frame still has its persisted sizes and the gallery poster.
     pub(crate) fn has_current_video_samples(
         &self,
         asset: &Asset,
@@ -317,8 +338,10 @@ impl ThumbnailDb {
                 |row| Ok((row.get::<_, i64>(0)?, row.get::<_, u16>(1)?)),
             )?
             .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?;
-        if !timestamps.iter().all(|timestamp| {
-            super::SIZE_BUCKETS
+        let mut ordered = timestamps.to_vec();
+        ordered.sort_unstable();
+        if !ordered.iter().enumerate().all(|(index, timestamp)| {
+            video_frame_buckets(index)
                 .iter()
                 .all(|bucket| variants.contains(&(*timestamp, *bucket)))
         }) {

@@ -298,6 +298,18 @@ mod tests {
                 .expect("the bundled CPU runtime initializes");
             });
         }
+        // Elsewhere the bundled loader leaves the environment alone; dev.sh copies the
+        // runtime next to test binaries in target/<profile>/deps.
+        #[cfg(not(windows))]
+        {
+            static RUNTIME: std::sync::Once = std::sync::Once::new();
+            RUNTIME.call_once(|| {
+                nicegal_core::runtime::initialize_bundled_runtime(
+                    nicegal_core::runtime::ExecutionProvider::Cpu,
+                )
+                .expect("the bundled CPU runtime initializes");
+            });
+        }
     }
 
     /// A router over real databases holding one indexed OCR row, so the search tests
@@ -602,13 +614,20 @@ mod tests {
     async fn runtime_status_reports_active_and_persisted_provider() {
         let temp = TempDir::new().unwrap();
         let router = test_router(&temp);
+        // The platform's default provider: DirectML on Windows, WebGPU or OpenVINO on Linux.
+        let default =
+            RuntimeSettings::load(temp.path().join("default.json").try_into().unwrap(), None)
+                .unwrap()
+                .active_execution_provider();
+        let (provider, distribution) =
+            (default.to_string(), runtime::runtime_distribution(default));
 
         let (status, body) = send(&router, Method::GET, "/v1/status").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["apiVersion"], API_VERSION);
-        assert_eq!(body["runtime"]["activeExecutionProvider"], "directml");
-        assert_eq!(body["runtime"]["activeRuntimeDistribution"], "directml");
-        assert_eq!(body["runtime"]["configuredExecutionProvider"], "directml");
+        assert_eq!(body["runtime"]["activeExecutionProvider"], provider);
+        assert_eq!(body["runtime"]["activeRuntimeDistribution"], distribution);
+        assert_eq!(body["runtime"]["configuredExecutionProvider"], provider);
         assert_eq!(body["runtime"]["restartRequired"], false);
         assert_eq!(body["runtime"]["onnxRuntimeBuildInfo"], "test build");
         assert_eq!(body["ocrModelsLoaded"], false);
@@ -617,18 +636,19 @@ mod tests {
             &router,
             Method::PUT,
             "/v1/runtime",
-            r#"{"executionProvider":"openvino"}"#,
+            // CPU is always compiled and never the default beside an accelerated provider.
+            r#"{"executionProvider":"cpu"}"#,
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["activeExecutionProvider"], "directml");
-        assert_eq!(body["activeRuntimeDistribution"], "directml");
-        assert_eq!(body["configuredExecutionProvider"], "openvino");
+        assert_eq!(body["activeExecutionProvider"], provider);
+        assert_eq!(body["activeRuntimeDistribution"], distribution);
+        assert_eq!(body["configuredExecutionProvider"], "cpu");
         assert_eq!(body["restartRequired"], true);
 
         let (status, body) = send(&router, Method::GET, "/v1/runtime").await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["configuredExecutionProvider"], "openvino");
+        assert_eq!(body["configuredExecutionProvider"], "cpu");
         assert_eq!(body["restartRequired"], true);
     }
 

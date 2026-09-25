@@ -360,8 +360,11 @@ impl AssetCatalog {
     /// time is its directory modification time from the latest completed scan, or `None` before
     /// one; nested included roots can snapshot the same directory, so the newest time wins.
     pub fn list_folders(&self, library_id: i64, scope: &PathScope) -> Result<Vec<FolderEntry>> {
-        let mut folders: BTreeMap<PathBuf, Option<i64>> =
-            scope.include().iter().map(|path| (path.clone(), None)).collect();
+        let mut folders: BTreeMap<PathBuf, Option<i64>> = scope
+            .include()
+            .iter()
+            .map(|path| (path.clone(), None))
+            .collect();
         let mut statement = self.conn.prepare(
             "SELECT path, modified_ns FROM library_directory_snapshots WHERE library_id = ?1",
         )?;
@@ -1713,21 +1716,28 @@ mod tests {
     #[test]
     fn a_version_six_catalog_migrates_to_the_fresh_schema_and_keeps_its_rows() -> Result<()> {
         let temp = TempDir::new()?;
+        // Library roots are validated as absolute on the host platform.
+        let root = if cfg!(windows) {
+            "C:/photos"
+        } else {
+            "/photos"
+        };
+        let (image, clip) = (format!("{root}/a.png"), format!("{root}/clip.mp4"));
         let old_path = PathBuf::try_from(temp.path().join("old.db"))?;
         let conn = Connection::open(&old_path)?;
         configure_writer(&conn)?;
         conn.execute_batch(include_str!("../tests/fixtures/schema/assets_v6.sql"))?;
-        conn.execute_batch(
+        conn.execute_batch(&format!(
             "INSERT INTO assets(asset_id, path, source_modified_ns, source_created_ns,
                  exif_taken_ns, source_size, media_kind, media_format, width, height,
                  is_animated, frame_count, duration_ms, metadata_version)
-             VALUES (7, 'C:/photos/a.png', 10, 11, 12, 13, 'image', 'png', 640, 480, 0,
+             VALUES (7, '{image}', 10, 11, 12, 13, 'image', 'png', 640, 480, 0,
                      NULL, NULL, 2),
-                    (9, 'C:/photos/clip.mp4', 20, NULL, NULL, 30, 'video', 'mp4', 1920,
+                    (9, '{clip}', 20, NULL, NULL, 30, 'video', 'mp4', 1920,
                      1080, 0, 300, 10000, 3);
              INSERT INTO decode_failure_state VALUES (7, 10, 13);
              UPDATE catalog_meta SET revision = 42;",
-        )?;
+        ))?;
         drop(conn);
         // Readers never migrate: they refuse the old version until a writer has upgraded it.
         assert!(AssetCatalog::new_read_only(&old_path).is_err());
@@ -1750,7 +1760,7 @@ mod tests {
                 .iter()
                 .map(|asset| (asset.asset_id, asset.path.as_str()))
                 .collect::<Vec<_>>(),
-            [(7, "C:/photos/a.png"), (9, "C:/photos/clip.mp4")]
+            [(7, image.as_str()), (9, clip.as_str())]
         );
         assert_eq!(assets[1].duration_ms, Some(10_000));
         assert_eq!(migrated.revision()?, 42);
@@ -1767,19 +1777,16 @@ mod tests {
 
         // The migrated catalog now serves readers and reopens as current, and its new tables work.
         let reader = AssetCatalog::new_read_only(&old_path)?;
-        assert_eq!(
-            reader.count_gallery(&PathScope::root(Path::new("C:/photos")))?,
-            2
-        );
+        assert_eq!(reader.count_gallery(&PathScope::root(Path::new(root)))?, 2);
         drop(reader);
         let mut reopened = AssetCatalog::new(&old_path)?;
         let library = reopened.create_library(
             &crate::libraries::LibraryDefinition {
-                include: vec![PathBuf::from("C:/photos")],
+                include: vec![PathBuf::from(root)],
                 exclude: Vec::new(),
                 options: Default::default(),
             },
-            Some("C:/photos"),
+            Some(root),
         )?;
         assert!(matches!(library, crate::libraries::Created::New(_)));
         assert_eq!(

@@ -270,7 +270,7 @@ pub(super) struct RuntimeStatusResponse {
 
 /// CPU models can execute against either accelerated distribution. The Windows server uses the
 /// DirectML distribution for CPU selection because it is the default general-purpose bundle.
-fn runtime_distribution(execution_provider: ExecutionProvider) -> &'static str {
+pub(super) fn runtime_distribution(execution_provider: ExecutionProvider) -> &'static str {
     match execution_provider {
         ExecutionProvider::OpenVino => "openvino",
         ExecutionProvider::Webgpu => "webgpu",

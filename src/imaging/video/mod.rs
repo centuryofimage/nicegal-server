@@ -180,9 +180,12 @@ impl VideoReader {
         &self.metadata
     }
 
-    #[tracing::instrument(level = "trace", skip_all, fields(path = %self.path, max_edge = options.max_edge, targets = options.seek_percentages.len()))]
+    #[tracing::instrument(level = "trace", skip_all, fields(path = %self.path, max_edge = options.max_edge, max_targets = ?options.max_targets))]
     pub(crate) fn samples(&mut self, options: &VideoSamplingOptions) -> Result<Vec<VideoSample>> {
-        let targets = sample_targets(self.metadata.duration_ms, &options.seek_percentages);
+        let mut targets = options.placement.targets(self.metadata.duration_ms);
+        if let Some(limit) = options.max_targets {
+            targets.truncate(limit);
+        }
         // Keep a usable fallback before seeking: a failed seek can leave a demuxer
         // at an unspecified position. Unknown-duration files need only this sample.
         let first = self.read_sample(options.max_edge, true)?;
@@ -235,6 +238,9 @@ impl VideoReader {
             }
         }
         ensure!(!samples.is_empty(), "no usable video samples");
+        // Keyframe snapping is monotonic in practice; sorting guarantees the earliest
+        // sample is first, which callers store as the gallery poster.
+        samples.sort_by_key(|sample| sample.timestamp_ms);
         Ok(samples)
     }
 
@@ -429,19 +435,6 @@ fn to_millis(value: i64, base: ffmpeg::Rational) -> i64 {
     to_micros(value, base) / 1000
 }
 
-fn sample_targets(duration: Option<u64>, percentages: &[u8]) -> Vec<i64> {
-    match duration.filter(|value| *value > 0) {
-        Some(duration) => percentages
-            .iter()
-            .map(|percent| {
-                (u128::from(duration) * u128::from(*percent) / 100).min(i64::MAX as u128 / 1000)
-                    as i64
-            })
-            .collect(),
-        None => Vec::new(),
-    }
-}
-
 fn display_dimensions(
     width: u32,
     height: u32,
@@ -582,11 +575,9 @@ mod tests {
 
     #[test]
     fn targets_and_display_geometry_are_bounded() {
-        assert_eq!(
-            sample_targets(Some(10000), &[10, 50, 90]),
-            vec![1000, 5000, 9000]
-        );
-        assert_eq!(sample_targets(None, &[10, 50, 90]), Vec::<i64>::new());
+        let percentages = crate::video::SamplePlacement::Percentages(vec![10, 50, 90]);
+        assert_eq!(percentages.targets(Some(10000)), vec![1000, 5000, 9000]);
+        assert_eq!(percentages.targets(None), Vec::<i64>::new());
         assert_eq!(
             display_dimensions(
                 720,

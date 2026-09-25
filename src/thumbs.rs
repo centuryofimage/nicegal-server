@@ -19,6 +19,9 @@ use crate::video;
 
 pub const SIZE_BUCKETS: [u16; 4] = [128, 256, 512, 1024];
 pub const EAGER_SIZE_BUCKETS: [u16; 3] = [128, 256, 512];
+/// Indexed video frames other than the poster only appear as matched-frame grid tiles.
+/// Skipping 1024 saves about two thirds of their storage; readers fall back to 512.
+pub const VIDEO_FRAME_SIZE_BUCKETS: [u16; 3] = [128, 256, 512];
 pub const GENERATOR_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,10 +116,7 @@ pub fn decode_asset_variants_with_video_output(
     let posters = match asset.media_kind {
         MediaKind::Image => poster::image_buckets(&asset.path, buckets)?,
         MediaKind::Video => {
-            let samples = video::samples(&asset.path, video::SAMPLE_MAX_EDGE, || false)?;
-            let first = samples
-                .first()
-                .context("video has no decodable sample frame")?;
+            let first = video::poster_sample(&asset.path, video::SAMPLE_MAX_EDGE, || false)?;
             let span = debug_span!("video_poster_encode", path = %asset.path, buckets = ?buckets);
             let _entered = span.enter();
             poster::raster_buckets_with_output_at(

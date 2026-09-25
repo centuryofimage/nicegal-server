@@ -642,19 +642,21 @@ fn flush_batch(
             continue;
         }
         if asset.media_kind == MediaKind::Video {
+            let samples = distinct_frames(
+                decoded
+                    .sample_timestamps
+                    .into_iter()
+                    .zip(sample_vectors)
+                    .collect(),
+                crate::video::DUPLICATE_FRAME_SIMILARITY,
+            );
+            let mut encoded = decoded
+                .encoded_samples
+                .context("video samples were not encoded")?;
+            encoded.retain_timestamps(&samples.iter().map(|(timestamp, _)| *timestamp).collect());
             thumbnails
                 .context("video indexing requires thumbnail storage")?
-                .store_encoded_video_samples(
-                    asset.clone(),
-                    decoded
-                        .encoded_samples
-                        .context("video samples were not encoded")?,
-                )?;
-            let samples = decoded
-                .sample_timestamps
-                .into_iter()
-                .zip(sample_vectors)
-                .collect();
+                .store_encoded_video_samples(asset.clone(), encoded)?;
             db.save_video_embeddings(&asset, samples)?;
             stored += 1;
         } else {
@@ -688,6 +690,29 @@ fn flush_batch(
     }
     debug!(stored, "saved an image embedding batch");
     Ok(())
+}
+
+/// Greedily keep frames in time order, dropping any too similar to one already kept.
+/// The first frame is the gallery poster and always survives.
+fn distinct_frames(frames: Vec<(i64, Vec<f32>)>, threshold: f32) -> Vec<(i64, Vec<f32>)> {
+    let mut kept: Vec<(i64, Vec<f32>)> = Vec::with_capacity(frames.len());
+    for frame in frames {
+        if kept.iter().all(|old| cosine(&old.1, &frame.1) < threshold) {
+            kept.push(frame);
+        }
+    }
+    kept
+}
+
+pub(crate) fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    let (mut dot, mut aa, mut bb) = (0.0_f32, 0.0_f32, 0.0_f32);
+    for (x, y) in a.iter().zip(b) {
+        dot += x * y;
+        aa += x * x;
+        bb += y * y;
+    }
+    let norm = (aa * bb).sqrt();
+    if norm > 0.0 { dot / norm } else { 0.0 }
 }
 
 fn embed_sample_batches(
@@ -735,9 +760,33 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn distinct_frames_keep_the_poster_and_drop_near_duplicates() {
+        let frames = vec![
+            (0, vec![1.0, 0.0]),
+            (5_000, vec![0.99, 0.05]),
+            (10_000, vec![0.0, 1.0]),
+            (15_000, vec![0.02, 2.0]),
+            (20_000, vec![0.7, 0.7]),
+        ];
+        let kept = distinct_frames(frames, 0.95);
+        assert_eq!(
+            kept.iter()
+                .map(|(timestamp, _)| *timestamp)
+                .collect::<Vec<_>>(),
+            vec![0, 10_000, 20_000]
+        );
+    }
+
+    #[test]
     fn video_override_keeps_images_eligible_but_skips_video_frames() -> Result<()> {
         let temp = TempDir::new()?;
-        let root = PathBuf::from("C:/gallery");
+        // Library roots are validated as absolute on the host platform.
+        let root = if cfg!(windows) {
+            "C:/gallery"
+        } else {
+            "/gallery"
+        };
+        let root = PathBuf::from(root);
         let rows = vec![
             (1, root.join("photo.png"), 10, None, 100),
             (2, root.join("movie.mp4"), 10, None, 100),

@@ -819,7 +819,8 @@ mod sample_tests {
         );
 
         cache.store_video_samples(&asset, &samples)?;
-        assert_eq!(cache.delete_asset(asset.asset_id)?, 12);
+        // Poster frame: 4 sizes plus 4 gallery thumbnails; the second frame omits 1024.
+        assert_eq!(cache.delete_asset(asset.asset_id)?, 11);
         assert!(
             super::super::videos_with_complete_thumbnails(&db, &cache, &[asset], &vectors)?
                 .is_empty()
