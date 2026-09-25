@@ -9,9 +9,11 @@
   non-CPU provider compiled in. They cannot be merged: the server packages and dynamically loads
   one complete distribution per process. This means `runtime::fallback_chain`'s `directml` →
   `openvino` rung can never actually succeed when the process loaded the `directml` distribution —
-  it always lands on `cpu`. `ocr_models::job::run` detects exactly that outcome and restarts the
-  process into `openvino` instead of running the rest of the session on CPU; see `RESTART_EXIT_CODE`
-  in `api/mod.rs` and INTERNAL_API.md.
+  it always lands on `cpu`. The server's shared provider decision detects that outcome on the
+  first indexing-model load and restarts the process into `openvino`; see `RESTART_EXIT_CODE` in
+  `api/mod.rs` and INTERNAL_API.md. OCR, CLIP image, and BGE then use one provider per process.
+  Once one has loaded on the selected provider, its ID is saved as working. Later model-load
+  failures, even after a process crash, do not trigger fallback from that provider.
 
 ## Runtime setup
 

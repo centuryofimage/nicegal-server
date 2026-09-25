@@ -141,13 +141,19 @@ async fn main() -> Result<()> {
         execution_provider: runtime.active_execution_provider(),
         ..RuntimeOptions::default()
     };
-    let embedder = Arc::new(api::models::TextModel::deferred(embedder_options.clone()));
+    let embedder = Arc::new(
+        api::models::TextModel::deferred(embedder_options.clone())
+            .with_provider_tracking(Arc::clone(&runtime)),
+    );
     let image_embedder_options = ImageEmbedderOptions {
         model: image_model,
         runtime: embedder_options.runtime,
         ..ImageEmbedderOptions::default()
     };
-    let image_embedder = Arc::new(api::models::ImageModel::deferred(image_embedder_options));
+    let image_embedder = Arc::new(
+        api::models::ImageModel::deferred(image_embedder_options)
+            .with_provider_tracking(Arc::clone(&runtime)),
+    );
     // The CLIP pair's text half, on CPU on purpose: query embedding is one short forward pass
     // per search, where a GPU upload costs more than the pass itself, and the accelerator is
     // wanted by indexing and OCR. Its model is the image encoder's paired text encoder, so it is

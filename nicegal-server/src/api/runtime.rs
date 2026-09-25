@@ -10,13 +10,13 @@ use axum::http::StatusCode;
 use axum::routing::{MethodRouter, get};
 use camino::Utf8PathBuf as PathBuf;
 use nicegal_core::embedding::ImageEmbeddingModel;
-use nicegal_core::runtime::ExecutionProvider;
+use nicegal_core::runtime::{ExecutionProvider, RuntimeOptions};
 use serde::{Deserialize, Serialize};
 
-use super::AppState;
 use super::error::ApiError;
 use super::extract::ApiJson;
 use super::ocr_models;
+use super::{AppState, RESTART_EXIT_CODE};
 
 /// The runtime selection read at server startup and the persisted selection for its next launch.
 /// ONNX Runtime binds to its loaded DLL process-wide, so changing this setting deliberately does
@@ -26,6 +26,7 @@ pub(crate) struct RuntimeSettings {
     active_execution_provider: ExecutionProvider,
     onnx_runtime_build_info: Mutex<String>,
     configured: Mutex<ConfiguredSettings>,
+    loaded_execution_provider: Mutex<Option<ExecutionProvider>>,
 }
 
 impl RuntimeSettings {
@@ -46,6 +47,7 @@ impl RuntimeSettings {
                 .unwrap_or(configured.execution_provider),
             onnx_runtime_build_info: Mutex::new(String::new()),
             configured: Mutex::new(configured),
+            loaded_execution_provider: Mutex::new(None),
         })
     }
 
@@ -61,12 +63,18 @@ impl RuntimeSettings {
     }
 
     fn status(&self) -> RuntimeStatusResponse {
+        let loaded_execution_provider = self
+            .loaded_execution_provider
+            .lock()
+            .expect("loaded provider mutex poisoned")
+            .map(|provider| provider.to_string());
         let configured = self
             .configured
             .lock()
             .expect("runtime settings mutex poisoned");
         RuntimeStatusResponse {
             active_execution_provider: self.active_execution_provider.to_string(),
+            loaded_execution_provider,
             active_runtime_distribution: runtime_distribution(self.active_execution_provider)
                 .to_owned(),
             onnx_runtime_build_info: self
@@ -92,6 +100,75 @@ impl RuntimeSettings {
     ) -> Result<RuntimeStatusResponse> {
         self.update(Some(execution_provider), None)?;
         Ok(self.status())
+    }
+
+    /// A provider that has compiled an indexing model successfully must not be treated as unsupported
+    /// after a later process crash or model reload failure.
+    pub(super) fn provider_has_worked(&self, provider: ExecutionProvider) -> bool {
+        self.configured
+            .lock()
+            .expect("runtime settings mutex poisoned")
+            .working_execution_providers
+            .contains(&provider.to_string())
+    }
+
+    pub(super) fn record_working_provider(&self, provider: ExecutionProvider) -> Result<()> {
+        let mut configured = self
+            .configured
+            .lock()
+            .expect("runtime settings mutex poisoned");
+        let name = provider.to_string();
+        if configured.working_execution_providers.contains(&name) {
+            return Ok(());
+        }
+        let mut next = configured.clone();
+        next.working_execution_providers.push(name);
+        write_settings(&self.path, &RuntimeSettingsFile::from(&next))?;
+        *configured = next;
+        Ok(())
+    }
+
+    /// All indexing models share the provider chosen by the first successful model load.
+    pub(super) fn model_runtime_options(&self, mut options: RuntimeOptions) -> RuntimeOptions {
+        let loaded = *self
+            .loaded_execution_provider
+            .lock()
+            .expect("loaded provider mutex poisoned");
+        options.execution_provider = loaded.unwrap_or(self.active_execution_provider);
+        options.allow_cpu_fallback =
+            loaded.is_none() && !self.provider_has_worked(self.active_execution_provider);
+        options
+    }
+
+    pub(super) fn accept_loaded_provider(&self, provider: ExecutionProvider) -> Result<()> {
+        let mut loaded = self
+            .loaded_execution_provider
+            .lock()
+            .expect("loaded provider mutex poisoned");
+        if let Some(previous) = *loaded {
+            anyhow::ensure!(
+                previous == provider,
+                "models in this server process cannot mix {previous} and {provider} execution providers"
+            );
+            return Ok(());
+        }
+        if provider == self.active_execution_provider {
+            if let Err(error) = self.record_working_provider(provider) {
+                tracing::warn!(%error, %provider, "failed to save a working execution provider");
+            }
+        } else if self.active_execution_provider == ExecutionProvider::Directml
+            && provider == ExecutionProvider::Cpu
+        {
+            // The loaded DirectML distribution cannot run OpenVINO sessions. A new process can.
+            self.set(ExecutionProvider::OpenVino)?;
+            tracing::warn!("DirectML failed its first model load; restarting with OpenVINO");
+            std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                std::process::exit(RESTART_EXIT_CODE);
+            });
+        }
+        *loaded = Some(provider);
+        Ok(())
     }
 
     pub(super) fn image_model(&self) -> ImageEmbeddingModel {
@@ -179,6 +256,7 @@ impl RuntimeSettings {
 #[serde(rename_all = "camelCase")]
 pub(super) struct RuntimeStatusResponse {
     active_execution_provider: String,
+    loaded_execution_provider: Option<String>,
     active_runtime_distribution: String,
     onnx_runtime_build_info: String,
     configured_execution_provider: String,
@@ -262,6 +340,8 @@ struct RuntimeUpdateRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RuntimeSettingsFile {
     execution_provider: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    working_execution_providers: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     image_model: Option<String>,
     #[serde(default = "default_true")]
@@ -360,6 +440,7 @@ async fn update(
 #[derive(Clone)]
 struct ConfiguredSettings {
     execution_provider: ExecutionProvider,
+    working_execution_providers: Vec<String>,
     image_model: ImageEmbeddingModel,
     index_videos: bool,
     ocr_models: ocr_models::job::Request,
@@ -369,6 +450,7 @@ impl From<&ConfiguredSettings> for RuntimeSettingsFile {
     fn from(settings: &ConfiguredSettings) -> Self {
         Self {
             execution_provider: settings.execution_provider.to_string(),
+            working_execution_providers: settings.working_execution_providers.clone(),
             image_model: Some(settings.image_model.id().to_owned()),
             index_videos: settings.index_videos,
             ocr_models: settings.ocr_models.clone(),
@@ -398,6 +480,9 @@ fn read_settings(path: &PathBuf) -> Result<ConfiguredSettings> {
         .filter(|provider| provider_available(*provider));
     let settings = ConfiguredSettings {
         execution_provider: provider.unwrap_or_else(default_provider),
+        working_execution_providers: file
+            .as_ref()
+            .map_or_else(Vec::new, |file| file.working_execution_providers.clone()),
         image_model: match file.as_ref().and_then(|file| file.image_model.as_deref()) {
             Some(model) => model.parse()?,
             None => read_legacy_image_model(path)?,
@@ -459,6 +544,56 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn working_provider_survives_restart_and_provider_change() -> Result<()> {
+        let temp = TempDir::new()?;
+        let path = PathBuf::try_from(temp.path().join("runtime.json"))?;
+        let provider = default_provider();
+        let settings = RuntimeSettings::load(path.clone(), None)?;
+        assert!(!settings.provider_has_worked(provider));
+        settings.record_working_provider(provider)?;
+        settings.record_working_provider(provider)?;
+        settings.set(ExecutionProvider::Cpu)?;
+
+        let restarted = RuntimeSettings::load(path.clone(), None)?;
+        assert!(restarted.provider_has_worked(provider));
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(path)?)?;
+        assert_eq!(
+            saved["workingExecutionProviders"],
+            serde_json::json!([provider.to_string()])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn first_loaded_model_sets_the_provider_for_later_models() -> Result<()> {
+        let temp = TempDir::new()?;
+        let path = PathBuf::try_from(temp.path().join("runtime.json"))?;
+        let settings = RuntimeSettings::load(path, Some(ExecutionProvider::Cpu))?;
+        assert!(
+            settings
+                .model_runtime_options(RuntimeOptions::default())
+                .allow_cpu_fallback
+        );
+        settings.accept_loaded_provider(ExecutionProvider::Cpu)?;
+        let later = settings.model_runtime_options(RuntimeOptions {
+            execution_provider: ExecutionProvider::Directml,
+            ..RuntimeOptions::default()
+        });
+        assert_eq!(later.execution_provider, ExecutionProvider::Cpu);
+        assert!(!later.allow_cpu_fallback);
+        assert!(
+            settings
+                .accept_loaded_provider(ExecutionProvider::Directml)
+                .is_err()
+        );
+        assert_eq!(
+            settings.status().loaded_execution_provider.as_deref(),
+            Some("cpu")
+        );
+        Ok(())
+    }
 
     #[test]
     fn scan_options_survive_restart() -> Result<()> {

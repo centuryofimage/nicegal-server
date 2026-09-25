@@ -6,14 +6,13 @@ use hf_hub::api::tokio::Progress;
 use nicegal_core::hub::{self, DownloadObserver, ModelSource};
 use nicegal_core::index::IndexObserver;
 use nicegal_core::ocr::{OcrModelFiles, PaddleOcrPool};
-use nicegal_core::runtime::{ExecutionProvider, RuntimeOptions};
+use nicegal_core::runtime::RuntimeOptions;
 use serde::Deserialize;
-use tracing::{error, warn};
 
 use super::ModelStore;
+use crate::api::RuntimeSettings;
 use crate::api::error::ApiError;
 use crate::api::jobs::Job;
-use crate::api::{RESTART_EXIT_CODE, RuntimeSettings};
 
 const DEFAULT_MODEL_FILENAME: &str = "inference.onnx";
 const DEFAULT_CONFIG_FILENAME: &str = "inference.yml";
@@ -176,10 +175,7 @@ pub(crate) async fn run(
     job.loading_models();
     let detection = spec.detection;
     let recognition = spec.recognition;
-    let runtime_options = RuntimeOptions {
-        execution_provider: store.requested_execution_provider(),
-        ..RuntimeOptions::default()
-    };
+    let runtime_options = runtime_options(store, runtime);
     let models = tokio::task::spawn_blocking(move || {
         PaddleOcrPool::load_files(
             OcrModelFiles {
@@ -198,34 +194,17 @@ pub(crate) async fn run(
     .await
     .map_err(|error| anyhow::anyhow!("model loader worker failed: {error}"))??;
     job.models_loaded(2);
-    let requested = store.requested_execution_provider();
     let actual = models.execution_provider();
+    runtime.accept_loaded_provider(actual)?;
     store.replace(models);
-    // DirectML falling all the way back to CPU means the loaded distribution's DirectML EP could
-    // not actually compile a session (see `runtime::fallback_chain`: the OpenVINO rung is dead in
-    // this process, since only one non-CPU provider is ever compiled into the loaded runtime
-    // library). Persist OpenVINO as the next launch's provider and restart into it now, rather
-    // than silently running the rest of this session on CPU.
-    if requested == ExecutionProvider::Directml && actual == ExecutionProvider::Cpu {
-        match runtime.set(ExecutionProvider::OpenVino) {
-            Ok(_) => {
-                warn!("DirectML failed to load; switching to OpenVINO and restarting");
-                schedule_restart();
-            }
-            Err(error) => {
-                error!(%error, "failed to persist the OpenVINO fallback after DirectML failed to load");
-            }
-        }
-    }
     Ok(())
 }
 
-/// Exit after completion is published so the launcher can restart with the selected runtime.
-fn schedule_restart() {
-    tokio::spawn(async {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        std::process::exit(RESTART_EXIT_CODE);
-    });
+fn runtime_options(store: &ModelStore, runtime: &RuntimeSettings) -> RuntimeOptions {
+    runtime.model_runtime_options(RuntimeOptions {
+        execution_provider: store.requested_execution_provider(),
+        ..RuntimeOptions::default()
+    })
 }
 
 #[derive(Clone)]
@@ -311,6 +290,22 @@ fn default_config_filename() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nicegal_core::runtime::ExecutionProvider;
+    use tempfile::TempDir;
+
+    #[test]
+    fn a_provider_that_worked_before_cannot_fall_back_after_restart() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let path = camino::Utf8PathBuf::try_from(temp.path().join("runtime.json"))?;
+        let store = ModelStore::new(ExecutionProvider::Directml);
+        let runtime = RuntimeSettings::load(path.clone(), None)?;
+        assert!(runtime_options(&store, &runtime).allow_cpu_fallback);
+        runtime.record_working_provider(ExecutionProvider::Directml)?;
+
+        let restarted = RuntimeSettings::load(path, None)?;
+        assert!(!runtime_options(&store, &restarted).allow_cpu_fallback);
+        Ok(())
+    }
 
     #[test]
     fn model_ids_are_required_and_not_defaulted() {

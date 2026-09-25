@@ -12,10 +12,11 @@ use nicegal_core::embedding::{
     ImageEmbedder, ImageEmbedderOptions, ImageQueryEmbedder, ImageQueryEmbedderOptions,
     TextEmbedder, TextEmbedderOptions,
 };
+use nicegal_core::runtime::ExecutionProvider;
 use parking_lot::Mutex;
 use serde::Serialize;
 
-use super::{AppState, error::ApiError};
+use super::{AppState, RuntimeSettings, error::ApiError};
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -35,6 +36,11 @@ enum ModelState {
 }
 
 type CachedLoader<T, O> = fn(&O) -> Result<Option<T>>;
+struct ProviderTracker<T, O> {
+    runtime: Arc<RuntimeSettings>,
+    provider: fn(&T) -> ExecutionProvider,
+    configure: fn(&O, &RuntimeSettings) -> O,
+}
 
 pub(crate) struct LazyModel<T, O> {
     pub(crate) options: O,
@@ -44,6 +50,7 @@ pub(crate) struct LazyModel<T, O> {
     #[cfg(test)]
     loader: Option<fn(&O) -> Result<T>>,
     cached_loader: Option<CachedLoader<T, O>>,
+    provider_tracker: Option<ProviderTracker<T, O>>,
     name: &'static str,
 }
 
@@ -60,12 +67,19 @@ impl<T, O> LazyModel<T, O> {
             #[cfg(test)]
             loader: None,
             cached_loader: None,
+            provider_tracker: None,
             name,
         }
     }
 
     pub(super) fn status(&self) -> ModelStatus {
         self.status.lock().clone()
+    }
+
+    fn load_options(&self) -> Option<O> {
+        self.provider_tracker
+            .as_ref()
+            .map(|tracker| (tracker.configure)(&self.options, &tracker.runtime))
     }
 
     #[cfg(test)]
@@ -105,6 +119,16 @@ impl<T, O> LazyModel<T, O> {
                 "Preparing {} failed. Check your connection and available disk space, then retry preparing search in Libraries",
                 self.name
             )
+        })
+        .and_then(|loaded| {
+            if let Some(model) = loaded.as_ref()
+                && let Some(tracker) = &self.provider_tracker
+            {
+                tracker
+                    .runtime
+                    .accept_loaded_provider((tracker.provider)(model))?;
+            }
+            Ok(loaded)
         });
         match loaded {
             Ok(Some(session)) => {
@@ -139,7 +163,9 @@ impl<T, O> LazyModel<T, O> {
             return Ok(Arc::clone(session));
         }
         if let Some(loader) = self.cached_loader {
-            match self.prepare_with(|| loader(&self.options)) {
+            let configured = self.load_options();
+            let options = configured.as_ref().unwrap_or(&self.options);
+            match self.prepare_with(|| loader(options)) {
                 Ok(Some(session)) => return Ok(session),
                 Ok(None) => {}
                 Err(error) => return Err(ApiError::models_not_ready(format!("{error:#}"))),
@@ -175,10 +201,10 @@ macro_rules! model {
                 &self,
                 progress: &dyn nicegal_core::hub::DownloadObserver,
             ) -> Result<Arc<$session>> {
-                self.prepare_with(|| {
-                    $session::load_with_progress(&self.options, progress).map(Some)
-                })?
-                .context("download-capable loader returned no model")
+                let configured = self.load_options();
+                let options = configured.as_ref().unwrap_or(&self.options);
+                self.prepare_with(|| $session::load_with_progress(options, progress).map(Some))?
+                    .context("download-capable loader returned no model")
             }
             pub(crate) fn deferred(options: $options) -> Self {
                 let mut model = Self::new(options, $name);
@@ -223,6 +249,36 @@ model!(
     Some(ImageQueryEmbedder::load_cached)
 );
 
+impl TextModel {
+    pub(crate) fn with_provider_tracking(mut self, runtime: Arc<RuntimeSettings>) -> Self {
+        self.provider_tracker = Some(ProviderTracker {
+            runtime,
+            provider: TextEmbedder::execution_provider,
+            configure: |options, runtime| {
+                let mut configured = options.clone();
+                configured.runtime = runtime.model_runtime_options(configured.runtime);
+                configured
+            },
+        });
+        self
+    }
+}
+
+impl ImageModel {
+    pub(crate) fn with_provider_tracking(mut self, runtime: Arc<RuntimeSettings>) -> Self {
+        self.provider_tracker = Some(ProviderTracker {
+            runtime,
+            provider: ImageEmbedder::execution_provider,
+            configure: |options, runtime| {
+                let mut configured = options.clone();
+                configured.runtime = runtime.model_runtime_options(configured.runtime);
+                configured
+            },
+        });
+        self
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct StatusResponse {
@@ -253,6 +309,27 @@ async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tempfile::TempDir;
+
+    #[test]
+    fn successful_lazy_load_records_its_provider_across_restarts() -> Result<()> {
+        let temp = TempDir::new()?;
+        let path = camino::Utf8PathBuf::try_from(temp.path().join("runtime.json"))?;
+        let runtime = Arc::new(RuntimeSettings::load(
+            path.clone(),
+            Some(ExecutionProvider::Cpu),
+        )?);
+        let mut model = LazyModel::new_with_loader((), "test model", |_| Ok(42));
+        model.provider_tracker = Some(ProviderTracker {
+            runtime: Arc::clone(&runtime),
+            provider: |_| ExecutionProvider::Cpu,
+            configure: |_, _| (),
+        });
+        assert!(!runtime.provider_has_worked(ExecutionProvider::Cpu));
+        model.prepare()?;
+        assert!(RuntimeSettings::load(path, None)?.provider_has_worked(ExecutionProvider::Cpu));
+        Ok(())
+    }
 
     #[test]
     #[ignore = "requires the search models to have been downloaded by explicit setup"]

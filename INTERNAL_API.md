@@ -100,12 +100,16 @@ loading models again.
 to compile, but the `openvino` rung only ever succeeds if the *loaded* runtime distribution has
 OpenVINO compiled in — see "Runtime setup" below: a process launched with `directml` only ever
 lands on `cpu` in practice, since the two accelerated providers ship in separate, mutually
-exclusive `onnxruntime.dll` distributions. When that specific case happens — `directml` requested,
-`cpu` actually loaded — the `ocrModelLoad` job itself persists `openvino` as the next launch's
-provider and exits with `RESTART_EXIT_CODE` (see `api::RESTART_EXIT_CODE` in `nicegal-server`) to
+exclusive `onnxruntime.dll` distributions. When that specific case happens on the first indexing
+model load — `directml` requested, `cpu` actually loaded — the server persists `openvino` as the
+next launch's provider and exits with `RESTART_EXIT_CODE` (see `api::RESTART_EXIT_CODE`) to
 ask the desktop launcher for an immediate, transparent restart into it, rather than running the
 rest of the session on CPU. The desktop launcher (`main/backend/nicegal-server-process.ts`) recognizes
-this exit code and respawns without reporting a crash.
+this exit code and respawns without reporting a crash. OCR, CLIP image, and BGE share the provider
+settled by the first load in each process. Providers that successfully load one of those models are
+saved in `workingExecutionProviders`. A later load failure for one of those providers, including
+after a process crash, is reported as a job error instead of changing providers. CLIP's short
+text-query encoder intentionally uses CPU outside this indexing-provider decision.
 
 All four stores use WAL mode. Their separation and the stable columns explicitly documented below
 are part of the desktop read contract. Any table or column shape change requires a `user_version`
