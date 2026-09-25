@@ -518,9 +518,11 @@ Version 1 routes:
   strings; unavailable timestamps/dimensions/frame count/duration are null.
 - `GET /v1/catalog/count?libraryId=<id>` returns a JSON integer without materializing rows.
   `GET /v1/catalog/revision` returns a decimal-string revision.
-- `GET /v1/catalog/folders?libraryId=<id>` returns a sorted JSON array of directory paths from
-  completed scan snapshots, plus configured included roots. It includes empty directories and
-  filters excluded paths. A newly added root appears immediately; its subfolders appear after its
+- `GET /v1/catalog/folders?libraryId=<id>` returns a path-sorted JSON array of
+  `{ "path": "D:\Photos\Trips", "modifiedNs": "1790000000000000000" }` from completed scan
+  snapshots, plus configured included roots. `modifiedNs` is the directory's modification time at
+  its latest completed scan, as a decimal string, or `null` for a root that has not finished one.
+  It includes empty directories and filters excluded paths. A newly added root appears immediately; its subfolders appear after its
   first complete scan. No source directory is walked by this read.
 - `GET /v1/libraries` lists every library in creation order; `GET /v1/libraries/<id>` returns one.
   A library is

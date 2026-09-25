@@ -31,13 +31,26 @@ pub fn resize_rgb(
     let Some(algorithm) = resize_algorithm(filter) else {
         return resize_rgb_float(source, width, height, filter);
     };
+    resize_rgb_bytes(&source, width, height, algorithm)
+}
+
+/// Resize borrowed RGB pixels with byte intermediates and CPU-specific kernels.
+pub fn resize_rgb_bytes(
+    source: &image::RgbImage,
+    width: u32,
+    height: u32,
+    algorithm: ResizeAlg,
+) -> Result<image::RgbImage> {
+    if source.dimensions() == (width, height) {
+        return Ok(source.clone());
+    }
     let input = ImageRef::new(
         source.width(),
         source.height(),
         source.as_raw(),
         PixelType::U8x3,
     )
-    .context("building byte resize source")?;
+    .context("building RGB byte resize source")?;
     let mut output = Image::new(width, height, PixelType::U8x3);
     Resizer::new()
         .resize(
@@ -45,9 +58,9 @@ pub fn resize_rgb(
             &mut output,
             &ResizeOptions::new().resize_alg(algorithm),
         )
-        .context("resizing model input with byte intermediates")?;
+        .context("resizing RGB image with byte intermediates")?;
     image::RgbImage::from_raw(width, height, output.into_vec())
-        .context("building byte-resized model input")
+        .context("building byte-resized RGB image")
 }
 
 /// Float convolution for enlargement, preserving model-input precision.

@@ -9,7 +9,7 @@ mod webp;
 
 pub(crate) use raster::ExifOrientation;
 pub use raster::Raster;
-pub use resize::{fit_within, resize, resize_rgb};
+pub use resize::{fit_within, resize, resize_rgb, resize_rgb_bytes};
 
 use anyhow::{Context, Result, bail};
 use nom_exif::{Exif, ExifTag, MediaParser, MediaSource};

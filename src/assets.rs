@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::BufReader;
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -170,6 +170,13 @@ impl MediaKind {
             _ => bail!("invalid media kind in asset catalog: {value}"),
         }
     }
+}
+
+/// A folder for the library tree: a configured root or a directory from a completed scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FolderEntry {
+    pub path: PathBuf,
+    pub modified_ns: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -349,20 +356,30 @@ pub(crate) struct PreparedCatalogChange {
 
 impl AssetCatalog {
     /// The scan snapshot is updated once per completed folder scan, not once per indexed file.
-    /// Keep configured roots visible before the first scan and while a drive is offline.
-    pub fn list_folders(&self, library_id: i64, scope: &PathScope) -> Result<Vec<PathBuf>> {
-        let mut paths: BTreeSet<PathBuf> = scope.include().iter().cloned().collect();
+    /// Keep configured roots visible before the first scan and while a drive is offline. A folder's
+    /// time is its directory modification time from the latest completed scan, or `None` before
+    /// one; nested included roots can snapshot the same directory, so the newest time wins.
+    pub fn list_folders(&self, library_id: i64, scope: &PathScope) -> Result<Vec<FolderEntry>> {
+        let mut folders: BTreeMap<PathBuf, Option<i64>> =
+            scope.include().iter().map(|path| (path.clone(), None)).collect();
         let mut statement = self.conn.prepare(
-            "SELECT path FROM library_directory_snapshots WHERE library_id = ?1 ORDER BY path",
+            "SELECT path, modified_ns FROM library_directory_snapshots WHERE library_id = ?1",
         )?;
-        let rows = statement.query_map([library_id], |row| row.get::<_, String>(0))?;
+        let rows = statement.query_map([library_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
         for row in rows {
-            let path = PathBuf::from(row?);
+            let (path, modified_ns) = row?;
+            let path = PathBuf::from(path);
             if scope.contains_folder(&path) {
-                paths.insert(path);
+                let entry = folders.entry(path).or_default();
+                *entry = (*entry).max(Some(modified_ns));
             }
         }
-        Ok(paths.into_iter().collect())
+        Ok(folders
+            .into_iter()
+            .map(|(path, modified_ns)| FolderEntry { path, modified_ns })
+            .collect())
     }
 
     pub fn new(path: &Path) -> Result<Self> {

@@ -40,10 +40,19 @@ pub(super) fn routes() -> Router<AppState> {
         .route("/v1/catalog/metadata", get(metadata))
 }
 
+/// Nanosecond times are strings, as in GalleryAssetResponse, because they exceed JSON's safe
+/// integer range.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FolderResponse {
+    path: Utf8PathBuf,
+    modified_ns: Option<String>,
+}
+
 async fn folders(
     State(state): State<AppState>,
     ApiQuery(request): ApiQuery<Listing>,
-) -> Result<Json<Vec<String>>, ApiError> {
+) -> Result<Json<Vec<FolderResponse>>, ApiError> {
     Ok(Json(
         run_blocking(move || {
             let scope = libraries::scope(&state.databases, request.library_id)?;
@@ -52,7 +61,10 @@ async fn folders(
                 .open_assets_read_only()?
                 .list_folders(request.library_id, &scope)?
                 .into_iter()
-                .map(Utf8PathBuf::into_string)
+                .map(|folder| FolderResponse {
+                    path: folder.path,
+                    modified_ns: folder.modified_ns.map(|ns| ns.to_string()),
+                })
                 .collect())
         })
         .await?,

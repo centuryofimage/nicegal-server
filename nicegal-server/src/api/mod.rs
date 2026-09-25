@@ -536,7 +536,7 @@ mod tests {
                     },
                     nicegal_core::libraries::DirectorySnapshot {
                         path: empty.clone(),
-                        modified_ns: 0,
+                        modified_ns: 1_790_000_000_000_000_000,
                     },
                 ],
             )
@@ -550,12 +550,10 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{folders}");
-        assert!(
-            folders
-                .as_array()
-                .unwrap()
-                .contains(&serde_json::json!(empty.as_str()))
-        );
+        assert!(folders.as_array().unwrap().contains(&serde_json::json!({
+            "path": empty.as_str(),
+            "modifiedNs": "1790000000000000000",
+        })));
 
         let (status, body) = send(&router, Method::GET, &search_uri("TRIPS", "path")).await;
         assert_eq!(status, StatusCode::OK, "{body}");

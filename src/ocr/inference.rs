@@ -5,13 +5,15 @@ use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
-use image::imageops::{FilterType, resize, rotate90};
+use fast_image_resize::{FilterType, ResizeAlg};
+use image::imageops::rotate90;
 use image::{Rgb, RgbImage};
 use ort::session::Session;
 use ort::value::TensorRef;
 use serde::Deserialize;
 use tracing::{Span, debug, field, instrument};
 
+const OCR_RESIZE_ALGORITHM: ResizeAlg = ResizeAlg::Convolution(FilterType::Bilinear);
 const DETECTION_TARGET_SIDE: u32 = 736;
 /// Default longest detector input side. Lower values reduce work but may miss small text.
 const DETECTION_MAX_SIDE: u32 = 960;
@@ -397,7 +399,7 @@ impl<'a> PaddleOcrEngine<'a> {
                 width,
                 &self.config.recognizer,
                 &mut self.scratch.recognizer_input,
-            );
+            )?;
             let input_bytes = self.scratch.recognizer_input.len() * size_of::<f32>();
             let tensor = TensorRef::from_array_view((
                 vec![
@@ -504,7 +506,12 @@ fn detection_input(
     }
     let resize_width = aligned_dimension(width, ratio);
     let resize_height = aligned_dimension(height, ratio);
-    let resized = resize(image, resize_width, resize_height, FilterType::Triangle);
+    let resized = crate::imaging::resize_rgb_bytes(
+        image,
+        resize_width,
+        resize_height,
+        OCR_RESIZE_ALGORITHM,
+    )?;
     let plane = usize::try_from(resize_width)? * usize::try_from(resize_height)?;
     input.resize(plane * 3, 0.0);
     // `(v / 255 - mean) / std` is two divisions per channel per pixel — over five million of them
@@ -809,7 +816,7 @@ fn recognition_input(
     width: usize,
     config: &RecognizerConfig,
     input: &mut Vec<f32>,
-) {
+) -> Result<()> {
     let plane = config.height * width;
     let item_size = config.channels * plane;
     input.resize(batch.len() * item_size, 0.0);
@@ -818,12 +825,12 @@ fn recognition_input(
         let crop = &crops[crop_index];
         let resized_width =
             ((config.height as f32 * aspect_ratio(crop)).ceil() as usize).clamp(1, width);
-        let resized = resize(
+        let resized = crate::imaging::resize_rgb_bytes(
             crop,
             resized_width as u32,
             config.height as u32,
-            FilterType::Triangle,
-        );
+            OCR_RESIZE_ALGORITHM,
+        )?;
         let item_offset = batch_index * item_size;
         for (pixel_index, pixel) in resized.pixels().enumerate() {
             let row = pixel_index / resized_width;
@@ -836,6 +843,7 @@ fn recognition_input(
                 f32::from(pixel[0]).mul_add(RECOGNITION_SCALE, -1.0);
         }
     }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Default)]
