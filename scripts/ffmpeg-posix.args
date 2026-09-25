@@ -1,0 +1,23 @@
+# Standalone-checkout fallback for the parent .github/ffmpeg/posix.args recipe.
+# Keep this aligned with the GitHub Actions recipe when its codec set changes.
+--enable-static
+--disable-shared
+--enable-pic
+--disable-doc
+--disable-debug
+--disable-programs
+--disable-autodetect
+--disable-everything
+--disable-network
+--disable-hwaccels
+--disable-avdevice
+--disable-swresample
+--enable-avcodec
+--enable-avformat
+--enable-avfilter
+--enable-swscale
+--enable-filter=buffer,buffersink,scale,format,transpose,rotate,hflip,vflip
+--enable-protocol=file
+--enable-demuxer=mov,matroska,avi,mpegts,mpegps,ivf
+--enable-parser=h264,hevc,vp8,vp9,av1,mpeg4video,mpegvideo,mjpeg
+--enable-decoder=h264,hevc,vp8,vp9,av1,mpeg2video,mpeg4,mjpeg

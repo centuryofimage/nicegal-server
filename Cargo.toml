@@ -16,7 +16,7 @@ regex = ["dep:regex"]
 logging = ["dep:tracing-subscriber", "dep:tracing-appender"]
 ort-openvino = ["ort/openvino"]
 ort-webgpu = ["ort/webgpu", "fastembed/webgpu"]
-ort-profiling = ["ort/api-25"]
+ort-profiling = ["ort/api-25", "fastembed/ort-profiling"]
 ort-directml = ["ort/directml", "fastembed/directml"]
 ort-coreml = ["ort/coreml"]
 

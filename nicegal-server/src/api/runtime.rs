@@ -293,30 +293,35 @@ fn runtime_distribution(execution_provider: ExecutionProvider) -> &'static str {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn available_execution_providers() -> &'static [ExecutionProvider] {
-    if cfg!(target_os = "linux") {
-        &[
-            #[cfg(feature = "ort-webgpu")]
-            ExecutionProvider::Webgpu,
-            #[cfg(feature = "ort-openvino")]
-            ExecutionProvider::OpenVino,
-            ExecutionProvider::Cpu,
-        ]
-    } else if cfg!(windows) {
-        &[
-            #[cfg(feature = "ort-directml")]
-            ExecutionProvider::Directml,
-            #[cfg(feature = "ort-openvino")]
-            ExecutionProvider::OpenVino,
-            ExecutionProvider::Cpu,
-        ]
-    } else {
-        &[
-            #[cfg(all(target_os = "macos", feature = "ort-coreml"))]
-            ExecutionProvider::CoreML,
-            ExecutionProvider::Cpu,
-        ]
-    }
+    &[
+        #[cfg(feature = "ort-webgpu")]
+        ExecutionProvider::Webgpu,
+        #[cfg(feature = "ort-openvino")]
+        ExecutionProvider::OpenVino,
+        ExecutionProvider::Cpu,
+    ]
+}
+
+#[cfg(windows)]
+fn available_execution_providers() -> &'static [ExecutionProvider] {
+    &[
+        #[cfg(feature = "ort-directml")]
+        ExecutionProvider::Directml,
+        #[cfg(feature = "ort-openvino")]
+        ExecutionProvider::OpenVino,
+        ExecutionProvider::Cpu,
+    ]
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn available_execution_providers() -> &'static [ExecutionProvider] {
+    &[
+        #[cfg(all(target_os = "macos", feature = "ort-coreml"))]
+        ExecutionProvider::CoreML,
+        ExecutionProvider::Cpu,
+    ]
 }
 
 fn provider_available(provider: ExecutionProvider) -> bool {

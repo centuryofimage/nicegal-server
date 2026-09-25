@@ -115,7 +115,7 @@ pub(crate) fn with_fallback<T>(
     for &fallback in fallback_chain(options.execution_provider) {
         warn!(
             execution_provider = %requested,
-            error = %last_error,
+            error = %format_args!("{last_error:#}"),
             "execution provider failed; retrying on the next fallback provider"
         );
         requested = fallback;
@@ -399,7 +399,7 @@ fn compile_session(
 ) -> Result<Session> {
     let provider = configure_provider(execution_provider, intra_threads)?;
 
-    let builder = Session::builder()?
+    let mut builder = Session::builder()?
         .with_intra_threads(provider.intra_threads.get())
         .map_err(builder_error)?
         .with_parallel_execution(false)
@@ -412,6 +412,13 @@ fn compile_session(
             GraphOptimizationLevel::Level3
         })
         .map_err(builder_error)?;
+    if std::env::var_os("NICEGAL_ORT_TRACE").is_some() {
+        builder = builder
+            .with_log_level(ort::logging::LogLevel::Verbose)
+            .map_err(builder_error)?
+            .with_log_verbosity(1)
+            .map_err(builder_error)?;
+    }
     let mut builder = if execution_provider == ExecutionProvider::Webgpu {
         let environment = ort::environment::Environment::current()?;
         let device = environment

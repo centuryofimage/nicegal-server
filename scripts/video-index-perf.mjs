@@ -16,6 +16,8 @@ const corpus = await realpath(options.corpus ?? join(repository, '..', 'testdata
 const executable = await realpath(options.executable ?? join(repository, 'target', 'release', 'nicegal-server.exe'))
 const outputRoot = resolve(options.output ?? join(repository, 'target', 'video-index-perf'))
 const image = options.image !== 'false'
+const limit = options.limit === undefined ? undefined : Number(options.limit)
+if (limit !== undefined) assert.ok(Number.isSafeInteger(limit) && limit > 0, 'expected --limit to be a positive integer')
 const rustLog = process.env.RUST_LOG ??
   'nicegal_core=trace,nicegal_server=trace,tower_http=info,hyper=warn,h2=warn,tower=warn,rustls=warn'
 await mkdir(outputRoot, { recursive: true })
@@ -36,7 +38,7 @@ try {
   const libraryId = await createLibrary(endpoint, token, { include: [corpus], ocr: false, image })
   const created = await fetch(`${endpoint}/v1/jobs`, {
     method: 'POST', headers,
-    body: JSON.stringify({ type: 'libraryScan', params: { libraryId } })
+    body: JSON.stringify({ type: 'libraryScan', params: { libraryId, debugLimit: limit } })
   })
   assert.equal(created.status, 202, await created.clone().text())
   let job = await created.json()
@@ -70,7 +72,7 @@ try {
   const phaseTraceMs = Object.fromEntries(['scan', 'catalog', 'image_index']
     .filter(name => spans[name])
     .map(name => [name, spans[name].totalMs]))
-  const report = { corpus, executable, image, rustLog, elapsedMs, cpuMs,
+  const report = { corpus, executable, image, limit, rustLog, elapsedMs, cpuMs,
     averageCores: cpuMs / elapsedMs, phaseTraceMs, progress: job.progress, status: job.status,
     errors: job.errors, spans }
   await writeFile(join(stateDirectory, 'profile.json'), JSON.stringify(report, null, 2) + '\n')

@@ -9,15 +9,6 @@ use clap::{ArgMatches, Command, arg, crate_description, crate_version, value_par
 use nicegal_core::db::{DB, SearchFilters, SearchType};
 use nicegal_core::scope::PathScope;
 
-#[cfg(not(target_env = "msvc"))]
-#[cfg(not(debug_assertions))]
-use tikv_jemallocator::Jemalloc;
-
-#[cfg(not(target_env = "msvc"))]
-#[cfg(not(debug_assertions))]
-#[global_allocator]
-static GLOBAL: Jemalloc = Jemalloc;
-
 fn main() -> Result<()> {
     run(cli().get_matches())
 }

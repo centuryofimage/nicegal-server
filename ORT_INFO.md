@@ -48,11 +48,12 @@
 
 ## Important gotchas
 
-- Opt-in `ort-profiling` requires ORT API 25 or newer. With this feature,
-  `NICEGAL_ORT_PROFILE_DIR` records ONNX profiles for the first three image batches
-  (including warmup), using `RunOptions::enable_profiling`. Leave both unset for
-  throughput measurements. This feature is not enabled in the standard Windows
-  build, whose older runtimes retain the existing API 24 requirement.
+- Opt-in `ort-profiling` requires ORT API 25 or newer. Build with the feature
+  and set `NICEGAL_ORT_PROFILE_DIR` to a writable directory to record the entire
+  image embedding session. FastEmbed finalizes the profile when the session is
+  dropped and logs its path. Leave the feature off for standard builds and omit
+  the variable for throughput measurements. `NICEGAL_ORT_TRACE` independently
+  enables verbose ORT logs through the regular tracing output.
 
 - With `load-dynamic`, `ort-sys/disable-linking` means upstream `copy-dylibs` does not run.
   `build.rs` copies the two distributions itself, and startup selects an absolute DLL path.
