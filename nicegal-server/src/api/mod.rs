@@ -2009,7 +2009,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn automatic_scan_checks_nested_changes_without_advancing_the_full_scan_clock() {
+    async fn automatic_scan_checks_nested_changes_with_the_directory_snapshot() {
         let temp = TempDir::new().unwrap();
         let router = test_router(&temp);
         let root = library_dir(&temp, "automatic");
@@ -2077,7 +2077,80 @@ mod tests {
             .collect::<Vec<_>>();
         names.sort();
         assert_eq!(names, ["keep.mp4", "new.mp4"]);
+        // A quick check counts as the folder's last scan.
         let (_, after) = send(&router, Method::GET, &format!("/v1/libraries/{id}")).await;
-        assert_eq!(after["include"][0]["lastScanCompletedNs"], full_clock);
+        let clock = |value: &serde_json::Value| value.as_str().unwrap().parse::<i64>().unwrap();
+        assert!(clock(&after["include"][0]["lastScanCompletedNs"]) > clock(&full_clock));
+    }
+
+    /// A directory link that needs no privileges: a junction on Windows, a symlink elsewhere.
+    fn link_dir(target: &str, link: &str) {
+        #[cfg(windows)]
+        assert!(
+            std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J", link, target])
+                .stdout(std::process::Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        );
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+
+    #[tokio::test]
+    async fn automatic_scan_checks_linked_directories_like_any_other() {
+        let temp = TempDir::new().unwrap();
+        let router = test_router(&temp);
+        let root = library_dir(&temp, "linked");
+        // The target is outside the library; its files still show, under the link's path.
+        let target = library_dir(&temp, "elsewhere/nested");
+        std::fs::write(PathBuf::from(target.as_str()).join("old.mp4"), b"video").unwrap();
+        link_dir(&target, PathBuf::from(root.as_str()).join("alias").as_str());
+        let (status, library) = post_json(
+            &router,
+            "/v1/libraries",
+            serde_json::json!({ "include": [root], "image": false }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{library}");
+        let id = library["id"].as_i64().unwrap();
+        let scan = |mode: &str| {
+            serde_json::json!({
+                "type": "libraryScan", "params": { "libraryId": id, "scanMode": mode }
+            })
+        };
+        let names = || async {
+            let (_, gallery) =
+                send(&router, Method::GET, &format!("/v1/catalog?libraryId={id}")).await;
+            let mut names = gallery
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|asset| asset["displayName"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        };
+        let (_, first) = post_json(&router, "/v1/jobs", scan("full")).await;
+        assert_eq!(wait_for_job(&router, &first).await["status"], "completed");
+        assert_eq!(names().await, ["old.mp4"]);
+        let (_, gallery) = send(&router, Method::GET, &format!("/v1/catalog?libraryId={id}")).await;
+        let expected = PathBuf::from(root.as_str()).join("alias").join("old.mp4");
+        assert_eq!(
+            gallery[0]["path"].as_str(),
+            Some(expected.as_str()),
+            "{gallery}"
+        );
+
+        // The link does not block a snapshot, so the next automatic scan is a quick check,
+        // and it sees changes made inside the link's target.
+        std::fs::remove_file(PathBuf::from(target.as_str()).join("old.mp4")).unwrap();
+        std::fs::write(PathBuf::from(target.as_str()).join("new.mp4"), b"video").unwrap();
+        let (_, changed) = post_json(&router, "/v1/jobs", scan("fast")).await;
+        let changed = wait_for_job(&router, &changed).await;
+        assert_eq!(changed["status"], "completed", "{changed}");
+        assert_eq!(changed["folders"][0]["scanMode"], "fast");
+        assert_eq!(names().await, ["new.mp4"]);
     }
 }

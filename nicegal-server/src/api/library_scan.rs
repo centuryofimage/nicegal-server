@@ -7,14 +7,14 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use camino::Utf8PathBuf as PathBuf;
 use glob::Pattern;
 use nicegal_core::assets::{Asset, AssetCatalog, canonicalize_path};
 use nicegal_core::db::DB;
-use nicegal_core::index::{self, IndexObserver, IndexOptions};
+use nicegal_core::index::{self, IndexEvent, IndexObserver, IndexOptions};
 use nicegal_core::libraries::{DirectorySnapshot, IncludedFolder, Library, ScanOutcome};
 use nicegal_core::scope::PathScope;
 use nicegal_core::thumbs::ThumbnailService;
@@ -29,7 +29,6 @@ use super::prune_jobs::{self, ReconcileInput, ReconcileScope};
 use super::{Databases, RuntimeSettings, image_embeddings, ocr_models, text_embeddings};
 
 const OCR_COMMIT_CHUNK_SIZE: usize = 32;
-const FULL_SCAN_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Cache folders that never hold library media.
 const DEFAULT_EXCLUDES: [&str; 2] = ["*/.cache", "*/.thumb*"];
 
@@ -120,6 +119,8 @@ impl Spec {
         self.library_id
     }
 
+    /// Folds a request that arrived while this one waited in the queue into it. Each option
+    /// widens: one request for every folder or a full walk makes the merged scan do it too.
     pub(crate) fn merge(&mut self, other: &Self) {
         self.pending_only &= other.pending_only;
         if other.scan_mode == ScanMode::Full {
@@ -189,6 +190,15 @@ struct ScanFolder<'a> {
     skip(spec, services, job),
     fields(library_id = spec.library_id, scan_mode = ?spec.scan_mode, pending_only = spec.pending_only)
 )]
+/// Runs in two stages:
+///
+/// 1. **Catalog**, once per walk: a full walk or a quick directory check brings the catalog in
+///    line with the disk, removes missing files, and saves the directory snapshot.
+/// 2. **Index**, once for the whole library: image embeddings, OCR, and text embeddings for
+///    every cataloged asset that lacks them.
+///
+/// A folder's scan request is cleared only after both stages finish. The snapshot is saved
+/// after stage 1, so cancelling indexing never makes the next scan walk again.
 pub(super) fn run(mut spec: Spec, services: &Services<'_>, job: &Arc<Job>) -> anyhow::Result<()> {
     let mut ocr_request = spec.ocr_models.take();
     let mut catalog = AssetCatalog::new(&services.databases.assets)?;
@@ -221,7 +231,7 @@ pub(super) fn run(mut spec: Spec, services: &Services<'_>, job: &Arc<Job>) -> an
     );
 
     let options = || spec.index_options(&library.exclude);
-    let mut scanned = Vec::new();
+    // Walks whose catalog stage succeeded: (index into `folders`, took the full path).
     let mut complete = Vec::new();
     for (index, walk) in folders.iter().enumerate() {
         let path = &walk.folder.path;
@@ -240,36 +250,30 @@ pub(super) fn run(mut spec: Spec, services: &Services<'_>, job: &Arc<Job>) -> an
             }
             continue;
         }
+        // A snapshot is only valid for the exclusions it was taken with. Removing an exclusion
+        // reveals directories the snapshot never recorded, so the key changes and the folder
+        // takes the full path.
         let scope_key = serde_json::to_string(&library.exclude)?;
         let previous = catalog.directory_snapshot(library.id, path, &scope_key)?;
-        let now_ns = now_ns();
-        for folder in walk.folders() {
-            tracing::trace!(
-                folder = %folder.path,
-                scan_pending = folder.scan_pending,
-                scan_outcome = ?folder.scan_outcome,
-                last_scan_completed_ns = ?folder.last_scan_completed_ns,
-                now_ns,
-                "full scan clock"
-            );
-        }
-        let full_due = full_scan_due(walk.folders(), now_ns);
+        // Automatic scans never walk every file on a timer: the directory snapshot finds
+        // additions, removals, and renames. Only an explicit rescan, a missing or out-of-scope
+        // snapshot, or the debug limit takes the full path.
+        // Snapshots are sorted by path, so the walk root comes first when one was recorded.
         let snapshot_valid = previous.first().is_some_and(|entry| entry.path == *path);
-        let full = spec.scan_mode == ScanMode::Full
-            || full_due
-            || spec.debug_limit.is_some()
-            || !snapshot_valid;
+        let full =
+            spec.scan_mode == ScanMode::Full || spec.debug_limit.is_some() || !snapshot_valid;
         tracing::debug!(
             folder = %path,
             mode = if full { "full" } else { "fast" },
             requested_full = spec.scan_mode == ScanMode::Full,
-            full_due,
             debug_limit = ?spec.debug_limit,
             snapshot_valid,
             snapshot_directories = previous.len(),
             "selected folder scan mode"
         );
         job.set_folder_scan_mode(index, if full { "full" } else { "fast" });
+        // Taken before cataloging: a directory that changes during the walk then differs from
+        // its recorded mtime, and the next quick check lists it again instead of missing it.
         let before = if full {
             match snapshot_directories(path, &options(), job.as_ref()) {
                 Ok(snapshot) => {
@@ -325,7 +329,8 @@ pub(super) fn run(mut spec: Spec, services: &Services<'_>, job: &Arc<Job>) -> an
         }
         tracing::debug!(folder = %path, mode = if full { "full" } else { "fast" }, assets = assets.len(), scan_complete = summary.scan_complete, "folder catalog finished");
         if summary.scan_complete {
-            // Missing-file cleanup only follows a complete walk, and only inside this folder.
+            // Missing-file cleanup only follows a complete walk, and only inside this folder. A
+            // quick check already cleaned up its changed directories in `quick_catalog`.
             let reconciled = if full {
                 prune_jobs::reconcile(
                     ReconcileScope::new(path.clone(), &options()),
@@ -340,8 +345,20 @@ pub(super) fn run(mut spec: Spec, services: &Services<'_>, job: &Arc<Job>) -> an
             };
             match reconciled {
                 Ok(()) => {
+                    // Indexing below selects from the whole library, not this walk, so the
+                    // snapshot is current now. A cancelled indexing stage must not force the
+                    // next scan to walk again. An unsuccessful capture erases any old snapshot,
+                    // which would otherwise hide changes made since it was taken.
+                    if full || next_snapshot.is_some() {
+                        catalog.replace_directory_snapshot(
+                            library.id,
+                            path,
+                            &scope_key,
+                            next_snapshot.as_deref().unwrap_or(&[]),
+                        )?;
+                    }
                     job.finish_folder(index, FolderState::Scanned, None);
-                    complete.push((index, full, next_snapshot, scope_key));
+                    complete.push((index, full));
                 }
                 Err(error) if super::jobs::is_cancelled(&error) => {
                     job.finish_folder(index, FolderState::Cancelled, None);
@@ -361,6 +378,16 @@ pub(super) fn run(mut spec: Spec, services: &Services<'_>, job: &Arc<Job>) -> an
                 }
             }
         } else {
+            // Some entries could not be read. Nothing is removed by a full walk, because an
+            // unreadable file is not evidence that it was deleted. The snapshot is still saved
+            // (it marks unreadable directories for another look), so a folder with one bad
+            // corner does not walk in full every time. A debug-limited walk skipped files the
+            // snapshot would claim were seen, so it saves nothing.
+            if spec.debug_limit.is_none()
+                && let Some(snapshot) = &next_snapshot
+            {
+                catalog.replace_directory_snapshot(library.id, path, &scope_key, snapshot)?;
+            }
             let message = if spec.debug_limit.is_some() {
                 "stopped at the debug limit, or some files or folders could not be read"
             } else {
@@ -376,17 +403,25 @@ pub(super) fn run(mut spec: Spec, services: &Services<'_>, job: &Arc<Job>) -> an
                 )?;
             }
         }
-        scanned.extend(assets);
     }
     job.leave_folder();
 
+    // Index everything the library still needs, not only what this walk touched: a quick check
+    // skips unchanged directories, and earlier indexing may have been cancelled or run with
+    // another model.
     let scope = library.scope();
+    let indexable = if library.options.image || library.options.ocr {
+        catalog.in_scope(&scope)?
+    } else {
+        Vec::new()
+    };
+    job.check_cancelled()?;
     if library.options.image {
         embed_images(
             &spec,
             &scope,
             library.options.videos,
-            &scanned,
+            &indexable,
             services,
             job,
         )?;
@@ -395,7 +430,7 @@ pub(super) fn run(mut spec: Spec, services: &Services<'_>, job: &Arc<Job>) -> an
         recognize_text(
             &mut ocr_request,
             &catalog,
-            &scanned,
+            &indexable,
             &options(),
             services,
             job,
@@ -403,23 +438,10 @@ pub(super) fn run(mut spec: Spec, services: &Services<'_>, job: &Arc<Job>) -> an
         embed_text(&spec, &scope, services, job)?;
     }
 
-    // Folders count as scanned only once every enabled index has caught up with them.
-    let completed_ns = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| {
-            i64::try_from(elapsed.as_nanos()).unwrap_or(i64::MAX)
-        });
-    for (index, full, snapshot, scope_key) in complete {
-        // An unsuccessful capture must erase any old snapshot; otherwise this new full-scan
-        // clock could make a stale snapshot look current on the next automatic request.
-        if full || snapshot.is_some() {
-            catalog.replace_directory_snapshot(
-                library.id,
-                &folders[index].folder.path,
-                &scope_key,
-                snapshot.as_deref().unwrap_or(&[]),
-            )?;
-        }
+    // Folders count as scanned only once every enabled index has caught up with them. Both
+    // paths record the time; it is shown as "Last scanned" and schedules nothing.
+    let completed_ns = now_ns();
+    for (index, full) in complete {
         for folder in folders[index].folders() {
             if full {
                 catalog.complete_folder_scan(
@@ -429,7 +451,12 @@ pub(super) fn run(mut spec: Spec, services: &Services<'_>, job: &Arc<Job>) -> an
                     completed_ns,
                 )?;
             } else {
-                catalog.complete_folder_check(library.id, &folder.path, folder.scan_request)?;
+                catalog.complete_folder_check(
+                    library.id,
+                    &folder.path,
+                    folder.scan_request,
+                    completed_ns,
+                )?;
             }
         }
         job.finish_folder(index, FolderState::Completed, None);
@@ -520,16 +547,6 @@ fn now_ns() -> i64 {
         })
 }
 
-fn full_scan_due<'a>(folders: impl Iterator<Item = &'a IncludedFolder>, now_ns: i64) -> bool {
-    folders.into_iter().any(|folder| {
-        folder.scan_pending
-            || folder.scan_outcome.is_some()
-            || folder.last_scan_completed_ns.is_none_or(|last| {
-                last <= 0 || now_ns.saturating_sub(last) >= FULL_SCAN_INTERVAL.as_nanos() as i64
-            })
-    })
-}
-
 fn directory_mtime(path: &camino::Utf8Path) -> anyhow::Result<i64> {
     let modified = fs::metadata(path)?.modified()?.duration_since(UNIX_EPOCH)?;
     Ok(i64::try_from(modified.as_nanos())?)
@@ -548,37 +565,70 @@ fn excluded_directory(path: &camino::Utf8Path, options: &IndexOptions) -> bool {
         })
 }
 
-/// Capture directory mtimes before cataloging. A failed or unsupported walk leaves no trusted
-/// snapshot; the next automatic request then takes the full path again.
+/// Recorded for a directory that could not be read. No real mtime equals it, so every quick check
+/// lists that directory again instead of trusting it.
+const UNKNOWN_MTIME: i64 = i64::MIN;
+
+/// Capture the mtime of every directory under `root`, root included. A directory's mtime changes
+/// when an entry directly inside it is added, removed, or renamed, but not when a file is edited
+/// in place or when something changes deeper down; that is why every directory is recorded
+/// rather than only the root.
+///
+/// A linked directory (symlink or junction) acts like a folder: it is recorded at its own path,
+/// as the catalog records its files, with its target's mtime. A directory that cannot be read is
+/// recorded with `UNKNOWN_MTIME`, so an unreadable corner does not cost the whole folder its
+/// snapshot. Only a failed walk leaves no snapshot; the next automatic request then takes the
+/// full path again.
 fn snapshot_directories(
     root: &camino::Utf8Path,
     options: &IndexOptions,
     job: &Job,
 ) -> anyhow::Result<Vec<DirectorySnapshot>> {
-    let mut directories = Vec::new();
+    let mut directories = Vec::<DirectorySnapshot>::new();
+    let mut unreadable = Vec::<PathBuf>::new();
     for entry in WalkDir::new(root)
         .follow_links(true)
         .into_iter()
         .filter_entry(|entry| {
-            entry
-                .path()
-                .to_str()
-                .is_some_and(|path| !excluded_directory(camino::Utf8Path::new(path), options))
+            let Some(path) = entry.path().to_str().map(camino::Utf8Path::new) else {
+                return false;
+            };
+            // A link into an excluded folder is skipped, as the catalog walk skips it.
+            !excluded_directory(path, options)
+                && !(entry.path_is_symlink()
+                    && canonicalize_path(path)
+                        .is_ok_and(|target| excluded_directory(&target, options)))
         })
     {
         job.check_cancelled()?;
-        let entry = entry?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            // A link back to an ancestor; that directory is already recorded.
+            Err(error) if error.loop_ancestor().is_some() => continue,
+            Err(error) => {
+                let path = error
+                    .path()
+                    .context("unreadable entry without a path")?
+                    .to_owned();
+                unreadable.push(PathBuf::try_from(path)?);
+                continue;
+            }
+        };
         if entry.file_type().is_dir() {
             let path = PathBuf::try_from(entry.path().to_owned())?;
-            // A linked directory can be retargeted without changing its parent mtime. Full
-            // scanning it remains safe until a link-aware snapshot is available.
-            if entry.path_is_symlink() {
-                anyhow::bail!("linked directory has no stable snapshot");
-            }
             directories.push(DirectorySnapshot {
                 modified_ns: directory_mtime(&path)?,
                 path,
             });
+        }
+    }
+    // An unreadable directory is its own entry; an unreadable file marks the directory it is in.
+    for path in unreadable {
+        tracing::debug!(path = %path, "directory snapshot marks unreadable entry for another look");
+        if let Some(snapshot) = directories.iter_mut().rev().find(|snapshot| {
+            snapshot.path == path || Some(snapshot.path.as_path()) == path.parent()
+        }) {
+            snapshot.modified_ns = UNKNOWN_MTIME;
         }
     }
     directories.sort_by(|a, b| a.path.cmp(&b.path));
@@ -589,6 +639,8 @@ fn snapshot_directories(
     Ok(directories)
 }
 
+/// Catalog one directory's own files without descending; its subdirectories are checked
+/// separately by their own snapshot entries.
 fn shallow_options(options: &IndexOptions) -> IndexOptions {
     IndexOptions {
         limit: options.limit,
@@ -602,7 +654,10 @@ fn shallow_options(options: &IndexOptions) -> IndexOptions {
 }
 
 /// Stat known directories, list only changed ones, and scan new child subtrees. Deletions are
-/// reconciled only after every required listing and catalog operation completed successfully.
+/// reconciled only for directories whose listing and catalog completed; a directory that could
+/// not be read is reported, kept as `UNKNOWN_MTIME`, and looked at again next time.
+///
+/// Returns the assets it cataloged, a summary, and the snapshot to save.
 #[tracing::instrument(level = "trace", skip(catalog, previous, options, job, services), fields(folder = %root, known_directories = previous.len()))]
 fn quick_catalog(
     catalog: &AssetCatalog,
@@ -612,6 +667,9 @@ fn quick_catalog(
     job: &Job,
     services: &Services<'_>,
 ) -> anyhow::Result<(Vec<Asset>, index::CatalogSummary, Vec<DirectorySnapshot>)> {
+    // `known` is the snapshot as loaded; `next` becomes the snapshot to save. `candidates` are
+    // cataloged assets that may have been deleted; `reconcile` checks each against the disk
+    // before removing anything.
     let known: HashMap<_, _> = previous
         .iter()
         .map(|entry| (entry.path.clone(), entry.modified_ns))
@@ -627,6 +685,8 @@ fn quick_catalog(
 
     for entry in previous {
         job.check_cancelled()?;
+        // `previous` is sorted, so a removed directory is seen before its children, and its
+        // `under_root` candidates already cover them.
         if missing
             .iter()
             .any(|parent| PathScope::root(parent).contains(&entry.path))
@@ -646,7 +706,10 @@ fn quick_catalog(
                 continue;
             }
             Err(error) => {
-                return Err(error).with_context(|| format!("checking directory {}", entry.path));
+                report_unreadable(job, &entry.path, &error);
+                complete = false;
+                set_mtime(&mut next, &entry.path, UNKNOWN_MTIME);
+                continue;
             }
         };
         tracing::trace!(
@@ -661,38 +724,44 @@ fn quick_catalog(
             continue;
         }
         changed_count += 1;
-        let children = fs::read_dir(&entry.path)
-            .with_context(|| format!("listing changed directory {}", entry.path))?;
-        for child in children {
-            job.check_cancelled()?;
-            let child = child?;
-            let path = PathBuf::try_from(child.path())?;
-            if excluded_directory(&path, options) {
+        // A changed directory is listed for new subdirectories (cataloged below as whole
+        // subtrees) and re-cataloged one level deep for its own files.
+        let children = match new_child_directories(&entry.path, &known, options, job) {
+            Ok(children) => children,
+            Err(error) if super::jobs::is_cancelled(&error) => return Err(error),
+            Err(error) => {
+                report_unreadable(job, &entry.path, &error);
+                complete = false;
+                set_mtime(&mut next, &entry.path, UNKNOWN_MTIME);
                 continue;
             }
-            let metadata = child.metadata()?;
-            if metadata.is_dir() && !known.contains_key(&path) {
-                tracing::trace!(directory = %path, parent = %entry.path, "found new directory subtree");
-                new_subtrees.insert(path);
-            }
-        }
+        };
+        new_subtrees.extend(children);
         let (found, summary) =
             index::catalog_snapshot(catalog, &entry.path, shallow_options(options), job)?;
         tracing::trace!(directory = %entry.path, assets = found.len(), scan_complete = summary.scan_complete, "cataloged changed directory");
         complete &= summary.scan_complete;
-        let seen: HashSet<_> = found.iter().map(|asset| &asset.path).collect();
-        candidates.extend(
-            catalog
-                .under_root(&entry.path)?
-                .into_iter()
-                .filter(|asset| {
-                    asset.path.parent() == Some(entry.path.as_path()) && !seen.contains(&asset.path)
-                }),
-        );
-        scanned.extend(found);
-        if let Some(stored) = next.iter_mut().find(|stored| stored.path == entry.path) {
-            stored.modified_ns = current;
+        if summary.scan_complete {
+            // Files cataloged directly in this directory but not found now were removed or
+            // renamed away. Deeper files belong to their own directory's entry.
+            let seen: HashSet<_> = found.iter().map(|asset| &asset.path).collect();
+            candidates.extend(
+                catalog
+                    .under_root(&entry.path)?
+                    .into_iter()
+                    .filter(|asset| {
+                        asset.path.parent() == Some(entry.path.as_path())
+                            && !seen.contains(&asset.path)
+                    }),
+            );
         }
+        scanned.extend(found);
+        let recorded = if summary.scan_complete {
+            current
+        } else {
+            UNKNOWN_MTIME
+        };
+        set_mtime(&mut next, &entry.path, recorded);
     }
     next.retain(|entry| {
         !missing
@@ -703,6 +772,8 @@ fn quick_catalog(
     new_subtrees.sort();
     for path in new_subtrees {
         job.check_cancelled()?;
+        // Skip a path already recorded, or one inside a subtree added earlier in this loop:
+        // sorting puts parents first, and a parent's walk already covered it.
         if next.iter().any(|entry| entry.path == path)
             || next.iter().any(|entry| {
                 !known.contains_key(&entry.path) && PathScope::root(&entry.path).contains(&path)
@@ -715,17 +786,23 @@ fn quick_catalog(
             index::catalog_snapshot(catalog, &path, shallow_options_recursive(options), job)?;
         tracing::trace!(directory = %path, directories = snapshot.len(), assets = found.len(), scan_complete = summary.scan_complete, "cataloged new directory subtree");
         complete &= summary.scan_complete;
-        let seen: HashSet<_> = found.iter().map(|asset| &asset.path).collect();
-        candidates.extend(
-            catalog
-                .under_root(&path)?
-                .into_iter()
-                .filter(|asset| !seen.contains(&asset.path)),
-        );
+        if summary.scan_complete {
+            // A directory renamed into place can still have catalog rows under its new path
+            // from before; any that are gone are candidates too.
+            let seen: HashSet<_> = found.iter().map(|asset| &asset.path).collect();
+            candidates.extend(
+                catalog
+                    .under_root(&path)?
+                    .into_iter()
+                    .filter(|asset| !seen.contains(&asset.path)),
+            );
+        }
         next.extend(snapshot);
         scanned.extend(found);
     }
-    if complete && !job.is_cancelled() {
+    // Candidates only come from directories that were read completely; an unreadable one
+    // proves nothing about deletions and contributed none.
+    if !job.is_cancelled() {
         candidates.sort_by_key(|asset| asset.asset_id);
         candidates.dedup_by_key(|asset| asset.asset_id);
         tracing::trace!(
@@ -761,6 +838,56 @@ fn quick_catalog(
     ))
 }
 
+/// The subdirectories of a changed directory that the snapshot does not know yet. A link to a
+/// directory counts as one, at its own path.
+fn new_child_directories(
+    directory: &camino::Utf8Path,
+    known: &HashMap<PathBuf, i64>,
+    options: &IndexOptions,
+    job: &Job,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let mut found = Vec::new();
+    for child in fs::read_dir(directory)? {
+        job.check_cancelled()?;
+        let child = child?;
+        let path = PathBuf::try_from(child.path())?;
+        if excluded_directory(&path, options) {
+            continue;
+        }
+        let is_directory = if child.file_type()?.is_symlink() {
+            // A broken link, a link to a file, or a link into an excluded folder is not a
+            // directory to walk.
+            fs::metadata(&path).is_ok_and(|metadata| metadata.is_dir())
+                && !canonicalize_path(&path)
+                    .is_ok_and(|target| excluded_directory(&target, options))
+        } else {
+            child.metadata()?.is_dir()
+        };
+        if is_directory && !known.contains_key(&path) {
+            tracing::trace!(directory = %path, parent = %directory, "found new directory subtree");
+            found.push(path);
+        }
+    }
+    Ok(found)
+}
+
+fn set_mtime(snapshot: &mut [DirectorySnapshot], path: &camino::Utf8Path, modified_ns: i64) {
+    if let Some(stored) = snapshot.iter_mut().find(|stored| stored.path == path) {
+        stored.modified_ns = modified_ns;
+    }
+}
+
+/// Report a directory the quick check could not read as a job error, like the catalog walk does
+/// for its own unreadable entries.
+fn report_unreadable(job: &Job, directory: &camino::Utf8Path, error: &anyhow::Error) {
+    let message = format!("checking directory failed: {error:#}");
+    tracing::warn!(directory = %directory, "{message}");
+    job.on_event(IndexEvent::Error {
+        path: Some(directory.to_owned()),
+        message,
+    });
+}
+
 fn shallow_options_recursive(options: &IndexOptions) -> IndexOptions {
     let mut copied = shallow_options(options);
     copied.subdirs = true;
@@ -771,7 +898,7 @@ fn embed_images(
     spec: &Spec,
     scope: &PathScope,
     index_videos: bool,
-    scanned: &[Asset],
+    assets: &[Asset],
     services: &Services<'_>,
     job: &Arc<Job>,
 ) -> anyhow::Result<()> {
@@ -785,7 +912,7 @@ fn embed_images(
         &image_spec,
         services.databases,
         services.image_embedder.dimensions(),
-        Some(scanned),
+        Some(assets),
     )? {
         return Ok(());
     }
@@ -801,20 +928,20 @@ fn embed_images(
         services.thumbnails,
         model.as_ref(),
         job.as_ref(),
-        Some(scanned),
+        Some(assets),
     )
 }
 
 fn recognize_text(
     ocr_request: &mut Option<ocr_models::job::Spec>,
     catalog: &AssetCatalog,
-    scanned: &[Asset],
+    assets: &[Asset],
     options: &IndexOptions,
     services: &Services<'_>,
     job: &Arc<Job>,
 ) -> anyhow::Result<()> {
     let mut ocr = DB::new(&services.databases.ocr)?;
-    let selection = index::select_ocr_sources(catalog, &ocr, scanned, options, job.as_ref())?;
+    let selection = index::select_ocr_sources(catalog, &ocr, assets, options, job.as_ref())?;
     job.check_cancelled()?;
     if selection.is_empty() {
         return Ok(());
@@ -1018,19 +1145,6 @@ mod tests {
     }
 
     #[test]
-    fn full_scans_are_due_on_a_rolling_24_hour_clock() {
-        let interval = FULL_SCAN_INTERVAL.as_nanos() as i64;
-        let now = interval * 10;
-        let mut current = folder("/current", false);
-        current.last_scan_completed_ns = Some(now - interval + 1);
-        assert!(!full_scan_due(std::iter::once(&current), now));
-        current.last_scan_completed_ns = Some(now - interval);
-        assert!(full_scan_due(std::iter::once(&current), now));
-        current.last_scan_completed_ns = None;
-        assert!(full_scan_due(std::iter::once(&current), now));
-    }
-
-    #[test]
     fn directory_mtime_detects_new_entries_without_changing_untouched_parent() {
         let temp = tempfile::tempdir().unwrap();
         let root = PathBuf::try_from(temp.path().to_owned()).unwrap();
@@ -1043,7 +1157,7 @@ mod tests {
         assert_eq!(directory_mtime(&root).unwrap(), root_snapshot);
         assert_eq!(directory_mtime(&child).unwrap(), child_snapshot);
 
-        std::thread::sleep(Duration::from_millis(1100));
+        std::thread::sleep(std::time::Duration::from_millis(1100));
         fs::write(child.join("new.jpg"), b"image").unwrap();
         // Adding an entry changes its containing directory, but not the parent directory.
         assert_ne!(directory_mtime(&child).unwrap(), child_snapshot);

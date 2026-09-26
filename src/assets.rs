@@ -285,7 +285,6 @@ fn natural_file_cmp(left: &[u8], right: &[u8]) -> Ordering {
 
 #[derive(Debug, Default)]
 pub(crate) struct CatalogUpsertTimings {
-    pub canonicalize: Duration,
     pub fingerprint: Duration,
     pub lookup: Duration,
     pub probe: Duration,
@@ -303,7 +302,6 @@ pub(crate) struct CatalogUpsertTimings {
 impl CatalogUpsertTimings {
     pub fn record(&self, span: &tracing::Span) {
         for (name, duration) in [
-            ("canonicalize_us", self.canonicalize),
             ("fingerprint_us", self.fingerprint),
             ("lookup_us", self.lookup),
             ("probe_us", self.probe),
@@ -324,7 +322,6 @@ impl CatalogUpsertTimings {
     }
 
     pub fn accumulate(&mut self, timings: Self) {
-        self.canonicalize += timings.canonicalize;
         self.fingerprint += timings.fingerprint;
         self.lookup += timings.lookup;
         self.probe += timings.probe;
@@ -561,14 +558,16 @@ impl AssetCatalog {
 
     /// Avoid scheduling a probe for a video whose catalog metadata is already current.
     pub(crate) fn video_needs_probe(&self, path: &Path, metadata: &fs::Metadata) -> Result<bool> {
-        let path = canonicalize_path(path)?;
         let fingerprint = SourceFingerprint::from_metadata(metadata)?;
-        Ok(!self.get_by_path(&path)?.is_some_and(|existing| {
+        Ok(!self.get_by_path(path)?.is_some_and(|existing| {
             existing.fingerprint == fingerprint
                 && existing.metadata_version == metadata_version_for(existing.media_kind)
         }))
     }
 
+    /// `path` is stored as spelled. The catalog walk builds it from a library's canonical root
+    /// and the names it lists, so a linked folder's files keep the link's path and the link acts
+    /// like a folder. A file reachable through two paths is two assets.
     pub(crate) fn prepare_upsert_timed_with_probe(
         &self,
         path: &Path,
@@ -582,9 +581,7 @@ impl AssetCatalog {
             bail!("unsupported media format: {path}");
         }
         let mut timings = CatalogUpsertTimings::default();
-        let started = Instant::now();
-        let path = canonicalize_path(path)?;
-        timings.canonicalize = started.elapsed();
+        let path = path.to_owned();
 
         let started = Instant::now();
         let fingerprint = SourceFingerprint::from_metadata(metadata)?;
@@ -1938,25 +1935,6 @@ mod tests {
         assert_eq!(first.width, None);
         assert!(!first.is_animated);
         assert_eq!(catalog.get(first.asset_id)?, Some(first));
-        Ok(())
-    }
-
-    #[test]
-    fn canonical_path_aliases_share_an_asset_id() -> Result<()> {
-        let temp = TempDir::new()?;
-        let source = PathBuf::try_from(temp.path().join("broken.png"))?;
-        File::create(&source)?;
-        let alias_parent = PathBuf::try_from(temp.path().join("alias"))?;
-        std::fs::create_dir(&alias_parent)?;
-        let source_alias = alias_parent.join("..").join("broken.png");
-        let catalog_path = PathBuf::try_from(temp.path().join("assets.db"))?;
-        let catalog = AssetCatalog::new(&catalog_path)?;
-
-        let direct = catalog.upsert(&source, &fs::metadata(&source)?)?;
-        let through_alias = catalog.upsert(&source_alias, &fs::metadata(&source_alias)?)?;
-
-        assert_eq!(direct.asset_id, through_alias.asset_id);
-        assert_eq!(direct.path, through_alias.path);
         Ok(())
     }
 

@@ -120,19 +120,29 @@ async fn find_by_path(
         return Err(ApiError::bad_request("asset path must be absolute"));
     }
     let response = run_blocking(move || {
-        // A path that is simply gone is a lookup miss, not a failure to resolve it.
-        let path = canonicalize_path(&request.path).map_err(|error| {
-            if is_not_found(&error) {
-                ApiError::asset_not_found()
-            } else {
-                ApiError::internal(error)
-            }
-        })?;
         let catalog = state.databases.open_assets_read_only()?;
-        let asset = catalog
-            .get_by_path(&path)
+        // The catalog keeps the path its walk listed, including through a linked folder, so try
+        // that spelling first. Otherwise resolve case, separators, and links.
+        let asset = match catalog
+            .get_by_path(&request.path)
             .context("looking up asset by path")?
-            .ok_or_else(ApiError::asset_not_found)?;
+        {
+            Some(asset) => asset,
+            None => {
+                // A path that is simply gone is a lookup miss, not a failure to resolve it.
+                let path = canonicalize_path(&request.path).map_err(|error| {
+                    if is_not_found(&error) {
+                        ApiError::asset_not_found()
+                    } else {
+                        ApiError::internal(error)
+                    }
+                })?;
+                catalog
+                    .get_by_path(&path)
+                    .context("looking up asset by path")?
+                    .ok_or_else(ApiError::asset_not_found)?
+            }
+        };
         let states = state
             .databases
             .open_ocr_read_only()?

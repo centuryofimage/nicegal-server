@@ -348,7 +348,9 @@ impl ImageIndexDb {
             return Ok(0);
         }
         let tx = self.conn.transaction()?;
-        let ids = std::iter::repeat_n("?", asset_ids.len()).collect::<Vec<_>>().join(",");
+        let ids = std::iter::repeat_n("?", asset_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
         let deleted = tx.execute(
             &format!("DELETE FROM image_embeddings WHERE embedding_id IN (SELECT embedding_id FROM image_embedding_samples WHERE asset_id IN ({ids}))"),
             params_from_iter(asset_ids),

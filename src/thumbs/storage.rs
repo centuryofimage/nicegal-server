@@ -534,7 +534,9 @@ impl ThumbnailDb {
             return Ok(0);
         }
         let transaction = self.conn.unchecked_transaction()?;
-        let ids = std::iter::repeat_n("?", asset_ids.len()).collect::<Vec<_>>().join(",");
+        let ids = std::iter::repeat_n("?", asset_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
         let mut deleted = transaction.execute(
             &format!("DELETE FROM thumbnails WHERE asset_id IN ({ids})"),
             params_from_iter(asset_ids),

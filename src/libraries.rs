@@ -398,13 +398,20 @@ impl AssetCatalog {
         Ok(())
     }
 
-    /// A successful quick check clears the outstanding request but preserves the full-scan clock.
-    pub fn complete_folder_check(&self, id: i64, path: &Path, scan_request: i64) -> Result<()> {
+    /// Record that a quick directory check of an included folder finished completely. It also
+    /// counts as the folder's last scan: nothing schedules full walks by this clock.
+    pub fn complete_folder_check(
+        &self,
+        id: i64,
+        path: &Path,
+        scan_request: i64,
+        completed_ns: i64,
+    ) -> Result<()> {
         self.conn.execute(
             "UPDATE library_folders SET scan_completed = max(scan_completed, ?3),
-             scan_outcome = NULL, scan_error = NULL
+             scan_outcome = NULL, scan_error = NULL, last_scan_completed_ns = ?4
              WHERE library_id = ?1 AND path = ?2 AND excluded = 0",
-            (id, path.as_str(), scan_request),
+            (id, path.as_str(), scan_request, completed_ns),
         )?;
         Ok(())
     }

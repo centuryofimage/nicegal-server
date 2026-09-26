@@ -485,9 +485,12 @@ fn decode_sources(
             Err(PreparationError::Decode(error)) => DecodeOutcome::Failure {
                 asset: asset.clone(),
                 message: format!("decoding image for embedding failed: {error:#}"),
-                // Video timeouts and codec limitations must remain retryable, and must
-                // never poison the shared still-image/OCR decode-failure cache.
-                cache_decode_failure: asset.media_kind == MediaKind::Image,
+                // A file that cannot be decoded, including a video that hit its time limit, is
+                // skipped until it changes or a scan retries failures; otherwise every scan would
+                // decode it again. A decode stopped by cancellation never reaches this record
+                // (see `stopping`). OCR reads only still images, so a recorded video failure
+                // never hides one from it.
+                cache_decode_failure: true,
             },
             Err(PreparationError::Preprocess(error)) => DecodeOutcome::Failure {
                 asset: asset.clone(),
@@ -876,6 +879,45 @@ mod tests {
             db.coverage(&SearchFilters::under(Path::new("C:/empty")))?,
             (0, 0)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn broken_videos_are_skipped_once_recorded_until_failures_are_retried() -> Result<()> {
+        let temp = TempDir::new()?;
+        let root = PathBuf::from("C:/gallery");
+        let database = catalog_with_rows(&temp, &[(1, root.join("broken.mov"), 10, None, 100)])?;
+        Connection::open(&database)?.execute(
+            "UPDATE assets SET media_kind = 'video', media_format = 'mov' WHERE asset_id = 1",
+            [],
+        )?;
+        let catalog = AssetCatalog::new(&database)?;
+        let assets = catalog.under_root(&root)?;
+        let images = ImageIndexDb::new(&PathBuf::try_from(temp.path().join("images.db"))?, 2)?;
+        let options = |retry_failed| ImageIndexOptions {
+            index_videos: true,
+            retry_failed,
+            ..ImageIndexOptions::default()
+        };
+        assert!(has_pending_catalog_images(
+            &catalog,
+            &images,
+            &assets,
+            &options(false)
+        )?);
+        catalog.record_decode_failure(&assets[0])?;
+        assert!(!has_pending_catalog_images(
+            &catalog,
+            &images,
+            &assets,
+            &options(false)
+        )?);
+        assert!(has_pending_catalog_images(
+            &catalog,
+            &images,
+            &assets,
+            &options(true)
+        )?);
         Ok(())
     }
 

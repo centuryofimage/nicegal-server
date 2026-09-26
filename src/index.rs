@@ -183,14 +183,16 @@ pub fn catalog_dir_with_step(
     Ok(summary)
 }
 
-/// Discover new, changed, and missing catalog paths without probing unchanged media.
+/// Discover new, changed, and missing catalog paths without probing unchanged media. `path` is
+/// used as spelled, like `catalog_snapshot`'s.
 pub fn catalog_delta_dir_observed(
     assets: &AssetCatalog,
     path: &Path,
     options: IndexOptions,
     observer: &dyn IndexObserver,
 ) -> Result<CatalogDelta> {
-    let root = canonicalize_path(path).context("canonicalizing catalog path")?;
+    anyhow::ensure!(path.is_absolute(), "catalog path must be absolute: {path}");
+    let root = path.to_owned();
     let pipeline = CatalogPipeline {
         assets,
         options: &options,
@@ -211,7 +213,8 @@ pub fn catalog_delta_dir_observed(
 }
 
 /// Scan and catalog a directory, returning every asset the walk visited in scan order. Unchanged
-/// assets keep their rows; only new or changed files are probed.
+/// assets keep their rows; only new or changed files are probed. `path` is used as spelled and
+/// links below it are not resolved, so pass a canonical library root or a path built from one.
 #[instrument(
     name = "catalog_sync",
     skip_all,
@@ -223,7 +226,8 @@ pub fn catalog_snapshot(
     options: IndexOptions,
     observer: &dyn IndexObserver,
 ) -> Result<(Vec<Asset>, CatalogSummary)> {
-    let root = canonicalize_path(path).context("canonicalizing catalog path")?;
+    anyhow::ensure!(path.is_absolute(), "catalog path must be absolute: {path}");
+    let root = path.to_owned();
     let pipeline = CatalogPipeline {
         assets,
         options: &options,
@@ -798,7 +802,6 @@ impl CatalogPipeline<'_> {
             batch_size = CATALOG_COMMIT_CHUNK_SIZE,
             write_batches = field::Empty,
             metadata_us = field::Empty,
-            canonicalize_us = field::Empty,
             fingerprint_us = field::Empty,
             lookup_us = field::Empty,
             probe_us = field::Empty,

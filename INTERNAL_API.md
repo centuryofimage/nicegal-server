@@ -553,7 +553,8 @@ Version 1 routes:
   walk reached its `debugLimit`), `cancelled`, or `failed` (cleanup or any other job failure); null
   when no attempt failed. `scanError` is human-readable detail for it, not meant to be parsed.
   Both clear on the next complete scan, and a new scan request for the folder clears them too.
-  `lastScanCompletedNs` is when a complete full scan last finished, as decimal Unix nanoseconds.
+  `lastScanCompletedNs` is when a complete scan (full or directory check) last finished, as
+  decimal Unix nanoseconds. It is informational and schedules nothing.
   `videos` includes video frames in image indexing; videos are cataloged either way, and turning
   it on while image search is on marks every folder for a scan.
   `ocr`, `image`, and `videos` choose which search indexes `libraryScan` maintains for the library, so a
@@ -1061,12 +1062,20 @@ confirmed-missing files, and then runs the search indexes the library has enable
 }
 ```
 
-Only `libraryId` is required. `scanMode` is `"full"` by default. `"fast"` runs a full scan for
-each included folder whose last full scan is at least 24 hours old, is pending, has a failed
-attempt, or lacks a valid directory snapshot. Other folders stat their known directories and
-enumerate only changed ones. A quick check does not advance `lastScanCompletedNs`. The client
-requests automatic scans at startup and when the rolling full-scan deadline passes; the server
-does not schedule them itself. The library's stored `ocr` and `image` options decide which indexes
+Only `libraryId` is required. `scanMode` is `"full"` by default. `"fast"` stats each included
+folder's known directories and enumerates only changed ones; it walks a folder in full only when
+it lacks a valid directory snapshot (never scanned, or changed
+exclusions) or the request has a `debugLimit`. Nothing schedules full walks on a timer; files edited
+in place are found by an explicit `"full"` scan. Either mode then indexes every asset in the
+library that its enabled indexes still lack, not only the files the walk touched, so a fast scan
+also catches up after a model change or a cancelled scan. The directory snapshot is saved once a
+folder's walk and cleanup succeed, before indexing. The server does not schedule scans itself.
+A linked folder (symlink or junction) acts like a folder: its files are cataloged under the
+link's path, even when the target is outside the library, and a file reachable through two paths
+is two assets. A walk that could not read some entries still saves the snapshot and removes
+nothing; unreadable directories are listed again by every quick check. A file that fails to
+decode, including a video that hits its time limit, is skipped until it changes or a scan passes
+`retryFailed`. The library's stored `ocr` and `image` options decide which indexes
 run (see the library endpoints), so save a changed choice with `PUT /v1/libraries/<id>` before
 scanning. OCR text always gets its text embeddings.
 
@@ -1114,8 +1123,7 @@ of these carries `error`. `discovered`, `cataloged`, and `failed` count that fol
 were already current, as the job-wide counter does. The
 job-wide `phase` and `progress` describe the current step as for every job; the library-wide
 steps after the walks (image embedding, OCR, text embedding) are not attributed to one folder.
-Only `completed` folders clear `scanPending`; completed full scans record `lastScanCompletedNs`,
-while completed automatic directory checks leave it unchanged. Other outcomes record
+Only `completed` folders clear `scanPending` and record `lastScanCompletedNs`. Other outcomes record
 `scanOutcome` and `scanError` on the library and stay pending. A folder edit made while a scan runs stays pending
 after the scan finishes.
 
