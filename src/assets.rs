@@ -18,7 +18,7 @@ use crate::storage::{
     READ_ONLY_FLAGS, bind_named, configure_reader, configure_writer, maintain, validate_asset_ids,
 };
 
-const SCHEMA_VERSION: i32 = 10;
+const SCHEMA_VERSION: i32 = 11;
 const SCHEMA_LABEL: &str = "asset catalog";
 const MIGRATIONS: &[(i32, &str)] = &[
     (
@@ -42,6 +42,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
     (7, include_str!("migrations/assets_7_to_8.sql")),
     (8, include_str!("migrations/assets_8_to_9.sql")),
     (9, include_str!("migrations/assets_9_to_10.sql")),
+    (10, include_str!("migrations/assets_10_to_11.sql")),
 ];
 // Creation time is filesystem metadata, not media-probe output. Keeping this version unchanged
 // lets version-3 catalogs backfill it with a narrow update instead of re-reading every image.
@@ -553,14 +554,26 @@ impl AssetCatalog {
         path: &Path,
         metadata: &fs::Metadata,
     ) -> Result<(PreparedCatalogAsset, CatalogUpsertTimings)> {
-        self.prepare_upsert_timed_with_probe(path, metadata, || {})
+        self.prepare_upsert_timed_with_probe(path, metadata, |path| {
+            crate::video::probe_catalog(path).ok()
+        })
+    }
+
+    /// Avoid scheduling a probe for a video whose catalog metadata is already current.
+    pub(crate) fn video_needs_probe(&self, path: &Path, metadata: &fs::Metadata) -> Result<bool> {
+        let path = canonicalize_path(path)?;
+        let fingerprint = SourceFingerprint::from_metadata(metadata)?;
+        Ok(!self.get_by_path(&path)?.is_some_and(|existing| {
+            existing.fingerprint == fingerprint
+                && existing.metadata_version == metadata_version_for(existing.media_kind)
+        }))
     }
 
     pub(crate) fn prepare_upsert_timed_with_probe(
         &self,
         path: &Path,
         metadata: &fs::Metadata,
-        on_video_probe: impl FnOnce(),
+        video_probe: impl FnOnce(&Path) -> Option<crate::video::VideoMetadata>,
     ) -> Result<(PreparedCatalogAsset, CatalogUpsertTimings)> {
         if !path.is_absolute() {
             bail!("asset path must be absolute: {path}");
@@ -593,11 +606,15 @@ impl AssetCatalog {
         }
         timings.lookup = started.elapsed();
 
-        if is_catalog_video(&path) {
-            on_video_probe();
-        }
         let started = Instant::now();
-        let (probe, probe_timings) = probe_media(&path);
+        let (probe, probe_timings) = probe_media(
+            &path,
+            if is_catalog_video(&path) {
+                Some(video_probe(&path))
+            } else {
+                None
+            },
+        );
         timings.probe = started.elapsed();
         timings.dimensions = probe_timings.dimensions;
         timings.exif = probe_timings.exif;
@@ -1024,15 +1041,17 @@ impl AssetCatalog {
             return Ok(0);
         }
         let tx = self.conn.unchecked_transaction()?;
-        let deleted = {
-            let mut failures =
-                tx.prepare("DELETE FROM decode_failure_state WHERE asset_id = ?1")?;
-            let mut statement = tx.prepare("DELETE FROM assets WHERE asset_id = ?1")?;
-            asset_ids.iter().try_fold(0usize, |deleted, asset_id| {
-                failures.execute([asset_id])?;
-                Ok::<_, rusqlite::Error>(deleted + statement.execute([asset_id])?)
-            })?
-        };
+        let ids = std::iter::repeat_n("?", asset_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        tx.execute(
+            &format!("DELETE FROM decode_failure_state WHERE asset_id IN ({ids})"),
+            params_from_iter(asset_ids),
+        )?;
+        let deleted = tx.execute(
+            &format!("DELETE FROM assets WHERE asset_id IN ({ids})"),
+            params_from_iter(asset_ids),
+        )?;
         if deleted > 0 {
             tx.execute(
                 "UPDATE catalog_meta SET revision = revision + 1 WHERE singleton = 1",
@@ -1102,7 +1121,10 @@ struct MediaProbeTimings {
     animation: Duration,
 }
 
-fn probe_media(path: &Path) -> (MediaProbe, MediaProbeTimings) {
+fn probe_media(
+    path: &Path,
+    video_metadata: Option<Option<crate::video::VideoMetadata>>,
+) -> (MediaProbe, MediaProbeTimings) {
     let mut timings = MediaProbeTimings::default();
     let extension = path.extension().unwrap_or_default().to_ascii_lowercase();
 
@@ -1111,7 +1133,7 @@ fn probe_media(path: &Path) -> (MediaProbe, MediaProbeTimings) {
         let _entered = span.enter();
         let started = Instant::now();
         // The catalog keeps the source even when its container or codec cannot be read.
-        let metadata = crate::video::probe_catalog(path).ok();
+        let metadata = video_metadata.expect("video metadata must be probed before classification");
         timings.dimensions = started.elapsed();
         return (
             MediaProbe {

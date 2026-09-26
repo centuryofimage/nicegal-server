@@ -10,6 +10,7 @@ if defined NICEGAL_FFMPEG_DIR (
     set "FFMPEG_DIR=%USERPROFILE%\vcpkg\packages\ffmpeg_%VCPKGRS_TRIPLET%"
 )
 REM if not defined RUSTFLAGS set "RUSTFLAGS=-C target-feature=+crt-static"
-REM build.rs reads the two provider venvs by default (see build-server.cmd). Set
-REM NICEGAL_DIRECTML_ORT_LIB_PATH, NICEGAL_OPENVINO_ORT_LIB_PATH, or
-REM NICEGAL_OPENVINO_LIB_PATH here only to use a different DLL source directory.
+REM build.rs reads the provider venvs by default (see build-server.cmd). Set
+REM NICEGAL_DIRECTML_ORT_LIB_PATH, NICEGAL_OPENVINO_ORT_LIB_PATH,
+REM NICEGAL_OPENVINO_LIB_PATH, NICEGAL_CUDA_ORT_LIB_PATH, or
+REM NICEGAL_CUDA_LIB_PATH here only to use a different DLL source directory.

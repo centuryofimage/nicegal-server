@@ -38,6 +38,7 @@ pub enum ExecutionProvider {
     Cpu,
     OpenVino,
     Directml,
+    Cuda,
     Webgpu,
     CoreML,
 }
@@ -161,13 +162,18 @@ pub fn initialize_from_dylib(path: &Path) -> Result<()> {
 
 /// Select the bundled ONNX Runtime distribution next to the current executable.
 ///
-/// Either accelerated distribution includes CPU. CPU therefore uses the broadly applicable
-/// DirectML bundle, while OpenVINO selects its own bundle. This must run before any model load.
+/// Every bundled distribution includes CPU. The default Windows build uses DirectML for CPU;
+/// builds with fewer providers use an available distribution. This must run before any model load.
 #[cfg(windows)]
 pub fn initialize_bundled_runtime(execution_provider: ExecutionProvider) -> Result<()> {
     let runtime_distribution = match execution_provider {
         ExecutionProvider::OpenVino => "openvino",
-        ExecutionProvider::Cpu | ExecutionProvider::Directml => "directml",
+        ExecutionProvider::Cuda => "cuda",
+        ExecutionProvider::Directml => "directml",
+        ExecutionProvider::Cpu if cfg!(feature = "ort-directml") => "directml",
+        ExecutionProvider::Cpu if cfg!(feature = "ort-openvino") => "openvino",
+        ExecutionProvider::Cpu if cfg!(feature = "ort-cuda") => "cuda",
+        ExecutionProvider::Cpu => bail!("no bundled Windows ONNX Runtime distribution is enabled"),
         ExecutionProvider::Webgpu => {
             bail!("{execution_provider} is only supported on Linux")
         }
@@ -214,6 +220,7 @@ pub fn initialize_bundled_runtime(execution_provider: ExecutionProvider) -> Resu
         ExecutionProvider::Cpu | ExecutionProvider::OpenVino => "openvino",
         ExecutionProvider::Webgpu => "webgpu",
         ExecutionProvider::Directml => bail!("directml is only supported on Windows"),
+        ExecutionProvider::Cuda => bail!("cuda is only supported on Windows"),
         ExecutionProvider::CoreML => bail!("coreml is only supported on macOS"),
     };
     let executable = std::env::current_exe().context("resolving the executable path")?;
@@ -250,7 +257,10 @@ pub fn initialize_bundled_runtime(execution_provider: ExecutionProvider) -> Resu
 pub fn initialize_bundled_runtime(execution_provider: ExecutionProvider) -> Result<()> {
     match execution_provider {
         ExecutionProvider::CoreML | ExecutionProvider::Cpu => {}
-        ExecutionProvider::OpenVino | ExecutionProvider::Directml | ExecutionProvider::Webgpu => {
+        ExecutionProvider::OpenVino
+        | ExecutionProvider::Directml
+        | ExecutionProvider::Cuda
+        | ExecutionProvider::Webgpu => {
             bail!("{execution_provider} is not supported on macOS")
         }
     }
@@ -317,9 +327,10 @@ pub(crate) fn fallback_chain(
 ) -> &'static [ExecutionProvider] {
     match execution_provider {
         ExecutionProvider::Directml => &[ExecutionProvider::OpenVino, ExecutionProvider::Cpu],
-        ExecutionProvider::OpenVino | ExecutionProvider::Webgpu | ExecutionProvider::Cpu => {
-            &[ExecutionProvider::Cpu]
-        }
+        ExecutionProvider::OpenVino
+        | ExecutionProvider::Cuda
+        | ExecutionProvider::Webgpu
+        | ExecutionProvider::Cpu => &[ExecutionProvider::Cpu],
         ExecutionProvider::CoreML => &[ExecutionProvider::Cpu],
     }
 }
@@ -371,6 +382,11 @@ pub(crate) fn configure_provider(
         ExecutionProvider::Directml => directml_provider(intra_threads),
         #[cfg(not(feature = "ort-directml"))]
         ExecutionProvider::Directml => provider_unavailable(execution_provider, "ort-directml"),
+
+        #[cfg(all(windows, feature = "ort-cuda"))]
+        ExecutionProvider::Cuda => cuda_provider(intra_threads),
+        #[cfg(not(all(windows, feature = "ort-cuda")))]
+        ExecutionProvider::Cuda => provider_unavailable(execution_provider, "ort-cuda"),
 
         #[cfg(feature = "ort-webgpu")]
         ExecutionProvider::Webgpu => Ok(ConfiguredProvider {
@@ -489,6 +505,18 @@ fn directml_provider(intra_threads: NonZeroUsize) -> Result<ConfiguredProvider> 
     })
 }
 
+#[cfg(all(windows, feature = "ort-cuda"))]
+fn cuda_provider(intra_threads: NonZeroUsize) -> Result<ConfiguredProvider> {
+    use ort::ep::CUDA;
+
+    let provider = CUDA::default();
+    ensure_available(&provider, ExecutionProvider::Cuda)?;
+    Ok(ConfiguredProvider {
+        dispatch: provider.build().error_on_failure(),
+        intra_threads,
+    })
+}
+
 #[cfg(feature = "ort-coreml")]
 fn coreml_provider(intra_threads: NonZeroUsize) -> Result<ConfiguredProvider> {
     use ort::ep::CoreML;
@@ -506,6 +534,7 @@ fn coreml_provider(intra_threads: NonZeroUsize) -> Result<ConfiguredProvider> {
     any(
         feature = "ort-openvino",
         feature = "ort-directml",
+        feature = "ort-cuda",
         feature = "ort-coreml"
     ),
     allow(dead_code)
@@ -525,6 +554,7 @@ fn provider_unavailable(
 #[cfg(any(
     feature = "ort-openvino",
     feature = "ort-directml",
+    feature = "ort-cuda",
     feature = "ort-coreml"
 ))]
 fn ensure_available(
@@ -563,6 +593,10 @@ mod tests {
             [ExecutionProvider::Cpu]
         );
         assert_eq!(
+            fallback_chain(ExecutionProvider::Cuda),
+            [ExecutionProvider::Cpu]
+        );
+        assert_eq!(
             fallback_chain(ExecutionProvider::CoreML),
             [ExecutionProvider::Cpu]
         );
@@ -574,6 +608,7 @@ mod tests {
             ("cpu", ExecutionProvider::Cpu),
             ("openvino", ExecutionProvider::OpenVino),
             ("directml", ExecutionProvider::Directml),
+            ("cuda", ExecutionProvider::Cuda),
             ("webgpu", ExecutionProvider::Webgpu),
             ("coreml", ExecutionProvider::CoreML),
         ] {

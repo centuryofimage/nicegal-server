@@ -18,7 +18,7 @@ use nicegal_core::scope::PathScope;
 use super::error::ApiError;
 use super::libraries;
 
-const PRUNE_BATCH_SIZE: usize = 128;
+const PRUNE_BATCH_SIZE: usize = 1024;
 
 /// The precise scan scope, retained across the catalog-first indexing pipeline.
 pub(super) struct ReconcileScope {

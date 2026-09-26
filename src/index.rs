@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{
     Arc,
@@ -15,8 +15,8 @@ use tracing::{Span, debug, error, field, info, instrument};
 use walkdir::WalkDir;
 
 use crate::assets::{
-    Asset, AssetCatalog, CatalogScanEntry, CatalogUpsertTimings, canonicalize_path,
-    is_catalog_media, is_ocr_image,
+    Asset, AssetCatalog, CatalogScanEntry, CatalogUpsertTimings, SourceFingerprint,
+    canonicalize_path, is_catalog_media, is_catalog_video, is_ocr_image,
 };
 use crate::db::{DB, OcrResult};
 use crate::ocr::{PaddleOcrModels, PaddleOcrOptions, PaddleOcrPool};
@@ -24,7 +24,11 @@ use crate::scope::PathScope;
 
 const DEFAULT_COMMIT_CHUNK_SIZE: usize = 32;
 const CATALOG_COMMIT_CHUNK_SIZE: usize = 128;
+const CATALOG_VIDEO_PROBE_WORKERS: usize = 6;
+const CATALOG_VIDEO_PROBE_BACKLOG: usize = 512;
 const MAX_DECODE_WORKERS: usize = 4;
+
+type CatalogVideoProbeResult = (PathBuf, Option<crate::video::VideoMetadata>, Duration);
 
 pub struct IndexOptions {
     pub limit: Option<usize>,
@@ -578,6 +582,87 @@ struct CatalogPipeline<'a> {
     observer: &'a dyn IndexObserver,
 }
 
+fn fill_catalog_video_probes<'scope>(
+    scope: &rayon::Scope<'scope>,
+    observer: &'scope dyn IndexObserver,
+    sender: &Sender<CatalogVideoProbeResult>,
+    candidates: &[PathBuf],
+    next: &mut usize,
+    in_flight: &mut usize,
+    abort: &Arc<AtomicBool>,
+) {
+    while *in_flight < CATALOG_VIDEO_PROBE_BACKLOG && *next < candidates.len() {
+        let path = candidates[*next].clone();
+        *next += 1;
+        *in_flight += 1;
+        let sender = sender.clone();
+        let abort = Arc::clone(abort);
+        scope.spawn(move |_| {
+            let started = Instant::now();
+            let metadata = if observer.is_cancelled() || abort.load(Ordering::Relaxed) {
+                None
+            } else {
+                observer.on_event(IndexEvent::ActiveAsset {
+                    path: path.clone(),
+                    active: true,
+                });
+                let metadata = crate::video::probe_catalog(&path).ok();
+                observer.on_event(IndexEvent::ActiveAsset {
+                    path: path.clone(),
+                    active: false,
+                });
+                metadata
+            };
+            let _ = sender.send((path, metadata, started.elapsed()));
+        });
+    }
+}
+
+fn run_catalog_video_probes(
+    observer: &dyn IndexObserver,
+    candidates: Vec<PathBuf>,
+    output: Sender<CatalogVideoProbeResult>,
+    abort: Arc<AtomicBool>,
+) -> Result<()> {
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    let pool = rayon::ThreadPoolBuilder::new()
+        // The scope coordinator waits on Crossbeam from one Rayon thread.
+        .num_threads(CATALOG_VIDEO_PROBE_WORKERS + 1)
+        .thread_name(|index| format!("catalog-video-probe-{index}"))
+        .build()?;
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    pool.scope(|scope| -> Result<()> {
+        let mut next = 0;
+        let mut in_flight = 0;
+        fill_catalog_video_probes(
+            scope,
+            observer,
+            &sender,
+            &candidates,
+            &mut next,
+            &mut in_flight,
+            &abort,
+        );
+        for _ in 0..candidates.len() {
+            let result = receiver.recv()?;
+            in_flight -= 1;
+            output.send(result)?;
+            fill_catalog_video_probes(
+                scope,
+                observer,
+                &sender,
+                &candidates,
+                &mut next,
+                &mut in_flight,
+                &abort,
+            );
+        }
+        Ok(())
+    })
+}
+
 struct DiscoveredFiles {
     paths: Vec<PathBuf>,
     unseen_paths: Vec<PathBuf>,
@@ -737,106 +822,183 @@ impl CatalogPipeline<'_> {
         let mut upsert_timings = CatalogUpsertTimings::default();
         let mut unchanged = 0usize;
         let mut write_batches = 0usize;
-        for source_paths in files.chunks(CATALOG_COMMIT_CHUNK_SIZE) {
-            let mut prepared = Vec::with_capacity(source_paths.len());
-            for source_path in source_paths {
-                if self.cancelled() {
-                    break;
-                }
-                let started = Instant::now();
-                let metadata = match source_path.metadata() {
-                    Ok(metadata) => {
-                        metadata_time += started.elapsed();
-                        metadata
-                    }
-                    Err(error) => {
-                        metadata_time += started.elapsed();
-                        if error.kind() == std::io::ErrorKind::NotFound {
-                            self.progress(IndexProgressDelta {
-                                phase_completed: 1,
-                                processed: 1,
-                                skipped: 1,
-                                ..IndexProgressDelta::default()
-                            });
-                            continue;
-                        }
-                        complete = false;
-                        self.report_item_error(
-                            Some(source_path.clone()),
-                            format!("reading source metadata failed: {error}"),
-                        );
-                        self.progress(IndexProgressDelta {
-                            phase_completed: 1,
-                            processed: 1,
-                            failed: 1,
-                            ..IndexProgressDelta::default()
-                        });
-                        continue;
-                    }
-                };
-                let mut probing_video = false;
-                let result =
-                    self.assets
-                        .prepare_upsert_timed_with_probe(source_path, &metadata, || {
-                            probing_video = true;
-                            self.observer.on_event(IndexEvent::ActiveAsset {
-                                path: source_path.clone(),
-                                active: true,
-                            });
-                        });
-                if probing_video {
-                    self.observer.on_event(IndexEvent::ActiveAsset {
-                        path: source_path.clone(),
-                        active: false,
-                    });
-                }
-                match result {
-                    Ok((asset, timings)) => {
-                        unchanged += usize::from(timings.unchanged);
-                        upsert_timings.accumulate(timings);
-                        prepared.push(asset);
-                    }
-                    Err(error) => {
-                        if is_missing_source_error(&error) {
-                            report_disappeared_source(self.observer, source_path);
-                            continue;
-                        }
-                        complete = false;
-                        self.report_item_error(
-                            Some(source_path.clone()),
-                            format!("cataloging media failed: {error:#}"),
-                        );
-                        self.progress(IndexProgressDelta {
-                            phase_completed: 1,
-                            processed: 1,
-                            failed: 1,
-                            ..IndexProgressDelta::default()
-                        });
-                    }
-                }
-            }
-            if prepared.is_empty() {
-                if self.cancelled() {
-                    break;
-                }
-                continue;
-            }
-            let (assets, timings) = self
-                .assets
-                .store_prepared_batch(prepared)
-                .context("storing catalog batch")?;
-            write_batches += usize::from(timings.store > Duration::ZERO);
-            upsert_timings.accumulate(timings);
-            self.progress(IndexProgressDelta {
-                phase_completed: assets.len(),
-                cataloged: assets.len(),
-                ..IndexProgressDelta::default()
-            });
-            catalog.extend(assets);
+        // Run slow FFmpeg probes on a small dedicated pool. Catalog writes stay on this thread;
+        // photos can be committed while video metadata is still being read.
+        let (probe_sender, probe_receiver) = crossbeam_channel::unbounded();
+        let abort = Arc::new(AtomicBool::new(false));
+        let mut video_candidates = Vec::new();
+        let mut video_fingerprints = HashMap::new();
+        for source_path in files.iter().filter(|path| is_catalog_video(path)) {
             if self.cancelled() {
                 break;
             }
+            let Ok(metadata) = source_path.metadata() else {
+                continue;
+            };
+            if self.assets.video_needs_probe(source_path, &metadata)? {
+                video_fingerprints.insert(
+                    source_path.clone(),
+                    SourceFingerprint::from_metadata(&metadata)?,
+                );
+                video_candidates.push(source_path.clone());
+            }
         }
+        let candidate_set: HashSet<_> = video_candidates.iter().cloned().collect();
+        let ordered_files: Vec<_> = files
+            .iter()
+            .enumerate()
+            .filter(|(_, path)| !is_catalog_video(path))
+            .chain(
+                files
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, path)| is_catalog_video(path)),
+            )
+            .collect();
+        let observer = self.observer;
+        std::thread::scope(|scope| -> Result<()> {
+            let worker_abort = Arc::clone(&abort);
+            let probe_thread = scope.spawn(move || {
+                run_catalog_video_probes(observer, video_candidates, probe_sender, worker_abort)
+            });
+            let catalog_result = (|| -> Result<()> {
+                let mut video_probes = HashMap::new();
+                for source_paths in ordered_files.chunks(CATALOG_COMMIT_CHUNK_SIZE) {
+                    let mut prepared = Vec::with_capacity(source_paths.len());
+                    for &(position, source_path) in source_paths {
+                        if candidate_set.contains(source_path) {
+                            while !video_probes.contains_key(source_path) {
+                                let (path, metadata, elapsed) = probe_receiver.recv()?;
+                                video_probes.insert(path, (metadata, elapsed));
+                            }
+                        }
+                        if self.cancelled() {
+                            break;
+                        }
+                        let started = Instant::now();
+                        let metadata = match source_path.metadata() {
+                            Ok(metadata) => {
+                                metadata_time += started.elapsed();
+                                metadata
+                            }
+                            Err(error) => {
+                                metadata_time += started.elapsed();
+                                video_probes.remove(source_path);
+                                if error.kind() == std::io::ErrorKind::NotFound {
+                                    self.progress(IndexProgressDelta {
+                                        phase_completed: 1,
+                                        processed: 1,
+                                        skipped: 1,
+                                        ..IndexProgressDelta::default()
+                                    });
+                                    continue;
+                                }
+                                complete = false;
+                                self.report_item_error(
+                                    Some(source_path.clone()),
+                                    format!("reading source metadata failed: {error}"),
+                                );
+                                self.progress(IndexProgressDelta {
+                                    phase_completed: 1,
+                                    processed: 1,
+                                    failed: 1,
+                                    ..IndexProgressDelta::default()
+                                });
+                                continue;
+                            }
+                        };
+                        let preprobed = video_probes.remove(source_path).filter(|_| {
+                            SourceFingerprint::from_metadata(&metadata).ok().as_ref()
+                                == video_fingerprints.get(source_path)
+                        });
+                        let probe_duration = preprobed.as_ref().map(|(_, elapsed)| *elapsed);
+                        let result = self.assets.prepare_upsert_timed_with_probe(
+                            source_path,
+                            &metadata,
+                            |path| match preprobed {
+                                Some((metadata, _)) => metadata,
+                                None => {
+                                    self.observer.on_event(IndexEvent::ActiveAsset {
+                                        path: source_path.clone(),
+                                        active: true,
+                                    });
+                                    let metadata = crate::video::probe_catalog(path).ok();
+                                    self.observer.on_event(IndexEvent::ActiveAsset {
+                                        path: source_path.clone(),
+                                        active: false,
+                                    });
+                                    metadata
+                                }
+                            },
+                        );
+                        match result {
+                            Ok((asset, mut timings)) => {
+                                if let Some(duration) = probe_duration {
+                                    timings.probe += duration;
+                                    timings.dimensions += duration;
+                                }
+                                unchanged += usize::from(timings.unchanged);
+                                upsert_timings.accumulate(timings);
+                                prepared.push((position, asset));
+                            }
+                            Err(error) => {
+                                if is_missing_source_error(&error) {
+                                    report_disappeared_source(self.observer, source_path);
+                                    continue;
+                                }
+                                complete = false;
+                                self.report_item_error(
+                                    Some(source_path.clone()),
+                                    format!("cataloging media failed: {error:#}"),
+                                );
+                                self.progress(IndexProgressDelta {
+                                    phase_completed: 1,
+                                    processed: 1,
+                                    failed: 1,
+                                    ..IndexProgressDelta::default()
+                                });
+                            }
+                        }
+                    }
+                    if prepared.is_empty() {
+                        if self.cancelled() {
+                            break;
+                        }
+                        continue;
+                    }
+                    let positions: Vec<_> =
+                        prepared.iter().map(|(position, _)| *position).collect();
+                    let (assets, timings) = self
+                        .assets
+                        .store_prepared_batch(
+                            prepared.into_iter().map(|(_, asset)| asset).collect(),
+                        )
+                        .context("storing catalog batch")?;
+                    write_batches += usize::from(timings.store > Duration::ZERO);
+                    upsert_timings.accumulate(timings);
+                    self.progress(IndexProgressDelta {
+                        phase_completed: assets.len(),
+                        cataloged: assets.len(),
+                        ..IndexProgressDelta::default()
+                    });
+                    catalog.extend(positions.into_iter().zip(assets));
+                    if self.cancelled() {
+                        break;
+                    }
+                }
+                Ok(())
+            })();
+            if catalog_result.is_err() || self.cancelled() {
+                abort.store(true, Ordering::Relaxed);
+            }
+            let probe_result = probe_thread
+                .join()
+                .map_err(|_| anyhow::anyhow!("catalog video probe coordinator panicked"))?;
+            catalog_result?;
+            probe_result
+        })?;
+        catalog.sort_unstable_by_key(|(position, _)| *position);
+        let catalog: Vec<_> = catalog.into_iter().map(|(_, asset)| asset).collect();
         let span = Span::current();
         span.record("cataloged", catalog.len());
         span.record("unchanged", unchanged);
@@ -1404,6 +1566,53 @@ mod tests {
                 .iter()
                 .all(|event| { !matches!(event, IndexEvent::ActiveAsset { .. }) })
         );
+        Ok(())
+    }
+
+    #[test]
+    fn deferred_video_catalog_preserves_scan_order() -> Result<()> {
+        let temp = TempDir::new()?;
+        let root = canonicalize_path(&PathBuf::try_from(temp.path().to_owned())?)?;
+        let assets = AssetCatalog::new(&root.join("assets.db"))?;
+        let video = root.join("a-video.mp4");
+        let photo = root.join("z-photo.png");
+        std::fs::write(&video, b"video")?;
+        std::fs::write(&photo, b"photo")?;
+
+        let (cataloged, summary) = catalog_snapshot(
+            &assets,
+            &root,
+            IndexOptions::default(),
+            &EventObserver::default(),
+        )?;
+        assert!(summary.scan_complete);
+        assert_eq!(
+            cataloged
+                .iter()
+                .map(|asset| &asset.path)
+                .collect::<Vec<_>>(),
+            [&video, &photo]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn video_probe_backlog_refills_past_512_candidates() -> Result<()> {
+        let temp = TempDir::new()?;
+        let root = PathBuf::try_from(temp.path().to_owned())?;
+        let candidates: Vec<_> = (0..=CATALOG_VIDEO_PROBE_BACKLOG)
+            .map(|index| root.join(format!("missing-{index}.mp4")))
+            .collect();
+        let (sender, receiver) = crossbeam_channel::unbounded();
+
+        run_catalog_video_probes(
+            &EventObserver::default(),
+            candidates.clone(),
+            sender,
+            Arc::new(AtomicBool::new(false)),
+        )?;
+        let completed: HashSet<_> = receiver.iter().map(|(path, _, _)| path).collect();
+        assert_eq!(completed, candidates.into_iter().collect());
         Ok(())
     }
 

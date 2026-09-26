@@ -61,7 +61,8 @@ pub(crate) struct Request {
 }
 
 pub(crate) struct Spec {
-    /// Set for a standalone job; its scope is read from the library when the job runs.
+    /// Set for a standalone job; its scope and video choice are read from the library when the job
+    /// runs.
     library_id: Option<i64>,
     scope: PathScope,
     force: bool,
@@ -97,7 +98,9 @@ impl Spec {
     pub(crate) fn resolve(mut self, databases: &Databases) -> anyhow::Result<Self> {
         if let Some(library_id) = self.library_id {
             let catalog = AssetCatalog::new_read_only(&databases.assets)?;
-            self.scope = super::libraries::stored(&catalog, library_id)?.scope();
+            let library = super::libraries::stored(&catalog, library_id)?;
+            self.scope = library.scope();
+            self.index_videos = library.options.videos;
         }
         Ok(self)
     }
@@ -115,6 +118,7 @@ pub(crate) fn prepare(request: Request) -> Result<Spec, ApiError> {
         force: request.force,
         retry_failed: false,
         debug_limit: request.debug_limit,
+        // Replaced by the library's choice in `resolve`.
         index_videos: true,
     })
 }

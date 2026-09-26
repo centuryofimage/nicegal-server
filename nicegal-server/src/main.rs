@@ -128,7 +128,14 @@ async fn main() -> Result<()> {
     // Create and validate every store once during startup so a schema incompatibility fails
     // before readiness, and so the per-request read-only connections always find a schema.
     drop(DB::new(&ocr_database)?);
-    drop(AssetCatalog::new(&asset_database)?);
+    let catalog = AssetCatalog::new(&asset_database)?;
+    // Video indexing moved from the runtime settings to each library. Copy an older "off" into
+    // the libraries before forgetting it, so a crash between the two steps repeats the copy.
+    if runtime.legacy_index_videos() == Some(false) {
+        catalog.disable_video_indexing()?;
+    }
+    runtime.clear_legacy_index_videos()?;
+    drop(catalog);
 
     // Models are loaded lazily when a job or request first needs them.
     let mut embedder_options = TextEmbedderOptions::default();

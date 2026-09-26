@@ -8,7 +8,7 @@ use crate::storage::{READ_ONLY_FLAGS, configure_reader, maintain, validate_asset
 use anyhow::{Context, Result, bail};
 use camino::{Utf8Path as Path, Utf8PathBuf as PathBuf};
 use rusqlite::types::Value;
-use rusqlite::{Connection, OptionalExtension, Transaction};
+use rusqlite::{Connection, OptionalExtension, Transaction, params_from_iter};
 use std::collections::HashSet;
 use std::ops::Deref;
 use tracing::instrument;
@@ -344,15 +344,23 @@ impl ImageIndexDb {
 
     pub fn delete_assets(&mut self, asset_ids: &[i64]) -> Result<usize> {
         validate_asset_ids(asset_ids)?;
-        let tx = self.conn.transaction()?;
-        let mut deleted = 0;
-        for asset_id in asset_ids {
-            deleted += delete_asset_samples(&tx, *asset_id)?;
-            tx.execute(
-                "DELETE FROM image_embedding_state WHERE asset_id = ?1",
-                [asset_id],
-            )?;
+        if asset_ids.is_empty() {
+            return Ok(0);
         }
+        let tx = self.conn.transaction()?;
+        let ids = std::iter::repeat_n("?", asset_ids.len()).collect::<Vec<_>>().join(",");
+        let deleted = tx.execute(
+            &format!("DELETE FROM image_embeddings WHERE embedding_id IN (SELECT embedding_id FROM image_embedding_samples WHERE asset_id IN ({ids}))"),
+            params_from_iter(asset_ids),
+        )?;
+        tx.execute(
+            &format!("DELETE FROM image_embedding_samples WHERE asset_id IN ({ids})"),
+            params_from_iter(asset_ids),
+        )?;
+        tx.execute(
+            &format!("DELETE FROM image_embedding_state WHERE asset_id IN ({ids})"),
+            params_from_iter(asset_ids),
+        )?;
         tx.commit()?;
         Ok(deleted)
     }

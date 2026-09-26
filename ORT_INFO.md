@@ -3,9 +3,9 @@
 ## Execution providers
 
 - CPU is always available.
-- `ort-directml` (Windows, DirectX 12 GPUs) and `ort-openvino` (Intel CPUs/iGPUs/VPUs) are both
-  compiled into the Windows server.
-- `onnxruntime-directml` and `onnxruntime-openvino` each ship an `onnxruntime.dll` with only that
+- `ort-directml` (Windows, DirectX 12 GPUs) and `ort-openvino` (Intel CPUs/iGPUs/VPUs) are
+  compiled into the default Windows server. `ort-cuda` (Windows, NVIDIA GPUs) is opt in for local builds.
+- `onnxruntime-directml`, `onnxruntime-openvino`, and `onnxruntime-gpu` each ship an `onnxruntime.dll` with only that
   non-CPU provider compiled in. They cannot be merged: the server packages and dynamically loads
   one complete distribution per process. This means `runtime::fallback_chain`'s `directml` →
   `openvino` rung can never actually succeed when the process loaded the `directml` distribution —
@@ -30,13 +30,18 @@
   the native parity tests. FastEmbed's embedding sessions retain their existing
   optimization level.
 
-- `build-server.cmd` creates the `.venv-directml` and `.venv-openvino` environments from their
-  corresponding requirements files, skipping each once installed.
-- `build.rs` copies both distributions to `onnxruntime/directml/` and `onnxruntime/openvino/` next
-  to the executable (and the test executable directory). The OpenVINO directory also contains its
-  plugin and support DLLs. `NICEGAL_DIRECTML_ORT_LIB_PATH`,
-  `NICEGAL_OPENVINO_ORT_LIB_PATH`, and `NICEGAL_OPENVINO_LIB_PATH` override their respective
+- `build-server.cmd` creates the `.venv-directml` and `.venv-openvino` environments when needed
+  and checks their requirements on every build. Set `NICEGAL_ENABLE_CUDA=1` to also install
+  `.venv-cuda` and build with `ort-cuda`; the default and CI builds skip it.
+- `build.rs` copies the distributions to `onnxruntime/directml/`, `onnxruntime/openvino/`, and
+  `onnxruntime/cuda/` when enabled, next to the executable (and the test executable directory). The OpenVINO
+  and CUDA directories also contain their support DLLs. `NICEGAL_DIRECTML_ORT_LIB_PATH`,
+  `NICEGAL_OPENVINO_ORT_LIB_PATH`, `NICEGAL_OPENVINO_LIB_PATH`, `NICEGAL_CUDA_ORT_LIB_PATH`,
+  and `NICEGAL_CUDA_LIB_PATH` override their respective
   source directories.
+  The CUDA copy omits the unused TensorRT provider, cuFFTW, cuRAND, NVBLAS, and alternate NVRTC
+  DLL. It retains cuDNN's dynamically loaded engines and NVRTC/NVJitLink used by cuBLAS/cuFFT.
+  Windows app packages exclude the CUDA directory even when a local opt-in build produced it.
 - The server resolves the selected distribution from `current_exe()` and calls
   `ort::init_from` before FastEmbed or PaddleOCR can create a session. `load-dynamic` then fixes
   that `onnxruntime` library for the process lifetime.

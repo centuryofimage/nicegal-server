@@ -10,7 +10,7 @@ use crate::storage::{
 use crate::{poster, video};
 use anyhow::{Context, Result, bail};
 use camino::Utf8Path as Path;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params_from_iter};
 use tracing::{debug_span, field, trace_span};
 // Keep this in sync with THUMBNAIL_SCHEMA_VERSION in the Electron frontend's
 // src/main/backend/thumbnail-reader.ts; it reads this database directly.
@@ -534,20 +534,15 @@ impl ThumbnailDb {
             return Ok(0);
         }
         let transaction = self.conn.unchecked_transaction()?;
-        let mut deleted = {
-            let mut statement =
-                transaction.prepare("DELETE FROM thumbnails WHERE asset_id = ?1")?;
-            asset_ids.iter().try_fold(0usize, |deleted, asset_id| {
-                statement.execute([asset_id]).map(|count| deleted + count)
-            })?
-        };
-        {
-            let mut statement =
-                transaction.prepare("DELETE FROM video_thumbnails WHERE asset_id = ?1")?;
-            for asset_id in asset_ids {
-                deleted += statement.execute([asset_id])?;
-            }
-        }
+        let ids = std::iter::repeat_n("?", asset_ids.len()).collect::<Vec<_>>().join(",");
+        let mut deleted = transaction.execute(
+            &format!("DELETE FROM thumbnails WHERE asset_id IN ({ids})"),
+            params_from_iter(asset_ids),
+        )?;
+        deleted += transaction.execute(
+            &format!("DELETE FROM video_thumbnails WHERE asset_id IN ({ids})"),
+            params_from_iter(asset_ids),
+        )?;
         transaction
             .commit()
             .context("committing asset thumbnail deletions")?;

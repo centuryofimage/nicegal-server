@@ -43,7 +43,9 @@ CREATE TABLE catalog_meta(
 );
 INSERT INTO catalog_meta(singleton, revision) VALUES (1, 0);
 -- Library definitions. A library owns no assets: its scope is evaluated against assets.path at
--- query time, so these rows are the only thing a folder edit writes.
+-- query time, so these rows are the only thing a folder edit writes. index_videos chooses whether
+-- image indexing includes video frames; videos are cataloged either way. Its odd layout is the
+-- text SQLite stores after assets_10_to_11.sql, so fresh and migrated schemas compare equal.
 CREATE TABLE libraries(
     library_id INTEGER PRIMARY KEY AUTOINCREMENT,
     -- The last scan request number handed to one of this library's folders. Numbers are never
@@ -55,7 +57,7 @@ CREATE TABLE libraries(
     -- Set when a library was created by importing an older client record, so the import can be
     -- repeated without creating duplicates.
     import_key TEXT UNIQUE
-);
+, index_videos INTEGER NOT NULL DEFAULT 1 CHECK(index_videos IN (0, 1)));
 -- Included and excluded folders, in display order. For included folders a scan is outstanding
 -- while scan_requested > scan_completed; a scan records the request number it started from, so a
 -- request made during the scan is not lost when it finishes. scan_outcome is why the latest attempt
@@ -82,5 +84,5 @@ CREATE TABLE library_directory_snapshots(
     scope_key TEXT NOT NULL,
     PRIMARY KEY(library_id, folder_path, path)
 ) WITHOUT ROWID;
-PRAGMA user_version = 10;
+PRAGMA user_version = 11;
 COMMIT;

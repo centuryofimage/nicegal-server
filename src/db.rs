@@ -647,29 +647,23 @@ impl DB {
             }
         }
         let tx = self.conn.transaction()?;
-        let deleted = {
-            let mut statement = tx.prepare("DELETE FROM ocr_results WHERE asset_id = ?1")?;
-            asset_ids.iter().try_fold(0usize, |deleted, asset_id| {
-                statement.execute([asset_id]).map(|count| deleted + count)
-            })?
-        };
+        let ids = std::iter::repeat_n("?", asset_ids.len()).collect::<Vec<_>>().join(",");
+        let deleted = tx.execute(
+            &format!("DELETE FROM ocr_results WHERE asset_id IN ({ids})"),
+            params_from_iter(asset_ids),
+        )?;
         for table in vector_tables {
-            let mut statement = tx.prepare(&format!("DELETE FROM {table} WHERE asset_id = ?1"))?;
-            for asset_id in asset_ids {
-                statement
-                    .execute([asset_id])
-                    .context("deleting asset embeddings")?;
-            }
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE asset_id IN ({ids})"),
+                params_from_iter(asset_ids),
+            )
+            .context("deleting asset embeddings")?;
         }
-        {
-            let mut statement =
-                tx.prepare("DELETE FROM ocr_embedding_state WHERE asset_id = ?1")?;
-            for asset_id in asset_ids {
-                statement
-                    .execute([asset_id])
-                    .context("deleting asset embedding state")?;
-            }
-        }
+        tx.execute(
+            &format!("DELETE FROM ocr_embedding_state WHERE asset_id IN ({ids})"),
+            params_from_iter(asset_ids),
+        )
+        .context("deleting asset embedding state")?;
         tx.commit()?;
         Ok(deleted)
     }

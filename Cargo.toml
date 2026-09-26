@@ -18,6 +18,7 @@ ort-openvino = ["ort/openvino"]
 ort-webgpu = ["ort/webgpu", "fastembed/webgpu"]
 ort-profiling = ["ort/api-25", "fastembed/ort-profiling"]
 ort-directml = ["ort/directml", "fastembed/directml"]
+ort-cuda = ["ort/cuda"]
 ort-coreml = ["ort/coreml"]
 
 [dependencies]

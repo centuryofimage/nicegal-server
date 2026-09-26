@@ -628,6 +628,13 @@ mod tests {
         assert_eq!(body["runtime"]["activeExecutionProvider"], provider);
         assert_eq!(body["runtime"]["activeRuntimeDistribution"], distribution);
         assert_eq!(body["runtime"]["configuredExecutionProvider"], provider);
+        #[cfg(all(windows, feature = "ort-cuda"))]
+        assert!(
+            body["runtime"]["availableExecutionProviders"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("cuda"))
+        );
         assert_eq!(body["runtime"]["restartRequired"], false);
         assert_eq!(body["runtime"]["onnxRuntimeBuildInfo"], "test build");
         assert_eq!(body["ocrModelsLoaded"], false);
@@ -646,9 +653,30 @@ mod tests {
         assert_eq!(body["configuredExecutionProvider"], "cpu");
         assert_eq!(body["restartRequired"], true);
 
+        #[cfg(all(windows, feature = "ort-cuda"))]
+        {
+            let (status, body) = send_json(
+                &router,
+                Method::PUT,
+                "/v1/runtime",
+                r#"{"executionProvider":"cuda"}"#,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["configuredExecutionProvider"], "cuda");
+            assert_eq!(body["restartRequired"], true);
+        }
+
         let (status, body) = send(&router, Method::GET, "/v1/runtime").await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["configuredExecutionProvider"], "cpu");
+        assert_eq!(
+            body["configuredExecutionProvider"],
+            if cfg!(all(windows, feature = "ort-cuda")) {
+                "cuda"
+            } else {
+                "cpu"
+            }
+        );
         assert_eq!(body["restartRequired"], true);
     }
 
@@ -1538,8 +1566,12 @@ mod tests {
         );
         assert_eq!(created["exclude"][0], private.as_str());
         assert_eq!(
-            (created["ocr"].clone(), created["image"].clone()),
-            (false.into(), true.into())
+            (
+                created["ocr"].clone(),
+                created["image"].clone(),
+                created["videos"].clone()
+            ),
+            (false.into(), true.into(), true.into())
         );
         let scans_of = |jobs: &serde_json::Value, library: &serde_json::Value| {
             jobs["jobs"]
@@ -1577,12 +1609,14 @@ mod tests {
         );
 
         let edit = serde_json::json!({
-            "include": [photos, phone], "exclude": [], "ocr": true, "image": true
+            "include": [photos, phone], "exclude": [], "ocr": true, "image": true,
+            "videos": false
         });
         let (status, edited) = send_value(&router, Method::PUT, &uri, edit.clone()).await;
         assert_eq!(status, StatusCode::OK, "{edited}");
         assert_eq!(edited["include"][1]["path"], phone.as_str());
         assert_eq!(edited["exclude"], serde_json::json!([]));
+        assert_eq!(edited["videos"], false);
         // The new folder awaits its first scan; the one that kept its place keeps its state.
         assert_eq!(edited["include"][1]["scanPending"], true);
         assert_eq!(
@@ -1660,7 +1694,7 @@ mod tests {
             &router,
             Method::PUT,
             &uri,
-            serde_json::json!({ "include": [offline], "ocr": false, "image": true }),
+            serde_json::json!({ "include": [offline], "ocr": false, "image": true, "videos": true }),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{edited}");

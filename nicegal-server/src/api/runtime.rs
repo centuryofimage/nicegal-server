@@ -83,7 +83,6 @@ impl RuntimeSettings {
                 .expect("runtime settings mutex poisoned")
                 .clone(),
             configured_execution_provider: configured.execution_provider.to_string(),
-            index_videos: configured.index_videos,
             ocr_models: configured.ocr_models.clone(),
             restart_required: self.active_execution_provider != configured.execution_provider,
             image_model: None,
@@ -178,11 +177,28 @@ impl RuntimeSettings {
             .image_model
     }
 
-    pub(super) fn index_videos(&self) -> bool {
+    /// The retired app-wide video choice, still present in a settings file from an older version.
+    /// The caller copies it into the libraries, then clears it with [`Self::clear_legacy_index_videos`].
+    pub(crate) fn legacy_index_videos(&self) -> Option<bool> {
         self.configured
             .lock()
             .expect("runtime settings mutex poisoned")
-            .index_videos
+            .legacy_index_videos
+    }
+
+    pub(crate) fn clear_legacy_index_videos(&self) -> Result<()> {
+        let mut configured = self
+            .configured
+            .lock()
+            .expect("runtime settings mutex poisoned");
+        if configured.legacy_index_videos.is_none() {
+            return Ok(());
+        }
+        let mut next = configured.clone();
+        next.legacy_index_videos = None;
+        write_settings(&self.path, &RuntimeSettingsFile::from(&next))?;
+        *configured = next;
+        Ok(())
     }
 
     pub(super) fn ocr_models(&self) -> Result<ocr_models::job::Spec> {
@@ -196,12 +212,8 @@ impl RuntimeSettings {
             .map_err(|error| anyhow!("invalid saved OCR models: {error:?}"))
     }
 
-    pub(super) fn save_scan_options(
-        &self,
-        videos: Option<bool>,
-        ocr: Option<&ocr_models::job::Spec>,
-    ) -> Result<()> {
-        self.update_all(None, None, videos, ocr)
+    pub(super) fn save_ocr_models(&self, ocr: &ocr_models::job::Spec) -> Result<()> {
+        self.update_all(None, None, Some(ocr))
     }
 
     /// Publish both selections only after their shared record has been atomically replaced.
@@ -210,14 +222,13 @@ impl RuntimeSettings {
         provider: Option<ExecutionProvider>,
         model: Option<ImageEmbeddingModel>,
     ) -> Result<()> {
-        self.update_all(provider, model, None, None)
+        self.update_all(provider, model, None)
     }
 
     fn update_all(
         &self,
         provider: Option<ExecutionProvider>,
         model: Option<ImageEmbeddingModel>,
-        videos: Option<bool>,
         ocr: Option<&ocr_models::job::Spec>,
     ) -> Result<()> {
         if let Some(provider) = provider {
@@ -240,9 +251,6 @@ impl RuntimeSettings {
         if let Some(model) = model {
             next.image_model = model;
         }
-        if let Some(videos) = videos {
-            next.index_videos = videos;
-        }
         if let Some(ocr) = ocr {
             next.ocr_models = ocr.request();
         }
@@ -260,7 +268,6 @@ pub(super) struct RuntimeStatusResponse {
     active_runtime_distribution: String,
     onnx_runtime_build_info: String,
     configured_execution_provider: String,
-    index_videos: bool,
     ocr_models: ocr_models::job::Request,
     restart_required: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -273,6 +280,7 @@ pub(super) struct RuntimeStatusResponse {
 pub(super) fn runtime_distribution(execution_provider: ExecutionProvider) -> &'static str {
     match execution_provider {
         ExecutionProvider::OpenVino => "openvino",
+        ExecutionProvider::Cuda => "cuda",
         ExecutionProvider::Webgpu => "webgpu",
         ExecutionProvider::CoreML => "coreml",
         ExecutionProvider::Cpu | ExecutionProvider::Directml => {
@@ -283,7 +291,15 @@ pub(super) fn runtime_distribution(execution_provider: ExecutionProvider) -> &'s
                     "openvino"
                 }
             } else if cfg!(windows) {
-                "directml"
+                if cfg!(feature = "ort-directml") {
+                    "directml"
+                } else if cfg!(feature = "ort-openvino") {
+                    "openvino"
+                } else if cfg!(feature = "ort-cuda") {
+                    "cuda"
+                } else {
+                    "cpu"
+                }
             } else if cfg!(target_os = "macos") {
                 "coreml"
             } else {
@@ -309,6 +325,8 @@ fn available_execution_providers() -> &'static [ExecutionProvider] {
     &[
         #[cfg(feature = "ort-directml")]
         ExecutionProvider::Directml,
+        #[cfg(feature = "ort-cuda")]
+        ExecutionProvider::Cuda,
         #[cfg(feature = "ort-openvino")]
         ExecutionProvider::OpenVino,
         ExecutionProvider::Cpu,
@@ -337,7 +355,6 @@ fn default_provider() -> ExecutionProvider {
 struct RuntimeUpdateRequest {
     execution_provider: Option<String>,
     image_model: Option<String>,
-    index_videos: Option<bool>,
     ocr_models: Option<ocr_models::job::Request>,
 }
 
@@ -349,14 +366,11 @@ struct RuntimeSettingsFile {
     working_execution_providers: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     image_model: Option<String>,
-    #[serde(default = "default_true")]
-    index_videos: bool,
+    /// Retired: video indexing is a library option now. Read once to carry an older choice over.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    index_videos: Option<bool>,
     #[serde(default = "default_ocr_models")]
     ocr_models: ocr_models::job::Request,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 fn default_ocr_models() -> ocr_models::job::Request {
@@ -389,7 +403,6 @@ async fn update(
 ) -> Result<(StatusCode, Json<RuntimeStatusResponse>), ApiError> {
     if request.execution_provider.is_none()
         && request.image_model.is_none()
-        && request.index_videos.is_none()
         && request.ocr_models.is_none()
     {
         return Err(ApiError::bad_request("Provide a runtime setting"));
@@ -429,12 +442,7 @@ async fn update(
     }
     let runtime = Arc::clone(&state.runtime);
     tokio::task::spawn_blocking(move || -> Result<()> {
-        runtime.update_all(
-            execution_provider,
-            model,
-            request.index_videos,
-            ocr_models.as_ref(),
-        )
+        runtime.update_all(execution_provider, model, ocr_models.as_ref())
     })
     .await
     .map_err(|error| ApiError::internal(anyhow!("runtime settings task failed: {error}")))?
@@ -447,7 +455,7 @@ struct ConfiguredSettings {
     execution_provider: ExecutionProvider,
     working_execution_providers: Vec<String>,
     image_model: ImageEmbeddingModel,
-    index_videos: bool,
+    legacy_index_videos: Option<bool>,
     ocr_models: ocr_models::job::Request,
 }
 
@@ -457,7 +465,7 @@ impl From<&ConfiguredSettings> for RuntimeSettingsFile {
             execution_provider: settings.execution_provider.to_string(),
             working_execution_providers: settings.working_execution_providers.clone(),
             image_model: Some(settings.image_model.id().to_owned()),
-            index_videos: settings.index_videos,
+            index_videos: settings.legacy_index_videos,
             ocr_models: settings.ocr_models.clone(),
         }
     }
@@ -477,7 +485,7 @@ fn read_settings(path: &PathBuf) -> Result<ConfiguredSettings> {
     let saved = file.as_ref().map(|file| file.execution_provider.as_str());
     let provider =
         match saved {
-            None | Some("cuda" | "migraphx") => None,
+            None | Some("migraphx") => None,
             Some(value) => Some(value.parse::<ExecutionProvider>().with_context(|| {
                 format!("invalid execution provider in runtime settings {path}")
             })?),
@@ -492,7 +500,7 @@ fn read_settings(path: &PathBuf) -> Result<ConfiguredSettings> {
             Some(model) => model.parse()?,
             None => read_legacy_image_model(path)?,
         },
-        index_videos: file.as_ref().is_none_or(|file| file.index_videos),
+        legacy_index_videos: file.as_ref().and_then(|file| file.index_videos),
         ocr_models: file
             .as_ref()
             .map_or_else(default_ocr_models, |file| file.ocr_models.clone()),
@@ -610,11 +618,37 @@ mod tests {
             "recognition": {"modelId": "example/recognizer"}
         }))?;
         let models = ocr_models::job::prepare(request).map_err(|error| anyhow!("{error:?}"))?;
-        settings.save_scan_options(Some(false), Some(&models))?;
+        settings.save_ocr_models(&models)?;
         let restarted = RuntimeSettings::load(path, None)?;
-        assert!(!restarted.index_videos());
         let saved = serde_json::to_value(restarted.ocr_models()?.request())?;
         assert_eq!(saved["detection"]["modelId"], "example/detector");
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_video_choice_is_kept_until_cleared() -> Result<()> {
+        let temp = TempDir::new()?;
+        let path = PathBuf::try_from(temp.path().join("runtime.json"))?;
+        fs::write(
+            &path,
+            serde_json::to_vec(
+                &serde_json::json!({"executionProvider": "cpu", "indexVideos": false}),
+            )?,
+        )?;
+        let settings = RuntimeSettings::load(path.clone(), None)?;
+        assert_eq!(settings.legacy_index_videos(), Some(false));
+        settings.set(ExecutionProvider::Cpu)?;
+        assert_eq!(
+            RuntimeSettings::load(path.clone(), None)?.legacy_index_videos(),
+            Some(false)
+        );
+        settings.clear_legacy_index_videos()?;
+        assert_eq!(
+            RuntimeSettings::load(path.clone(), None)?.legacy_index_videos(),
+            None
+        );
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(path)?)?;
+        assert!(saved.get("indexVideos").is_none());
         Ok(())
     }
 

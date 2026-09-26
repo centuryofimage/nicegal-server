@@ -48,8 +48,6 @@ pub(crate) struct Request {
     /// The OCR pair to recognize with. Loaded only when the scan finds images that need text
     /// recognition and a different pair (or none) is loaded.
     ocr_models: Option<ocr_models::job::Request>,
-    /// Include video frames in image search indexing. Videos are cataloged either way.
-    index_videos: Option<bool>,
     /// Scan only the folders a library edit marked pending.
     #[serde(default)]
     pending_only: bool,
@@ -77,7 +75,6 @@ struct MaxDimensions {
 pub(crate) struct Spec {
     library_id: i64,
     ocr_models: Option<ocr_models::job::Spec>,
-    index_videos: Option<bool>,
     pending_only: bool,
     scan_mode: ScanMode,
     force: bool,
@@ -109,7 +106,6 @@ pub(crate) fn prepare(request: Request) -> Result<Spec, ApiError> {
             .ocr_models
             .map(ocr_models::job::prepare)
             .transpose()?,
-        index_videos: request.index_videos,
         pending_only: request.pending_only,
         scan_mode: request.scan_mode,
         force: request.force,
@@ -131,9 +127,6 @@ impl Spec {
         }
         self.force |= other.force;
         self.retry_failed |= other.retry_failed;
-        if other.index_videos.is_some() {
-            self.index_videos = other.index_videos;
-        }
         if other.ocr_models.is_some() {
             self.ocr_models = other.ocr_models.clone();
         }
@@ -146,12 +139,9 @@ impl Spec {
     }
 
     pub(crate) fn apply_settings(&mut self, runtime: &RuntimeSettings) -> anyhow::Result<()> {
-        if self.index_videos.is_some() || self.ocr_models.is_some() {
-            runtime.save_scan_options(self.index_videos, self.ocr_models.as_ref())?;
-        }
-        self.index_videos = Some(self.index_videos.unwrap_or_else(|| runtime.index_videos()));
-        if self.ocr_models.is_none() {
-            self.ocr_models = Some(runtime.ocr_models()?);
+        match &self.ocr_models {
+            Some(models) => runtime.save_ocr_models(models)?,
+            None => self.ocr_models = Some(runtime.ocr_models()?),
         }
         Ok(())
     }
@@ -209,6 +199,10 @@ pub(super) fn run(mut spec: Spec, services: &Services<'_>, job: &Arc<Job>) -> an
         text: library.options.ocr,
     });
     let folders = scan_folders(&library, spec.pending_only);
+    anyhow::ensure!(
+        spec.pending_only || library.include.is_empty() || !folders.is_empty(),
+        "scan selected no folders from a library with included folders"
+    );
     tracing::debug!(walks = folders.len(), "selected scan folders");
     job.set_scan_requests(
         folders
@@ -388,7 +382,14 @@ pub(super) fn run(mut spec: Spec, services: &Services<'_>, job: &Arc<Job>) -> an
 
     let scope = library.scope();
     if library.options.image {
-        embed_images(&spec, &scope, &scanned, services, job)?;
+        embed_images(
+            &spec,
+            &scope,
+            library.options.videos,
+            &scanned,
+            services,
+            job,
+        )?;
     }
     if library.options.ocr {
         recognize_text(
@@ -453,9 +454,9 @@ fn scan_folders(library: &Library, pending_only: bool) -> Vec<ScanFolder<'_>> {
     let outer = selected
         .iter()
         .filter(|folder| {
-            !selected
-                .iter()
-                .any(|other| PathScope::root(&other.path).contains(&folder.path))
+            !selected.iter().any(|other| {
+                other.path != folder.path && PathScope::root(&other.path).contains(&folder.path)
+            })
         })
         .copied()
         .collect::<Vec<_>>();
@@ -465,7 +466,9 @@ fn scan_folders(library: &Library, pending_only: bool) -> Vec<ScanFolder<'_>> {
             folder,
             covered: selected
                 .iter()
-                .filter(|other| PathScope::root(&folder.path).contains(&other.path))
+                .filter(|other| {
+                    other.path != folder.path && PathScope::root(&folder.path).contains(&other.path)
+                })
                 .copied()
                 .collect(),
         })
@@ -767,6 +770,7 @@ fn shallow_options_recursive(options: &IndexOptions) -> IndexOptions {
 fn embed_images(
     spec: &Spec,
     scope: &PathScope,
+    index_videos: bool,
     scanned: &[Asset],
     services: &Services<'_>,
     job: &Arc<Job>,
@@ -775,7 +779,7 @@ fn embed_images(
         scope.clone(),
         spec.retry_failed,
         spec.debug_limit,
-        spec.index_videos.unwrap_or(true),
+        index_videos,
     );
     if !image_embeddings::has_pending(
         &image_spec,
@@ -936,12 +940,29 @@ mod tests {
     }
 
     #[test]
+    fn filesystem_root_is_not_treated_as_its_own_child() {
+        let library = Library {
+            id: 1,
+            include: vec![folder("/", true), folder("/nested", true)],
+            exclude: Vec::new(),
+            options: LibraryOptions::default(),
+        };
+        assert_eq!(
+            walks(&library, false),
+            [("/".to_owned(), vec!["/nested".to_owned()])]
+        );
+        assert_eq!(
+            walks(&library, true),
+            [("/".to_owned(), vec!["/nested".to_owned()])]
+        );
+    }
+
+    #[test]
     fn requests_need_a_library_and_reject_bad_limits() {
         let parse = |value: serde_json::Value| serde_json::from_value::<Request>(value);
         assert!(parse(serde_json::json!({})).is_err());
         assert!(parse(serde_json::json!({"libraryId": 1, "root": "/a"})).is_err());
         let spec = prepare(parse(serde_json::json!({"libraryId": 1})).unwrap()).unwrap();
-        assert_eq!(spec.index_videos, None);
         assert_eq!(spec.scan_mode, ScanMode::Full);
         assert_eq!(
             prepare(parse(serde_json::json!({"libraryId": 1, "scanMode": "fast"})).unwrap())

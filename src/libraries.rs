@@ -18,6 +18,8 @@ use crate::scope::PathScope;
 pub struct LibraryOptions {
     pub ocr: bool,
     pub image: bool,
+    /// Include video frames in image indexing. Videos are cataloged either way.
+    pub videos: bool,
 }
 
 impl Default for LibraryOptions {
@@ -26,6 +28,7 @@ impl Default for LibraryOptions {
         Self {
             ocr: false,
             image: true,
+            videos: true,
         }
     }
 }
@@ -296,9 +299,14 @@ impl AssetCatalog {
             return Ok(Created::Existing(existing));
         }
         tx.execute(
-            "INSERT INTO libraries(scan_sequence, index_ocr, index_image, import_key)
-             VALUES (0, ?1, ?2, ?3)",
-            (definition.options.ocr, definition.options.image, import_key),
+            "INSERT INTO libraries(scan_sequence, index_ocr, index_image, index_videos, import_key)
+             VALUES (0, ?1, ?2, ?3, ?4)",
+            (
+                definition.options.ocr,
+                definition.options.image,
+                definition.options.videos,
+                import_key,
+            ),
         )?;
         let id = tx.last_insert_rowid();
         write_folders(&tx, id, definition, &[])?;
@@ -326,8 +334,10 @@ impl AssetCatalog {
             return Ok(Some(current));
         }
 
+        let image_indexes_videos = |options: LibraryOptions| options.image && options.videos;
         let enabled = (definition.options.ocr && !current.options.ocr)
-            || (definition.options.image && !current.options.image);
+            || (definition.options.image && !current.options.image)
+            || (image_indexes_videos(definition.options) && !image_indexes_videos(current.options));
         let revealed = current
             .exclude
             .iter()
@@ -346,13 +356,26 @@ impl AssetCatalog {
             .collect::<Vec<_>>();
 
         tx.execute(
-            "UPDATE libraries SET index_ocr = ?2, index_image = ?3 WHERE library_id = ?1",
-            (id, definition.options.ocr, definition.options.image),
+            "UPDATE libraries SET index_ocr = ?2, index_image = ?3, index_videos = ?4
+             WHERE library_id = ?1",
+            (
+                id,
+                definition.options.ocr,
+                definition.options.image,
+                definition.options.videos,
+            ),
         )?;
         write_folders(&tx, id, definition, &rescan)?;
         let library = read_library(&tx, id)?.context("updated library disappeared")?;
         tx.commit()?;
         Ok(Some(library))
+    }
+
+    /// Stop indexing video frames in every library. Carries over the retired app-wide setting.
+    pub fn disable_video_indexing(&self) -> Result<()> {
+        self.conn
+            .execute("UPDATE libraries SET index_videos = 0", [])?;
+        Ok(())
     }
 
     /// Record that a scan of an included folder finished completely. `scan_request` is the
@@ -586,10 +609,16 @@ fn write_folders(
 }
 
 fn read_library(conn: &rusqlite::Connection, id: i64) -> Result<Option<Library>> {
-    let Some((ocr, image)) = conn
-        .prepare_cached("SELECT index_ocr, index_image FROM libraries WHERE library_id = ?1")?
+    let Some(options) = conn
+        .prepare_cached(
+            "SELECT index_ocr, index_image, index_videos FROM libraries WHERE library_id = ?1",
+        )?
         .query_row([id], |row| {
-            Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?))
+            Ok(LibraryOptions {
+                ocr: row.get(0)?,
+                image: row.get(1)?,
+                videos: row.get(2)?,
+            })
         })
         .optional()?
     else {
@@ -622,7 +651,7 @@ fn read_library(conn: &rusqlite::Connection, id: i64) -> Result<Option<Library>>
         id,
         include,
         exclude,
-        options: LibraryOptions { ocr, image },
+        options,
     }))
 }
 
@@ -950,6 +979,22 @@ mod tests {
         complete_scans(&catalog, library.id)?;
         options.options.ocr = false;
         assert!(pending(&updated(catalog.update_library(library.id, &options)?)).is_empty());
+
+        // Video frames only need preparing while image search is on.
+        options.options.videos = false;
+        assert!(pending(&updated(catalog.update_library(library.id, &options)?)).is_empty());
+        options.options.image = false;
+        options.options.videos = true;
+        assert!(pending(&updated(catalog.update_library(library.id, &options)?)).is_empty());
+        options.options.image = true;
+        assert_eq!(
+            pending(&updated(catalog.update_library(library.id, &options)?)),
+            ["/a", "/c"]
+        );
+        complete_scans(&catalog, library.id)?;
+
+        catalog.disable_video_indexing()?;
+        assert!(!catalog.library(library.id)?.unwrap().options.videos);
         Ok(())
     }
 }

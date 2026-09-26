@@ -480,7 +480,6 @@ Version 1 routes:
       "activeRuntimeDistribution": "directml",
       "onnxRuntimeBuildInfo": "ORT Build Info: ...",
       "configuredExecutionProvider": "openvino",
-      "indexVideos": true,
       "ocrModels": {
         "detection": { "modelId": "PaddlePaddle/PP-OCRv6_small_det_onnx", "revision": "main", "filename": "inference.onnx", "configFilename": "inference.yml" },
         "recognition": { "modelId": "PaddlePaddle/PP-OCRv6_small_rec_onnx", "revision": "main", "filename": "inference.onnx", "configFilename": "inference.yml" }
@@ -494,15 +493,16 @@ Version 1 routes:
   `activeRuntimeDistribution` identifies the ONNX Runtime DLL set actually loaded for it;
   `onnxRuntimeBuildInfo` is ONNX Runtime's own release/commit/build-flags diagnostic string;
   `configuredExecutionProvider` is the persisted choice for the next launch. They differ after a
-  setting changes and while a command-line provider override is in effect. `indexVideos` and
-  `ocrModels` are the saved defaults every scan uses unless its request supplies them. `ocrModelsLoaded`
+  setting changes and while a command-line provider override is in effect. `ocrModels` is the
+  saved default every scan uses unless its request supplies one. `ocrModelsLoaded`
   avoids a follow-up request when the client only needs to decide whether OCR indexing is available;
   use `GET /v1/ocr/models` for loaded model identities and their actual session provider.
 - `GET /v1/runtime` returns the `runtime` object shown above. `PUT /v1/runtime` accepts
-  `executionProvider`, `imageModel`, `indexVideos`, and `ocrModels` (the pair shape shown under
-  Jobs). Scan options persist in `runtime.json`; explicit scans may also supply them and update
-  the saved choices. The built-in defaults are video indexing enabled and the PaddleOCR v6 small
-  detector/recognizer pair. The frontend can omit both options on ordinary scans.
+  `executionProvider`, `imageModel`, and `ocrModels` (the pair shape shown under Jobs). The OCR pair
+  persists in `runtime.json`; explicit scans may also supply it and update the saved choice. The
+  built-in default is the PaddleOCR v6 small detector/recognizer pair. The frontend can omit it on
+  ordinary scans. Video indexing is a library option (`videos`); an `indexVideos: false` left in
+  an older `runtime.json` is copied into every library at startup and then removed.
   The execution provider selection persists for the next launch.
   Saved selections absent from the current build migrate to its bundled default at startup;
   explicit unsupported selections are rejected. Retired CUDA/MIGraphX settings also migrate.
@@ -542,7 +542,8 @@ Version 1 routes:
     }],
     "exclude": ["D:\\Photos\\Private"],
     "ocr": false,
-    "image": true
+    "image": true,
+    "videos": true
   }
   ```
   Libraries have no stored name; clients derive a label from the folders. `scanPending` means the folder was added or an edit revealed more
@@ -553,11 +554,13 @@ Version 1 routes:
   when no attempt failed. `scanError` is human-readable detail for it, not meant to be parsed.
   Both clear on the next complete scan, and a new scan request for the folder clears them too.
   `lastScanCompletedNs` is when a complete full scan last finished, as decimal Unix nanoseconds.
-  `ocr` and `image` choose which search indexes `libraryScan` maintains for the library, so a
+  `videos` includes video frames in image indexing; videos are cataloged either way, and turning
+  it on while image search is on marks every folder for a scan.
+  `ocr`, `image`, and `videos` choose which search indexes `libraryScan` maintains for the library, so a
   client saves a changed choice here before starting a scan; the scan request has no such
   options.
-  `POST /v1/libraries` accepts `{include, exclude?, ocr?, image?, importKey?}` and returns `201`
-  with the new library. `ocr` defaults to false and `image` to true. Folders are canonicalized and
+  `POST /v1/libraries` accepts `{include, exclude?, ocr?, image?, videos?, importKey?}` and returns
+  `201` with the new library. `ocr` defaults to false, `image` and `videos` to true. Folders are canonicalized and
   must exist, except in a request with `importKey`, which keeps a missing folder so an import can
   preserve a library on a disconnected drive. A missing folder is stored with the platform's
   separators and no trailing separator; its case and links cannot be resolved offline, so the first
@@ -565,7 +568,7 @@ Version 1 routes:
   spelling, keeping its scan state. Repeating a request with the same `importKey` returns the
   existing library with `200` and changes nothing. Creating a library starts no scan; its folders
   are `scanPending` until a client requests one.
-  `PUT /v1/libraries/<id>` accepts `{include, exclude?, ocr, image}`, replaces the definition, and
+  `PUT /v1/libraries/<id>` accepts `{include, exclude?, ocr, image, videos}`, replaces the definition, and
   returns the updated library. Folders the library already has are not re-read, so an offline
   folder stays editable. There is no edit conflict check: the server serves one client, so the
   last write wins. An edit starts no scan; folders it revealed are `scanPending` until a client
@@ -1088,8 +1091,7 @@ as an `ocrModelLoad` request). When omitted, the saved pair is used, including a
 provider fallback. A scan that finds nothing to do loads no
 model at all.
 
-**Options.** `indexVideos` defaults to the saved runtime setting (initially true) and includes video frames in image indexing; videos are
-cataloged either way. `force` re-runs OCR for images that already have current text. `retryFailed`
+**Options.** Whether video frames are indexed comes from the library's `videos` option. `force` re-runs OCR for images that already have current text. `retryFailed`
 retries sources whose earlier decode failed. `maxDimensions` skips OCR for larger images without
 removing earlier text. `debugLimit` caps each folder's walk for development runs; a walk that reaches it with files
 left over is incomplete, and one that finishes under it counts as complete.
@@ -1256,7 +1258,7 @@ models}`. Top-level `restartRequired` covers both the provider and model. Each c
 placed under `NICEGAL_LOCAL_MODELS_DIR`.
 
 `PUT /v1/runtime` accepts `{"imageModel":"facebook/metaclip-2-worldwide-b32"}`
-and returns runtime status. `executionProvider`, `imageModel`, `indexVideos`, and `ocrModels`
+and returns runtime status. `executionProvider`, `imageModel`, and `ocrModels`
 are optional, but at least one must be supplied. Unknown or unavailable image models are rejected,
 as are provider or image-model changes while an indexing job is active. The caller restarts the backend to
 activate the selection. Provider and image-model selections persist together in the runtime

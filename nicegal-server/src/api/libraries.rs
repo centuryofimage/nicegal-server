@@ -57,6 +57,8 @@ struct CreateRequest {
     ocr: Option<bool>,
     #[serde(default)]
     image: Option<bool>,
+    #[serde(default)]
+    videos: Option<bool>,
     /// Makes the request idempotent: a repeat returns the library the first request created.
     /// Import requests may also name folders that are currently unavailable.
     #[serde(default)]
@@ -71,6 +73,7 @@ struct UpdateRequest {
     exclude: Vec<PathBuf>,
     ocr: bool,
     image: bool,
+    videos: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -81,6 +84,7 @@ struct LibraryResponse {
     exclude: Vec<PathBuf>,
     ocr: bool,
     image: bool,
+    videos: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -114,6 +118,7 @@ impl From<Library> for LibraryResponse {
             exclude: library.exclude,
             ocr: library.options.ocr,
             image: library.options.image,
+            videos: library.options.videos,
         }
     }
 }
@@ -160,6 +165,7 @@ async fn create(
             options: LibraryOptions {
                 ocr: request.ocr.unwrap_or(defaults.ocr),
                 image: request.image.unwrap_or(defaults.image),
+                videos: request.videos.unwrap_or(defaults.videos),
             },
         };
         definition
@@ -195,6 +201,7 @@ async fn update(
             options: LibraryOptions {
                 ocr: request.ocr,
                 image: request.image,
+                videos: request.videos,
             },
         };
         definition
