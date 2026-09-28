@@ -2,6 +2,7 @@ pub mod assets;
 pub mod cancellation;
 pub mod db;
 pub mod embedding;
+pub mod file_filter;
 pub mod highlight;
 pub mod hub;
 pub mod image_index;

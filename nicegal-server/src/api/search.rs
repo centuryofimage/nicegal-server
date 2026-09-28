@@ -17,6 +17,7 @@ use nicegal_core::db::{
     DB, SNIPPET_CLOSE, SNIPPET_OPEN, SearchFilters, SearchType, TextEmbeddingSpace,
     TextVectorSearchOptions, TimeRange, query_syntax_message,
 };
+use nicegal_core::file_filter::FileFilter;
 use nicegal_core::highlight::{self, Highlight};
 use nicegal_core::image_index::{ImageIndexDb, ImageVectorSearchOptions};
 use nicegal_core::scope::PathScope;
@@ -261,6 +262,9 @@ struct MultiSearchRequest {
     library_id: i64,
     folder: Option<String>,
     path_contains: Option<String>,
+    /// File terms every query must satisfy, in addition to `pathContains`.
+    #[serde(default)]
+    filters: Vec<FileFilterRequest>,
     queries: Vec<QueryRequest>,
     #[serde(default = "default_limit")]
     limit: usize,
@@ -423,7 +427,7 @@ async fn search(
     let batch = MultiSearchPlan {
         library_id: request.library_id,
         folder: request.folder,
-        path_contains: validate_path_contains(request.path_contains)?,
+        files: file_filters(request.path_contains, Vec::new())?,
         queries: vec![plan],
         fusion: None,
     };
@@ -458,7 +462,7 @@ async fn multi_search(
 struct MultiSearchPlan {
     library_id: i64,
     folder: Option<String>,
-    path_contains: Option<String>,
+    files: Vec<FileFilter>,
     queries: Vec<QueryPlan>,
     fusion: Option<Fusion>,
 }
@@ -549,7 +553,7 @@ fn plan_multi_search(request: MultiSearchRequest) -> Result<MultiSearchPlan, Api
     Ok(MultiSearchPlan {
         library_id: request.library_id,
         folder: request.folder,
-        path_contains: validate_path_contains(request.path_contains)?,
+        files: file_filters(request.path_contains, request.filters)?,
         queries: plans,
         fusion,
     })
@@ -564,7 +568,7 @@ fn execute_search(
     let MultiSearchPlan {
         library_id,
         folder,
-        path_contains,
+        files: file_terms,
         queries: plans,
         fusion,
     } = plan;
@@ -679,7 +683,7 @@ fn execute_search(
                         .expect("a file query opens the catalog first");
                     let filters = SearchFilters::new(scope.clone())
                         .with_time(plan.time)
-                        .with_path_contains(path_contains.as_deref());
+                        .with_files(file_terms.iter().cloned());
                     let (total, matches) =
                         catalog.search_files(&filters, *field, text, plan.limit, &cancellation)?;
                     let mut hits = matches
@@ -707,7 +711,7 @@ fn execute_search(
                         .as_ref()
                         .expect("an image query opens the image snapshot first");
                     let vector = image_vectors.get(plan.key.as_str()).map(Vec::as_slice);
-                    plan.run_image(images, vector, &scope, path_contains.as_deref())?
+                    plan.run_image(images, vector, &scope, &file_terms)?
                 }
                 QueryInput::Ocr(query) => {
                     let vector = ocr_embeddings.get(query.text.as_str()).map(Vec::as_slice);
@@ -717,7 +721,7 @@ fn execute_search(
                             .expect("an OCR query opens the OCR snapshot first"),
                         &scope,
                         vector,
-                        path_contains.as_deref(),
+                        &file_terms,
                     )?
                 }
             };
@@ -872,11 +876,11 @@ impl QueryPlan {
         db: &mut DB,
         scope: &PathScope,
         vector: Option<&[f32]>,
-        path_contains: Option<&str>,
+        files: &[FileFilter],
     ) -> anyhow::Result<(usize, Vec<SearchHit>)> {
         let filters = SearchFilters::new(scope.clone())
             .with_time(self.time)
-            .with_path_contains(path_contains);
+            .with_files(files.iter().cloned());
         let text = query.text.as_str();
         match query.kind {
             OcrQueryKind::Literal(kind) => {
@@ -934,12 +938,12 @@ impl QueryPlan {
         images: &ImageIndexDb,
         vector: Option<&[f32]>,
         scope: &PathScope,
-        path_contains: Option<&str>,
+        files: &[FileFilter],
     ) -> anyhow::Result<(usize, Vec<SearchHit>)> {
         let vector = vector.expect("an image query is embedded before it is run");
         let filters = SearchFilters::new(scope.clone())
             .with_time(self.time)
-            .with_path_contains(path_contains);
+            .with_files(files.iter().cloned());
         let options = ImageVectorSearchOptions {
             max_distance: self.max_distance,
         };
@@ -1243,13 +1247,71 @@ fn validate_query(query: &str) -> Result<&str, ApiError> {
     Ok(query)
 }
 
-fn validate_path_contains(path: Option<String>) -> Result<Option<String>, ApiError> {
-    if path.as_ref().is_some_and(|value| value.len() > 4096) {
-        return Err(ApiError::bad_request(
-            "pathContains must be at most 4096 bytes",
-        ));
+/// A file term as the client spells it.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+enum FileFilterRequest {
+    /// Substring of the full path, or a wildcard pattern; see [`nicegal_core::file_filter`].
+    Path {
+        pattern: String,
+        #[serde(default)]
+        exclude: bool,
+    },
+    /// Any of these extensions, without the dot.
+    Ext {
+        extensions: Vec<String>,
+        #[serde(default)]
+        exclude: bool,
+    },
+}
+
+const MAX_FILE_FILTERS: usize = 32;
+const MAX_FILTER_EXTENSIONS: usize = 32;
+
+fn file_filters(
+    path_contains: Option<String>,
+    filters: Vec<FileFilterRequest>,
+) -> Result<Vec<FileFilter>, ApiError> {
+    if filters.len() > MAX_FILE_FILTERS {
+        return Err(ApiError::bad_request(format!(
+            "a search may have at most {MAX_FILE_FILTERS} filters"
+        )));
     }
-    Ok(path)
+    let path_contains = path_contains.map(|pattern| FileFilterRequest::Path {
+        pattern,
+        exclude: false,
+    });
+    path_contains
+        .into_iter()
+        .chain(filters)
+        .map(|filter| match filter {
+            FileFilterRequest::Path { pattern, exclude } => {
+                if pattern.len() > MAX_QUERY_BYTES {
+                    return Err(ApiError::bad_request(format!(
+                        "path filters must be at most {MAX_QUERY_BYTES} bytes"
+                    )));
+                }
+                Ok(FileFilter::path(&pattern, exclude))
+            }
+            FileFilterRequest::Ext {
+                extensions,
+                exclude,
+            } => {
+                if extensions.is_empty()
+                    || extensions.len() > MAX_FILTER_EXTENSIONS
+                    || extensions.iter().any(|extension| extension.len() > 255)
+                {
+                    return Err(ApiError::bad_request(format!(
+                        "an extension filter needs 1 to {MAX_FILTER_EXTENSIONS} extensions"
+                    )));
+                }
+                Ok(FileFilter::extensions(
+                    extensions.iter().map(String::as_str),
+                    exclude,
+                ))
+            }
+        })
+        .collect()
 }
 
 fn validate_limit(name: &str, limit: usize) -> Result<usize, ApiError> {
@@ -1291,10 +1353,14 @@ fn query_input(
                 "query {key}: imageQuery applies only to type=image"
             )));
         }
-        return Ok(QueryInput::File {
-            field,
-            text: validate_query(q.as_deref().unwrap_or_default())?.to_owned(),
-        });
+        // An empty file query lists every file the filters admit.
+        let text = q.unwrap_or_default();
+        if text.len() > MAX_QUERY_BYTES {
+            return Err(ApiError::bad_request(format!(
+                "search query must be at most {MAX_QUERY_BYTES} bytes"
+            )));
+        }
+        return Ok(QueryInput::File { field, text });
     }
     if let Some(kind) = ocr_kind {
         if image_query.is_some() {

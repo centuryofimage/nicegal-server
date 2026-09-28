@@ -7,20 +7,28 @@ use rusqlite::functions::FunctionFlags;
 use rusqlite::types::Value;
 use rusqlite::{Connection, OpenFlags, ToSql};
 
+use crate::file_filter::{PathPattern, extension};
+
 pub(crate) const READ_ONLY_FLAGS: OpenFlags =
     OpenFlags::SQLITE_OPEN_READ_ONLY.union(OpenFlags::SQLITE_OPEN_NO_MUTEX);
 
 pub(crate) fn configure_reader(conn: &Connection) -> Result<()> {
     conn.busy_timeout(Duration::from_secs(5))?;
     conn.create_scalar_function(
-        "nicegal_path_contains",
+        "nicegal_path_matches",
         2,
         FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
         |context| {
             let path: String = context.get(0)?;
-            let needle: String = context.get(1)?;
-            Ok(path.replace('\\', "/").to_lowercase().contains(&needle))
+            let pattern: String = context.get(1)?;
+            Ok(PathPattern::path(&pattern).matches(&path))
         },
+    )?;
+    conn.create_scalar_function(
+        "nicegal_extension",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |context| Ok(extension(&context.get::<String>(0)?)),
     )?;
     Ok(())
 }

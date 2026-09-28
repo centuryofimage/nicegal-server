@@ -645,17 +645,26 @@ Version 1 routes:
   SQLite's own message; see [Errors](#errors).
   OCR-mode `highlights` marks where in `snippet` this query matched; image hits omit it because
   they have no OCR snippet. See [Highlights](#highlights).
-  `type=name` searches the filename, and `type=path` searches the stored full media path, as
-  case-insensitive literal substrings inside the selected library. Both use the catalog's path
-  trigram index for suitable terms and a scoped scan for short or wildcard-character terms.
-  Path separators are normalized; the matched name or path is returned as the snippet.
+  `type=name` searches the filename, and `type=path` searches the stored full media path, inside
+  the selected library. Matching is case-insensitive and treats `\` and `/` alike. Text without
+  `*` or `?` is a substring. With either, it must match the whole target: `*` is any run of
+  characters, including separators, and `?` is one character. A `type=path` wildcard pattern
+  without a separator targets the filename (`IMG_*.jpg`); one with a separator targets the full
+  path (`*\2024\*.png`). Both use the catalog's path trigram index for the pattern's longest
+  literal run when it is at least four ASCII characters, and a scoped scan otherwise. The matched
+  name or path is returned as the snippet. On POST, an empty `q` for these two types returns every
+  file the filters admit.
   Name hits use numeric, case-insensitive ordering for ASCII filenames with asset ID as a stable
   tie-breaker. Non-ASCII names currently use lowercase lexical order, which can differ from the
   renderer's former locale-aware sort.
-  Optional `pathContains=<text>` on GET, or top-level `pathContains` on POST, filters every mode
-  by a case-insensitive literal substring of the full indexed path. It normalizes path separators
-  and applies before each mode's result limit. It can be combined with `folder`, time bounds, and
-  any search type. The path text is capped at 4096 bytes.
+  Optional `pathContains=<pattern>` on GET, or top-level `pathContains` on POST, filters every
+  mode by a `type=path` pattern as described above. POST also takes top-level `filters`, at most
+  32 terms that must all hold:
+  `{"kind":"path","pattern":"Trips"}` and `{"kind":"ext","extensions":["jpg","png"]}`. An
+  extension term matches any listed extension, case-insensitively and without the dot. Either
+  kind takes `"exclude": true` to keep only files it does not match. Filters apply before each
+  mode's result limit and combine with `folder`, time bounds, and any search type. Patterns are
+  capped at 4096 bytes; an extension term needs 1 to 32 extensions.
 - `POST /v1/search` runs several modes and optionally fuses them. OCR modes share one OCR-store
   snapshot; `type=image` reads its independent CLIP index on a separate read-only connection. This
   is the route for a client that searches more than one way at once; see
@@ -856,7 +865,7 @@ rejected.
 
 The existing `q` field remains a backward-compatible positive text component for `type=image`.
 It is optional only when `imageQuery.components` supplies at least one component. OCR `vector`,
-`ocrSimple`, `ocrMatch`, `ocrGlob`, `path`, and `regex` still require `q` and reject `imageQuery`. `GET /v1/search`
+`ocrSimple`, `ocrMatch`, `ocrGlob`, and `regex` still require `q`; they and `name`/`path` reject `imageQuery`. `GET /v1/search`
 does not accept components; use POST for structured composition.
 
 External images are native-picker snapshots sent as standard padded base64 (no data-URL prefix).

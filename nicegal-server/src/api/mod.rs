@@ -607,6 +607,31 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["total"], 1);
         assert_eq!(body["results"][0]["assetId"], asset.asset_id);
+        let filtered = |filters: &str| -> &'static str {
+            format!(
+                r#"{{"libraryId":{FIXTURE_LIBRARY},"filters":{filters},"queries":[{{"type":"path","q":""}}]}}"#
+            )
+            .leak()
+        };
+        for (filters, total) in [
+            (r#"[{"kind":"ext","extensions":["JPG"]}]"#, 2),
+            (r#"[{"kind":"path","pattern":"*-old\\*.jpg"}]"#, 1),
+            (r#"[{"kind":"path","pattern":"-old","exclude":true}]"#, 1),
+            (r#"[{"kind":"ext","extensions":["jpg"],"exclude":true}]"#, 0),
+        ] {
+            let (status, body) =
+                send_json(&router, Method::POST, "/v1/search", filtered(filters)).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["queries"][0]["total"], total, "{filters}");
+        }
+        let (status, _) = send_json(
+            &router,
+            Method::POST,
+            "/v1/search",
+            filtered(r#"[{"kind":"ext","extensions":[]}]"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
         let (status, body) = send(&router, Method::GET, "/v1/models").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["text"]["state"], "notLoaded");

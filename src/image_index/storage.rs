@@ -901,7 +901,9 @@ mod sample_tests {
         assert_eq!(total, 2);
         assert_eq!(hits.len(), 1);
         assert_eq!((hits[0].asset_id, hits[0].timestamp_ms), (1, Some(100)));
-        let filtered = filters.clone().with_path_contains(Some("VIDEO2.MP4"));
+        let filtered = filters
+            .clone()
+            .with_files([crate::file_filter::FileFilter::path("VIDEO2.MP4", false)]);
         let (filtered_total, filtered_hits) = reader.search_vectors(
             &[1.0, 0.0],
             &filtered,

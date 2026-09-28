@@ -10,6 +10,7 @@ use sqlite_vec::sqlite3_vec_init;
 use tracing::{Span, field, info, instrument};
 
 use crate::assets::{SourceFingerprint, Timeline};
+use crate::file_filter::FileFilter;
 use crate::schema::{check_schema_read_only, open_schema_with_migrations};
 use crate::scope::PathScope;
 pub(crate) use crate::storage::bind_named;
@@ -143,8 +144,8 @@ pub struct SearchFilters {
     pub scope: PathScope,
     /// Restrict to a span on one timeline. `None` searches every instant.
     pub time: Option<TimeRange>,
-    /// Case-insensitive substring of the indexed full path.
-    pub path_contains: Option<String>,
+    /// Path and extension terms. Every one must hold.
+    pub files: Vec<FileFilter>,
 }
 
 impl SearchFilters {
@@ -153,7 +154,7 @@ impl SearchFilters {
         Self {
             scope,
             time: None,
-            path_contains: None,
+            files: Vec::new(),
         }
     }
 
@@ -167,10 +168,13 @@ impl SearchFilters {
         self
     }
 
-    pub fn with_path_contains(mut self, path: Option<&str>) -> Self {
-        self.path_contains = path
-            .filter(|value| !value.is_empty())
-            .map(|value| value.replace('\\', "/").to_lowercase());
+    /// Add file terms, dropping any that cannot narrow the result.
+    pub fn with_files(mut self, files: impl IntoIterator<Item = FileFilter>) -> Self {
+        self.files
+            .extend(files.into_iter().filter(|filter| match filter {
+                FileFilter::Path { pattern, .. } => !pattern.is_empty(),
+                FileFilter::Extension { extensions, .. } => !extensions.is_empty(),
+            }));
         self
     }
 
@@ -186,12 +190,35 @@ impl SearchFilters {
         );
         let mut params = scope.params;
 
-        if let Some(needle) = &self.path_contains {
-            sql.push_str(&format!(
-                " AND nicegal_path_contains({}, :path_contains)",
-                rows.path_column
-            ));
-            params.push((":path_contains".to_owned(), Value::Text(needle.clone())));
+        let column = rows.path_column;
+        for (index, filter) in self.files.iter().enumerate() {
+            match filter {
+                FileFilter::Path { pattern, exclude } => {
+                    let name = format!(":file_{index}");
+                    let not = if *exclude { "NOT " } else { "" };
+                    sql.push_str(&format!(" AND {not}nicegal_path_matches({column}, {name})"));
+                    params.push((name, Value::Text(pattern.as_str().to_owned())));
+                }
+                FileFilter::Extension {
+                    extensions,
+                    exclude,
+                } => {
+                    let names = (0..extensions.len())
+                        .map(|item| format!(":file_{index}_{item}"))
+                        .collect::<Vec<_>>();
+                    let not = if *exclude { "NOT " } else { "" };
+                    sql.push_str(&format!(
+                        " AND nicegal_extension({column}) {not}IN ({})",
+                        names.join(", ")
+                    ));
+                    params.extend(
+                        names
+                            .into_iter()
+                            .zip(extensions)
+                            .map(|(name, extension)| (name, Value::Text(extension.clone()))),
+                    );
+                }
+            }
         }
 
         if let Some(time) = self.time {
@@ -242,6 +269,12 @@ impl FilterScope {
     pub(crate) const CATALOG_ROWS: Self = Self {
         table: "catalog.assets",
         path_column: "catalog.assets.path",
+    };
+
+    /// Rows of the asset catalog aliased as `a`, on the catalog's own connection.
+    pub(crate) const FILE_ROWS: Self = Self {
+        table: "a",
+        path_column: "a.path",
     };
 }
 

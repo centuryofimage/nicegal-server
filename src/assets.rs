@@ -10,7 +10,8 @@ use nom_exif::{ExifTag, read_exif};
 use rusqlite::{Connection, OptionalExtension, params_from_iter};
 
 use crate::cancellation::SearchCancellation;
-use crate::db::SearchFilters;
+use crate::db::{FilterScope, SearchFilters};
+use crate::file_filter::PathPattern;
 use crate::imaging::{ExifOrientation, orientation_from_exif};
 use crate::schema::{check_schema_read_only, open_schema_with_migrations};
 use crate::scope::PathScope;
@@ -413,8 +414,10 @@ impl AssetCatalog {
     }
 
     /// Search indexed paths inside the same library scope used by gallery listing. FTS5 narrows
-    /// ordinary ASCII substrings; short, Unicode, and wildcard-character terms use a scoped scan
-    /// so the final literal match never inherits SQLite LIKE's case or wildcard behavior.
+    /// candidates by the pattern's longest ordinary ASCII run; short, Unicode, and
+    /// wildcard-character runs use a scoped scan. The final comparison is always
+    /// [`PathPattern`]'s, so no match inherits SQLite LIKE's case or wildcard behavior. An empty
+    /// query returns every file the filters admit.
     pub fn search_files(
         &self,
         filters: &SearchFilters,
@@ -424,54 +427,21 @@ impl AssetCatalog {
         cancellation: &SearchCancellation,
     ) -> Result<(usize, Vec<FileSearchHit>)> {
         cancellation.check()?;
-        let scope = &filters.scope;
-        let time = filters.time;
-        let path_contains = filters.path_contains.as_deref();
-        let needle = match field {
-            FileSearchField::Name => query.to_owned(),
-            FileSearchField::Path => query.replace('\\', "/"),
-        }
-        .to_lowercase();
-        let indexed = needle.len() >= 4
-            && needle.is_ascii()
-            && !needle.contains(['%', '_'])
-            && !(field == FileSearchField::Name && needle.contains('\\'));
-        let bound = scope.bind("a.path");
+        let pattern = match field {
+            FileSearchField::Name => PathPattern::name(query),
+            FileSearchField::Path => PathPattern::path(query),
+        };
+        let literal = pattern.required_literal();
+        let indexed = literal.len() >= 4 && literal.is_ascii() && !literal.contains(['%', '_']);
+        let bound = filters.bind(FilterScope::FILE_ROWS)?;
         let mut params = bound.params;
-        let mut where_sql = bound.sql;
-        let path_needle = path_contains
-            .filter(|value| !value.is_empty())
-            .map(|value| value.replace('\\', "/").to_lowercase());
-        if let Some(needle) = &path_needle {
-            where_sql.push_str(" AND nicegal_path_contains(a.path, :path_contains)");
-            params.push((
-                ":path_contains".to_owned(),
-                rusqlite::types::Value::Text(needle.clone()),
-            ));
-        }
+        let mut where_sql = format!("1{}", bound.sql);
         if indexed {
             where_sql.push_str(" AND f.path LIKE :path_pattern");
             params.push((
                 ":path_pattern".to_owned(),
-                rusqlite::types::Value::Text(format!("%{needle}%")),
+                rusqlite::types::Value::Text(format!("%{literal}%")),
             ));
-        }
-        if let Some(time) = time {
-            let expression = time.timeline.expression("a");
-            if let Some(after) = time.after_ns {
-                where_sql.push_str(&format!(" AND {expression} >= :path_after"));
-                params.push((
-                    ":path_after".to_owned(),
-                    rusqlite::types::Value::Integer(after),
-                ));
-            }
-            if let Some(before) = time.before_ns {
-                where_sql.push_str(&format!(" AND {expression} < :path_before"));
-                params.push((
-                    ":path_before".to_owned(),
-                    rusqlite::types::Value::Integer(before),
-                ));
-            }
         }
         let from = if indexed {
             "asset_path_fts f JOIN assets a ON a.asset_id = f.rowid"
@@ -491,23 +461,7 @@ impl AssetCatalog {
         for row in rows {
             cancellation.check()?;
             let hit = row?;
-            let text = match field {
-                FileSearchField::Name => hit.path.file_name().unwrap_or(hit.path.as_str()),
-                FileSearchField::Path => hit.path.as_str(),
-            };
-            let text = match field {
-                FileSearchField::Name => text.to_owned(),
-                FileSearchField::Path => text.replace('\\', "/"),
-            };
-            if text.to_lowercase().contains(&needle)
-                && path_needle.as_ref().is_none_or(|path_needle| {
-                    hit.path
-                        .as_str()
-                        .replace('\\', "/")
-                        .to_lowercase()
-                        .contains(path_needle)
-                })
-            {
+            if pattern.matches(hit.path.as_str()) {
                 matches.push(hit);
             }
         }
@@ -1327,6 +1281,7 @@ pub fn is_ocr_image(asset: &Asset) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::file_filter::FileFilter;
     use std::borrow::Cow;
     use std::fs::File;
     use tempfile::TempDir;
@@ -1362,8 +1317,8 @@ mod tests {
             assert_eq!(total, 1, "{term}");
             assert_eq!(hits[0].path, wanted, "{term}");
         }
-        let filters =
-            SearchFilters::new(scope.clone()).with_path_contains(Some("TRIPS 2025\\CAFÉ"));
+        let filters = SearchFilters::new(scope.clone())
+            .with_files([FileFilter::path("TRIPS 2025\\CAFÉ", false)]);
         let (total, hits) =
             catalog.search_files(&filters, FileSearchField::Name, "Café", 1, &cancellation)?;
         assert_eq!(total, 1);
@@ -1401,6 +1356,63 @@ mod tests {
                 .map(|hit| hit.path.file_name().unwrap())
                 .collect::<Vec<_>>(),
             ["photo2.jpg", "photo10.jpg"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn file_search_honors_wildcards_extensions_and_exclusions() -> Result<()> {
+        let temp = TempDir::new()?;
+        let root = PathBuf::try_from(temp.path().to_path_buf())?;
+        let catalog = AssetCatalog::new(&root.join("assets.db"))?;
+        let folder = root.join("2024");
+        fs::create_dir_all(&folder)?;
+        for name in [
+            "IMG_0001.JPG",
+            "IMG_0002.png",
+            "clip.mp4",
+            "IMG_notes.txt.jpg",
+        ] {
+            let path = folder.join(name);
+            fs::write(&path, b"image")?;
+            catalog.upsert(&path, &fs::metadata(&path)?)?;
+        }
+        let cancellation = SearchCancellation::default();
+        let scope = PathScope::root(&root);
+        let names = |filters: SearchFilters, field, query: &str| -> Result<Vec<String>> {
+            let (_, hits) = catalog.search_files(&filters, field, query, 10, &cancellation)?;
+            Ok(hits
+                .into_iter()
+                .map(|hit| hit.path.file_name().unwrap().to_owned())
+                .collect())
+        };
+        let all = || SearchFilters::new(scope.clone());
+        assert_eq!(
+            names(all(), FileSearchField::Name, "img_????.*")?,
+            ["IMG_0001.JPG", "IMG_0002.png"]
+        );
+        assert_eq!(
+            names(all(), FileSearchField::Path, "*\\2024\\*.mp4")?,
+            ["clip.mp4"]
+        );
+        assert_eq!(
+            names(
+                all().with_files([FileFilter::extensions(["jpg"], false)]),
+                FileSearchField::Path,
+                ""
+            )?,
+            ["IMG_0001.JPG", "IMG_notes.txt.jpg"]
+        );
+        assert_eq!(
+            names(
+                all().with_files([
+                    FileFilter::extensions(["mp4"], true),
+                    FileFilter::path("img_*.jpg", true),
+                ]),
+                FileSearchField::Name,
+                "img"
+            )?,
+            ["IMG_0002.png"]
         );
         Ok(())
     }
