@@ -4,11 +4,13 @@ mod error;
 mod extract;
 mod image_embeddings;
 mod image_model;
+mod image_patches;
 mod jobs;
 mod libraries;
 mod library_scan;
 pub(crate) mod models;
 mod ocr_models;
+mod patch_cache;
 mod prune_jobs;
 mod roots;
 mod runtime;
@@ -125,6 +127,7 @@ pub(crate) fn router(state: AppState, authorization: HeaderValue) -> Router {
         .route("/v1/health", get(health))
         .route("/v1/status", get(status))
         .route("/v1/models", models::route())
+        .route("/v1/models/load-cached", models::load_cached_route())
         .route("/v1/runtime", runtime::route())
         .route("/v1/assets", assets::route())
         .merge(catalog::routes())
@@ -137,6 +140,14 @@ pub(crate) fn router(state: AppState, authorization: HeaderValue) -> Router {
         )
         .route("/v1/text-embeddings", text_embeddings::route())
         .route("/v1/image-embeddings", image_embeddings::route())
+        .route(
+            "/v1/image-embeddings/patches",
+            image_patches::route().layer(DefaultBodyLimit::max(48 * 1024 * 1024)),
+        )
+        .route(
+            "/v1/image-embeddings/patch-scores",
+            image_patches::scores_route(),
+        )
         .route(
             "/v1/text-embeddings/generate",
             text_embeddings::generate_route(),

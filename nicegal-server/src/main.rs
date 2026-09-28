@@ -85,7 +85,10 @@ async fn main() -> Result<()> {
     };
     let runtime_config = match args.runtime_config {
         Some(path) => path,
-        None => default_database("runtime.json")?,
+        None => asset_database
+            .parent()
+            .context("asset database path has no parent directory")?
+            .join("runtime.json"),
     };
     let runtime = Arc::new(api::RuntimeSettings::load(
         runtime_config.clone(),

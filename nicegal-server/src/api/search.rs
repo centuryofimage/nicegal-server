@@ -301,7 +301,7 @@ struct QueryRequest {
 /// Components whose normalized vectors are weighted and summed into one image query.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ImageQueryRequest {
+pub(super) struct ImageQueryRequest {
     components: Vec<ImageQueryComponentRequest>,
 }
 
@@ -959,6 +959,27 @@ impl QueryPlan {
             .collect();
         Ok((total, hits))
     }
+}
+
+/// Validate and resolve an `imageQuery` outside a search, with the rules and normalized
+/// combination a `type=image` query uses.
+pub(super) fn resolve_image_query(
+    state: &AppState,
+    request: ImageQueryRequest,
+    cancellation: &SearchCancellation,
+) -> Result<Vec<f32>, ApiError> {
+    let QueryInput::Image(query) = query_input(PlanKind::Image, None, Some(request), "imageQuery")?
+    else {
+        unreachable!("an image plan builds an image query");
+    };
+    let images = state
+        .databases
+        .open_images_read_only(state.image_query_embedder.dimensions())?;
+    images.set_search_cancellation(cancellation)?;
+    let snapshot = images.begin_read_snapshot()?;
+    let mut resolver = ImageQueryResolver::new(&state.image_query_embedder, &snapshot);
+    resolver.image_embedder = Some(&state.image_embedder);
+    resolver.resolve(&query, cancellation)
 }
 
 /// Resolves a request's image-query components without repeating inference or index reads for

@@ -75,22 +75,31 @@ impl FastEmbedBackend {
         )))
     }
 
+    #[tracing::instrument(level = "debug", skip_all, fields(model = %model, cached_only))]
     pub(super) fn load_local_image_query(
         model: ImageEmbeddingModel,
         options: RuntimeOptions,
         cached_only: bool,
         progress: &dyn crate::hub::DownloadObserver,
     ) -> Result<Option<(Self, PathBuf, ExecutionProvider)>> {
-        let Some(path) = model.validated_model_directory(cached_only, progress)? else {
+        let path = {
+            let _span = tracing::debug_span!("image_query_cache_validation").entered();
+            model.validated_model_directory(cached_only, progress)?
+        };
+        let Some(path) = path else {
             return Ok(None);
         };
         let (backend, provider) = runtime::with_fallback(options, |provider| {
+            let _span = tracing::debug_span!("image_query_provider_attempt", %provider).entered();
             let configured = runtime::configure_provider(provider, options.intra_threads)?;
-            let files = fastembed::TokenizerFiles {
-                tokenizer_file: std::fs::read(path.join("tokenizer.json"))?,
-                tokenizer_config_file: std::fs::read(path.join("tokenizer_config.json"))?,
-                special_tokens_map_file: std::fs::read(path.join("special_tokens_map.json"))?,
-                config_file: std::fs::read(path.join("config.json"))?,
+            let files = {
+                let _span = tracing::debug_span!("image_query_tokenizer_files_read").entered();
+                fastembed::TokenizerFiles {
+                    tokenizer_file: std::fs::read(path.join("tokenizer.json"))?,
+                    tokenizer_config_file: std::fs::read(path.join("tokenizer_config.json"))?,
+                    special_tokens_map_file: std::fs::read(path.join("special_tokens_map.json"))?,
+                    config_file: std::fs::read(path.join("config.json"))?,
+                }
             };
             TextEmbedding::try_new_from_path(
                 path.join("text.onnx"),

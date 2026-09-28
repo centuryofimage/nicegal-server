@@ -924,7 +924,7 @@ mod tests {
     }
 
     #[test]
-    fn video_samples_are_exact_and_refresh_the_gallery_poster() -> Result<()> {
+    fn video_samples_from_multiple_models_share_cache_until_source_changes() -> Result<()> {
         let temp = TempDir::new()?;
         let db = test_db(&temp)?;
         let asset = Asset {
@@ -976,11 +976,36 @@ mod tests {
             frame.pixels()[0] < 100,
             "gallery poster must use the first frame"
         );
+        let new_video = Asset {
+            asset_id: 43,
+            ..asset.clone()
+        };
+        db.store_video_samples(&new_video, &[sample(500, 50)])?;
+        assert!(db.get_video_sample(42, 1500, 200, CURRENT)?.is_some());
         db.store_video_samples(&asset, &[sample(700, 100)])?;
-        assert!(db.get_video_sample(42, 1500, 200, CURRENT)?.is_none());
+        // A second model may keep a different subset of frames. Its write must not remove
+        // frames still referenced by the first model's vectors.
+        assert!(db.get_video_sample(42, 1500, 200, CURRENT)?.is_some());
         assert!(db.get_video_sample(42, 700, 200, CURRENT)?.is_some());
-        db.delete_asset(42)?;
+        let changed = Asset {
+            fingerprint: SourceFingerprint {
+                modified_ns: CURRENT.modified_ns + 1,
+                ..CURRENT
+            },
+            ..asset
+        };
+        db.store_video_samples(&changed, &[sample(900, 150)])?;
+        assert!(db.get_video_sample(42, 1500, 200, CURRENT)?.is_none());
         assert!(db.get_video_sample(42, 700, 200, CURRENT)?.is_none());
+        assert!(
+            db.get_video_sample(42, 900, 200, changed.fingerprint)?
+                .is_some()
+        );
+        db.delete_asset(42)?;
+        assert!(
+            db.get_video_sample(42, 900, 200, changed.fingerprint)?
+                .is_none()
+        );
         Ok(())
     }
 

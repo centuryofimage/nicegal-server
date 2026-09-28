@@ -14,7 +14,7 @@ use nicegal_core::embedding::{
 };
 use nicegal_core::runtime::ExecutionProvider;
 use parking_lot::Mutex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::{AppState, RuntimeSettings, error::ApiError};
 
@@ -157,21 +157,27 @@ impl<T, O> LazyModel<T, O> {
         }
     }
 
-    /// Searches may compile cached sessions but never invoke the download-capable loader.
-    pub(super) fn ready_or_cached(&self) -> Result<Arc<T>, ApiError> {
+    /// Compile a cached session when present, without invoking the download-capable loader.
+    fn cached_if_available(&self) -> Result<Option<Arc<T>>, ApiError> {
         if let Some(session) = self.session.get() {
-            return Ok(Arc::clone(session));
+            return Ok(Some(Arc::clone(session)));
         }
         if let Some(loader) = self.cached_loader {
             let configured = self.load_options();
             let options = configured.as_ref().unwrap_or(&self.options);
-            match self.prepare_with(|| loader(options)) {
-                Ok(Some(session)) => return Ok(session),
-                Ok(None) => {}
-                Err(error) => return Err(ApiError::models_not_ready(format!("{error:#}"))),
-            }
+            return self
+                .prepare_with(|| loader(options))
+                .map_err(|error| ApiError::models_not_ready(format!("{error:#}")));
         }
-        self.ready()
+        Ok(None)
+    }
+
+    /// Searches may compile cached sessions but never invoke the download-capable loader.
+    pub(super) fn ready_or_cached(&self) -> Result<Arc<T>, ApiError> {
+        match self.cached_if_available()? {
+            Some(session) => Ok(session),
+            None => self.ready(),
+        }
     }
 
     #[cfg(test)]
@@ -289,6 +295,46 @@ struct StatusResponse {
 
 pub(super) fn route() -> MethodRouter<AppState> {
     get(status)
+}
+
+pub(super) fn load_cached_route() -> MethodRouter<AppState> {
+    axum::routing::post(load_cached)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum CachedModel {
+    ClipText,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LoadCachedRequest {
+    model: CachedModel,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LoadCachedResponse {
+    loaded: bool,
+}
+
+async fn load_cached(
+    State(state): State<AppState>,
+    super::extract::ApiJson(request): super::extract::ApiJson<LoadCachedRequest>,
+) -> Result<Json<LoadCachedResponse>, ApiError> {
+    let loaded = match request.model {
+        CachedModel::ClipText if !state.image_query_embedder.model().supports_text_queries() => {
+            false
+        }
+        CachedModel::ClipText => {
+            super::run_blocking(move || {
+                Ok(state.image_query_embedder.cached_if_available()?.is_some())
+            })
+            .await?
+        }
+    };
+    Ok(Json(LoadCachedResponse { loaded }))
 }
 async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
     Json(StatusResponse {
@@ -444,6 +490,7 @@ mod tests {
                 Ok(0)
             });
         model.cached_loader = Some(|_| Ok(None));
+        assert!(model.cached_if_available().unwrap().is_none());
         assert_eq!(
             model.ready_or_cached().unwrap_err().code.as_str(),
             "models_not_ready"
@@ -451,7 +498,7 @@ mod tests {
         assert_eq!(model.status().state, ModelState::NotLoaded);
         assert_eq!(downloads.load(Ordering::SeqCst), 0);
         model.cached_loader = Some(|_| Ok(Some(42)));
-        let session = model.ready_or_cached().unwrap();
+        let session = model.cached_if_available().unwrap().unwrap();
         assert_eq!(*session, 42);
         assert_eq!(model.status().state, ModelState::Ready);
         assert!(Arc::ptr_eq(&session, &model.ready_or_cached().unwrap()));

@@ -38,6 +38,7 @@ impl ImageModelSettings {
                     url: model.source_url(),
                     available: model.available(),
                     supports_text_queries: model.supports_text_queries(),
+                    patch_features: model.supports_patch_features(),
                 })
                 .collect(),
         }
@@ -62,6 +63,8 @@ struct ModelInfo {
     url: String,
     available: bool,
     supports_text_queries: bool,
+    /// Whether POST /v1/image-embeddings/patches serves this model.
+    patch_features: bool,
 }
 #[cfg(test)]
 mod tests {

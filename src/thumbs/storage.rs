@@ -206,7 +206,9 @@ impl ThumbnailDb {
         Ok(())
     }
 
-    /// Replace all indexed samples for this video and refresh its default gallery poster.
+    /// Merge indexed samples for this source and refresh its default gallery poster.
+    /// Different image models can keep different frames from the same video, while all of them
+    /// share this thumbnail database. Keep their current frames until the source changes.
     /// The first timestamp has every public size bucket; later ones omit the largest.
     pub fn store_video_samples(&self, asset: &Asset, samples: &[video::VideoSample]) -> Result<()> {
         self.store_video_samples_with_output(asset, samples, video::VideoOutputOptions::default())
@@ -245,12 +247,12 @@ impl ThumbnailDb {
         let _writing = write_span.enter();
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
-            "DELETE FROM video_thumbnails WHERE asset_id = ?1",
-            [asset.asset_id],
+            "DELETE FROM video_thumbnails WHERE asset_id = ?1 AND (sampling_version <> ?2 OR source_modified_ns <> ?3 OR source_size <> ?4)",
+            (asset.asset_id, video::SAMPLING_VERSION, asset.fingerprint.modified_ns, source_size),
         )?;
         {
             let mut insert = tx.prepare_cached(
-                "INSERT INTO video_thumbnails (asset_id, timestamp_ms, size_bucket, sampling_version, source_modified_ns, source_size, width, height, encoding, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
+                "INSERT INTO video_thumbnails (asset_id, timestamp_ms, size_bucket, sampling_version, source_modified_ns, source_size, width, height, encoding, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) ON CONFLICT(asset_id, timestamp_ms, size_bucket) DO UPDATE SET sampling_version=excluded.sampling_version, source_modified_ns=excluded.source_modified_ns, source_size=excluded.source_size, width=excluded.width, height=excluded.height, encoding=excluded.encoding, data=excluded.data"
             )?;
             for (timestamp_ms, posters) in &encoded.rows {
                 for (bucket, poster) in posters {

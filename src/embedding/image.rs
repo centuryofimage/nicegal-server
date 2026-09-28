@@ -5,11 +5,13 @@ use anyhow::{Context, Result, bail};
 use fastembed::{ImageEmbedding, ImagePreprocessor};
 use image::{DynamicImage, RgbImage};
 use ndarray::Array3;
-use tracing::{info, instrument};
+use rayon::prelude::*;
+use tracing::{info, instrument, warn};
 
 use crate::runtime::{self, ExecutionProvider, RuntimeOptions};
 
 use super::fastembed::FastEmbedBackend;
+use super::patches::{self, PatchFeatures, PatchMethod};
 
 /// An image embedding model supported by this build.
 ///
@@ -175,6 +177,38 @@ impl ImageEmbeddingModel {
 
     pub const fn is_deepghs(self) -> bool {
         matches!(self, Self::SigLipBetaSwinV2Frozen)
+    }
+
+    /// Whether [`ImageEmbedder::patch_features`] can expose spatial image features.
+    pub const fn supports_patch_features(self) -> bool {
+        self.patch_method().is_some()
+    }
+
+    /// How the image graph gains patch features. SigLIP2's attention-pooling head gives maps too
+    /// weak to be worth showing. DINOv3 exposes its normalized tokens before class pooling.
+    pub(super) const fn patch_method(self) -> Option<PatchMethod> {
+        match self {
+            Self::MetaClip2B32 | Self::MetaClip2B16 | Self::MetaClip2L14 => {
+                Some(PatchMethod::ClearClip)
+            }
+            // `encodings` is the spatial mean of this map and `embeddings` its L2 normalization.
+            Self::SigLipBetaSwinV2Frozen => Some(PatchMethod::FeatureMap(
+                "/siglip_model/norm/LayerNormalization_output_0",
+            )),
+            Self::DinoV3B16 => Some(PatchMethod::DinoTokens("/norm/LayerNormalization_output_0")),
+            Self::SigLip2Base256 => None,
+        }
+    }
+
+    /// The pooled output the image index stores.
+    const fn embedding_output(self) -> &'static str {
+        if self.is_deepghs() {
+            "embeddings"
+        } else if matches!(self, Self::DinoV3B16) {
+            "pooler_output"
+        } else {
+            "image_embeds"
+        }
     }
 
     pub fn source_url(self) -> String {
@@ -394,6 +428,140 @@ pub struct ImageEmbedder {
     model: ImageEmbeddingModel,
     max_batch_size: usize,
     execution_provider: ExecutionProvider,
+    /// Present when the session was built with [`patches::PATCH_OUTPUT`].
+    patch_setup: Option<PatchSetup>,
+}
+
+enum PatchedGraph {
+    Memory(Vec<u8>),
+    /// ONNX external tensor data resolves relative to the graph file, not a memory buffer.
+    File(std::path::PathBuf),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PatchSetup {
+    method: PatchMethod,
+    geometry: InputGeometry,
+}
+
+/// Where the model's square input comes from in a source image, following its preprocessing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputGeometry {
+    /// An exact resize: the whole image, stretched.
+    Stretch,
+    /// FastEmbed's shortest-edge resize, which truncates the long side, then a center crop.
+    ShortestEdge { edge: u32, crop: (u32, u32) },
+    /// DeepGHS: the short side to `size` with the long side capped at `max_size`, then a square
+    /// center crop.
+    DeepGhs { size: u32, max_size: u32, crop: u32 },
+}
+
+impl InputGeometry {
+    /// From a Hugging Face `preprocessor_config.json`.
+    fn from_config(config: &[u8]) -> Result<Self> {
+        let config: serde_json::Value =
+            serde_json::from_slice(config).context("parsing image preprocessor configuration")?;
+        let crop = config["do_center_crop"]
+            .as_bool()
+            .unwrap_or(false)
+            .then(|| match &config["crop_size"] {
+                size if size.is_object() => {
+                    dimension(&size["width"]).zip(dimension(&size["height"]))
+                }
+                size => dimension(size).map(|edge| (edge, edge)),
+            })
+            .flatten();
+        Ok(match (dimension(&config["size"]["shortest_edge"]), crop) {
+            (Some(edge), Some(crop)) => Self::ShortestEdge { edge, crop },
+            _ => Self::Stretch,
+        })
+    }
+
+    /// From a DeepGHS `preprocessor.json` transform description.
+    fn from_deepghs_config(config: &[u8]) -> Result<Self> {
+        let config: serde_json::Value =
+            serde_json::from_slice(config).context("parsing DeepGHS preprocessor configuration")?;
+        let stage = |kind: &str| {
+            config["stages"]
+                .as_array()
+                .and_then(|stages| stages.iter().find(|stage| stage["type"] == kind))
+                .with_context(|| format!("DeepGHS preprocessor has no {kind} stage"))
+        };
+        let (resize, crop) = (stage("resize")?, stage("center_crop")?);
+        let field = |stage: &serde_json::Value, name: &str| {
+            dimension(&stage[name])
+                .with_context(|| format!("DeepGHS preprocessor lacks a numeric {name}"))
+        };
+        Ok(Self::DeepGhs {
+            size: field(resize, "size")?,
+            max_size: field(resize, "max_size")?,
+            crop: field(crop, "size")?,
+        })
+    }
+
+    /// `[x, y, width, height]` of the source, as fractions, that the model input covers. Values
+    /// fall outside 0 to 1 where the center crop pads a short axis.
+    fn region(self, width: u32, height: u32) -> [f64; 4] {
+        let (width, height) = (width.max(1), height.max(1));
+        let (resized, (crop_width, crop_height)) = match self {
+            Self::Stretch => return [0.0, 0.0, 1.0, 1.0],
+            Self::ShortestEdge { edge, crop } => {
+                let (short, long) = (width.min(height), width.max(height));
+                let long = ((f64::from(edge) * f64::from(long)) / f64::from(short)) as u32;
+                let resized = if width <= height {
+                    (edge, long)
+                } else {
+                    (long, edge)
+                };
+                (resized, crop)
+            }
+            Self::DeepGhs {
+                size,
+                max_size,
+                crop,
+            } => {
+                let scale = |value: u32, numerator: u32, denominator: u32| {
+                    (u64::from(value) * u64::from(numerator) / u64::from(denominator)) as u32
+                };
+                let (mut resized_width, mut resized_height) = if width < height {
+                    (size, scale(size, height, width))
+                } else {
+                    (scale(size, width, height), size)
+                };
+                if resized_width.max(resized_height) > max_size {
+                    if resized_height > resized_width {
+                        resized_width = scale(max_size, resized_width, resized_height);
+                        resized_height = max_size;
+                    } else {
+                        resized_height = scale(max_size, resized_height, resized_width);
+                        resized_width = max_size;
+                    }
+                }
+                ((resized_width, resized_height), (crop, crop))
+            }
+        };
+        let (x, w) = crop_axis(resized.0.max(1), crop_width);
+        let (y, h) = crop_axis(resized.1.max(1), crop_height);
+        [x, y, w, h]
+    }
+}
+
+fn dimension(value: &serde_json::Value) -> Option<u32> {
+    value.as_u64().and_then(|v| u32::try_from(v).ok())
+}
+
+/// The start and length, as fractions of `resized`, of a center crop to `crop` pixels. A longer
+/// axis keeps its middle; a shorter one is padded evenly, so the crop starts before the image.
+fn crop_axis(resized: u32, crop: u32) -> (f64, f64) {
+    let start = if resized >= crop {
+        f64::from((resized - crop) / 2)
+    } else {
+        -f64::from((crop - resized) / 2)
+    };
+    (
+        start / f64::from(resized),
+        f64::from(crop) / f64::from(resized),
+    )
 }
 
 impl ImageEmbedder {
@@ -444,11 +612,38 @@ impl ImageEmbedder {
                 false,
             )
         };
+        // Built once, outside provider retries: the graph with its patch output appended.
+        let patched_graph = options.model.patch_method().and_then(|method| {
+            Self::patched_graph(
+                &image,
+                method,
+                options.model == ImageEmbeddingModel::DinoV3B16,
+            )
+        });
         let (backend, execution_provider) = runtime::with_fallback(options.runtime, |provider| {
             let configured = runtime::configure_provider(provider, options.runtime.intra_threads)?;
             let init = fastembed::ImageInitOptionsUserDefined::new()
                 .with_execution_providers(vec![configured.dispatch])
                 .with_intra_threads(configured.intra_threads.get());
+            if let Some(graph) = &patched_graph {
+                let preprocessor = if deepghs {
+                    ImagePreprocessor::from_deepghs_config(&preprocessor_config)
+                } else {
+                    ImagePreprocessor::from_local_config(&preprocessor_config)
+                }
+                .context("preparing image preprocessing")?;
+                let mut builder = ImageEmbedding::session_builder(init)
+                    .context("configuring image ONNX session")?;
+                let session = match graph {
+                    PatchedGraph::Memory(bytes) => builder.commit_from_memory(bytes),
+                    PatchedGraph::File(path) => builder.commit_from_file(path),
+                }
+                .context("loading image ONNX encoder with patch features")?;
+                return Ok(Some(
+                    ImageEmbedding::try_new_from_session(session, preprocessor)
+                        .with_output_key(options.model.embedding_output()),
+                ));
+            }
             let backend = if deepghs {
                 ImageEmbedding::try_new_from_deepghs_path(&image, &preprocessor_config, init)
                     .context("loading DeepGHS image ONNX encoder")?
@@ -465,6 +660,18 @@ impl ImageEmbedder {
         let Some(backend) = backend else {
             return Ok(None);
         };
+        let patch_setup = match (patched_graph.is_some(), options.model.patch_method()) {
+            (true, Some(method)) => Some(PatchSetup {
+                method,
+                geometry: if deepghs {
+                    InputGeometry::from_deepghs_config(&preprocessor_config)?
+                } else {
+                    InputGeometry::from_config(&preprocessor_config)?
+                },
+            }),
+            _ => None,
+        };
+        drop(patched_graph);
         let preprocessor = backend
             .preprocessor()
             .with_resize(|image, width, height, filter| {
@@ -478,6 +685,7 @@ impl ImageEmbedder {
             model: options.model,
             max_batch_size: options.max_batch_size,
             execution_provider,
+            patch_setup,
         };
         info!(
             dimensions = embedder.dimensions(),
@@ -523,6 +731,13 @@ impl ImageEmbedder {
 
     /// Encode a decoded external image without adding it to the catalog.
     pub fn embed_raster(&self, raster: crate::imaging::Raster) -> Result<Vec<f32>> {
+        let tensor = self.preprocess_raster(raster)?;
+        self.embed_preprocessed_images(vec![tensor])?
+            .pop()
+            .context("missing image vector")
+    }
+
+    fn preprocess_raster(&self, raster: crate::imaging::Raster) -> Result<Array3<f32>> {
         let (width, height) = (raster.width(), raster.height());
         let pixels = if self.model.is_deepghs() {
             raster.flatten_rgb([255, 255, 255])
@@ -531,10 +746,186 @@ impl ImageEmbedder {
         };
         let image = RgbImage::from_raw(width, height, pixels)
             .context("invalid decoded image dimensions")?;
-        let tensor = self.preprocess_image(image)?;
-        self.embed_preprocessed_images(vec![tensor])?
+        self.preprocess_image(image)
+    }
+
+    /// Read the image graph and append its patch output. A graph without the expected layout
+    /// still loads, without patch features.
+    fn patched_graph(
+        path: &std::path::Path,
+        method: PatchMethod,
+        file_backed: bool,
+    ) -> Option<PatchedGraph> {
+        let result = std::fs::read(path)
+            .context("reading image ONNX encoder")
+            .and_then(|mut graph| {
+                let fragment = method.fragment(&graph)?;
+                graph.extend_from_slice(&fragment);
+                if file_backed {
+                    Self::write_patched_graph(path, &graph).map(PatchedGraph::File)
+                } else {
+                    Ok(PatchedGraph::Memory(graph))
+                }
+            });
+        match result {
+            Ok(graph) => Some(graph),
+            Err(error) => {
+                warn!(
+                    error = format!("{error:#}"),
+                    "image patch features are unavailable"
+                );
+                None
+            }
+        }
+    }
+
+    /// Keep the patched graph and external data in one derived cache directory. Hugging Face's
+    /// snapshot uses a symlink to a blob outside that directory, which ONNX Runtime rejects for a
+    /// newly written graph; a hard link to the same blob keeps paths local without copying weights.
+    fn write_patched_graph(source: &std::path::Path, bytes: &[u8]) -> Result<std::path::PathBuf> {
+        static NEXT_TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        use std::hash::{Hash, Hasher};
+        use std::sync::atomic::Ordering;
+        let snapshot = source
+            .parent()
+            .context("image graph has no parent directory")?;
+        let directory = snapshot.join("nicegal-patches-v1");
+        std::fs::create_dir_all(&directory).context("creating patched image graph cache")?;
+        let external = directory.join("model.onnx_data");
+        if !external.is_file() {
+            std::fs::hard_link(snapshot.join("model.onnx_data").canonicalize()?, &external)
+                .context("linking DINOv3 external tensor data")?;
+        }
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        bytes.hash(&mut hasher);
+        let target = directory.join(format!("image-{:016x}.onnx", hasher.finish()));
+        if target.is_file() {
+            return Ok(target);
+        }
+        let temp = directory.join(format!(
+            "image.{}.{}.tmp",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&temp, bytes).context("writing patched image graph")?;
+        match std::fs::rename(&temp, &target) {
+            Ok(()) => Ok(target),
+            Err(error) => {
+                let _ = std::fs::remove_file(&temp);
+                if target.is_file() {
+                    Ok(target)
+                } else {
+                    Err(error).context("installing patched image graph")
+                }
+            }
+        }
+    }
+
+    /// Whether [`Self::patch_features`] is available for the loaded session.
+    pub fn supports_patch_features(&self) -> bool {
+        self.patch_setup.is_some()
+    }
+
+    /// Per-patch vectors in the joint text–image space for one decoded, oriented image, for
+    /// visualization. Their similarity to a query vector shows where the model sees it.
+    #[instrument(name = "image_patch_features", level = "debug", skip_all)]
+    pub fn patch_features(&self, raster: crate::imaging::Raster) -> Result<PatchFeatures> {
+        self.patch_features_batch(vec![raster])?
             .pop()
-            .context("missing image vector")
+            .context("missing image patch features")
+    }
+
+    /// Run one patch inference for up to `max_batch_size` decoded images.
+    #[instrument(name = "image_patch_features_batch", level = "debug", skip_all, fields(batch = rasters.len()))]
+    pub fn patch_features_batch(
+        &self,
+        rasters: Vec<crate::imaging::Raster>,
+    ) -> Result<Vec<PatchFeatures>> {
+        if rasters.len() > self.max_batch_size {
+            bail!(
+                "image batch of {} exceeds the {} images {} accepts",
+                rasters.len(),
+                self.max_batch_size,
+                self.model
+            );
+        }
+        if rasters.is_empty() {
+            return Ok(Vec::new());
+        }
+        let setup = self
+            .patch_setup
+            .with_context(|| format!("{} does not provide patch features", self.model))?;
+        let regions: Vec<_> = rasters
+            .iter()
+            .map(|raster| setup.geometry.region(raster.width(), raster.height()))
+            .collect();
+        let embedding_output = self.model.embedding_output();
+        let pixels: Vec<_> = rasters
+            .into_par_iter()
+            .map(|raster| self.preprocess_raster(raster))
+            .collect::<Result<_>>()?;
+        let pixels = ndarray::stack(
+            ndarray::Axis(0),
+            &pixels
+                .iter()
+                .map(|pixels| pixels.view())
+                .collect::<Vec<_>>(),
+        )?;
+        let mut backend = self
+            .backend
+            .lock()
+            .map_err(|_| anyhow::anyhow!("image embedding model lock was poisoned"))?;
+        let session = backend.session_mut();
+        let input = session.inputs()[0].name().to_owned();
+        let options = ort::session::RunOptions::new()?.with_outputs(
+            ort::session::OutputSelector::no_default()
+                .with(embedding_output)
+                .with(patches::PATCH_OUTPUT),
+        );
+        let outputs = session
+            .run_with_options(
+                ort::inputs![input => ort::value::Tensor::from_array(pixels)?],
+                &options,
+            )
+            .context("running image patch inference")?;
+        let (embedding_shape, embedding) = outputs[embedding_output].try_extract_tensor::<f32>()?;
+        let (shape, data) = outputs[patches::PATCH_OUTPUT].try_extract_tensor::<f32>()?;
+        let shape: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
+        let grids = patches::patch_grids(&shape, data, setup.method.prefix_tokens())?;
+        if grids.len() != regions.len()
+            || embedding_shape.len() != 2
+            || embedding_shape[0] != regions.len() as i64
+            || embedding_shape[1] != self.dimensions() as i64
+        {
+            bail!(
+                "{} returned inconsistent patch or embedding batch shapes",
+                self.model
+            );
+        }
+        Ok(grids
+            .into_iter()
+            .zip(regions)
+            .zip(embedding.chunks_exact(self.dimensions()))
+            .map(
+                |(((rows, columns, dimensions, patches), region), embedding)| {
+                    let norm = embedding
+                        .iter()
+                        .map(|v| v * v)
+                        .sum::<f32>()
+                        .sqrt()
+                        .max(f32::EPSILON);
+                    PatchFeatures {
+                        rows,
+                        columns,
+                        dimensions,
+                        patches,
+                        embedding: embedding.iter().map(|v| v / norm).collect(),
+                        region,
+                        method: setup.method.name(),
+                    }
+                },
+            )
+            .collect())
     }
 
     #[instrument(
@@ -830,5 +1221,169 @@ mod tests {
         assert_eq!(options.model, ImageEmbeddingModel::MetaClip2B32);
         assert_eq!(options.max_input_bytes, 4096);
         assert_eq!(options.runtime.execution_provider, ExecutionProvider::Cpu);
+    }
+
+    #[test]
+    fn input_region_follows_resize_and_crop() {
+        let stretched = InputGeometry::from_config(
+            br#"{"size": {"height": 224, "width": 224}, "do_center_crop": true, "crop_size": 224}"#,
+        )
+        .unwrap();
+        assert_eq!(stretched.region(400, 200), [0.0, 0.0, 1.0, 1.0]);
+        let cropped = InputGeometry::from_config(
+            br#"{"size": {"shortest_edge": 224}, "do_center_crop": true,
+                 "crop_size": {"height": 224, "width": 224}}"#,
+        )
+        .unwrap();
+        assert_eq!(cropped.region(400, 200), [0.25, 0.0, 0.5, 1.0]);
+        assert_eq!(cropped.region(200, 800), [0.0, 0.375, 1.0, 0.25]);
+    }
+
+    #[test]
+    fn deepghs_region_marks_the_padded_axis() {
+        let geometry = InputGeometry::from_deepghs_config(
+            br#"{"stages": [
+                {"type": "convert_rgb", "force_background": "white"},
+                {"type": "resize", "size": 448, "max_size": 448, "interpolation": "bicubic"},
+                {"type": "center_crop", "size": 448},
+                {"type": "maybe_to_tensor"},
+                {"type": "normalize", "mean": [0.5, 0.5, 0.5], "std": [0.5, 0.5, 0.5]}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(geometry.region(500, 500), [0.0, 0.0, 1.0, 1.0]);
+        // 800x400 fits as 448x224, centered in a 448 square with 112 rows of padding each side.
+        assert_eq!(geometry.region(800, 400), [0.0, -0.5, 1.0, 2.0]);
+        assert_eq!(geometry.region(400, 800), [-0.5, 0.0, 2.0, 1.0]);
+        assert!(InputGeometry::from_deepghs_config(br#"{"stages": []}"#).is_err());
+    }
+
+    fn initialize_test_runtime() {
+        static RUNTIME: std::sync::Once = std::sync::Once::new();
+        RUNTIME.call_once(|| {
+            #[cfg(windows)]
+            crate::runtime::initialize_from_dylib(
+                &std::env::current_exe()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .join("onnxruntime/directml/onnxruntime.dll"),
+            )
+            .unwrap();
+            #[cfg(not(windows))]
+            crate::runtime::initialize_bundled_runtime(ExecutionProvider::Cpu).unwrap();
+        });
+    }
+
+    /// Patch features load for `model`, produce the expected grid and region for a 320x200
+    /// image, and leave the pooled embedding equal to `plain`'s.
+    fn assert_patch_features(
+        model: ImageEmbeddingModel,
+        mut plain: ImageEmbedding,
+        grid: (usize, usize, usize),
+        region: [f64; 4],
+    ) {
+        let embedder = ImageEmbedder::load_cached(&ImageEmbedderOptions {
+            model,
+            ..ImageEmbedderOptions::default()
+        })
+        .unwrap()
+        .expect("cached image model");
+        assert!(embedder.supports_patch_features());
+        let (width, height) = (320, 200);
+        let rgb: Vec<u8> = (0..width * height * 3)
+            .map(|i| (i * 7 % 251) as u8)
+            .collect();
+        let raster = crate::imaging::Raster::Rgb {
+            width,
+            height,
+            pixels: rgb,
+        };
+        let features = embedder.patch_features(raster.clone()).unwrap();
+        assert_eq!((features.rows, features.columns, features.dimensions), grid);
+        assert_eq!(features.patches.len(), grid.0 * grid.1 * grid.2);
+        assert_eq!(features.region, region);
+        let batch = embedder
+            .patch_features_batch(vec![raster.clone(), raster.clone()])
+            .unwrap();
+        assert_eq!(batch.len(), 2);
+        for item in &batch {
+            assert_eq!((item.rows, item.columns, item.dimensions), grid);
+            assert_eq!(item.region, region);
+            let patch_difference = item
+                .patches
+                .iter()
+                .zip(&features.patches)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(patch_difference < 1e-5, "{patch_difference}");
+        }
+
+        let expected = plain
+            .embed_preprocessed(vec![embedder.preprocess_raster(raster.clone()).unwrap()])
+            .unwrap()
+            .remove(0);
+        for actual in [&features.embedding, &embedder.embed_raster(raster).unwrap()] {
+            let difference = actual
+                .iter()
+                .zip(&expected)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(difference < 1e-5, "{difference}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the MetaCLIP2 B/32 export cached by explicit setup"]
+    fn patch_branch_leaves_the_indexed_embedding_unchanged() {
+        initialize_test_runtime();
+        let directory = ImageEmbeddingModel::MetaClip2B32
+            .validated_model_directory(true, &())
+            .unwrap()
+            .unwrap();
+        let plain = ImageEmbedding::try_new_from_path(
+            directory.join("image.onnx"),
+            &std::fs::read(directory.join("preprocessor_config.json")).unwrap(),
+            fastembed::ImageInitOptionsUserDefined::new(),
+        )
+        .unwrap();
+        assert_patch_features(
+            ImageEmbeddingModel::MetaClip2B32,
+            plain,
+            (7, 7, 512),
+            [0.0, 0.0, 1.0, 1.0],
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the SigLIP SwinV2 checkpoint cached by explicit setup"]
+    fn swinv2_feature_map_leaves_the_indexed_embedding_unchanged() {
+        initialize_test_runtime();
+        let model = ImageEmbeddingModel::SigLipBetaSwinV2Frozen;
+        let (image, preprocessor) = model.deepghs_image_files(true, &()).unwrap().unwrap();
+        let plain = ImageEmbedding::try_new_from_deepghs_path(
+            image,
+            &preprocessor,
+            fastembed::ImageInitOptionsUserDefined::new(),
+        )
+        .unwrap();
+        // 320x200 fits as 448x280: 84 rows of padding above and below.
+        assert_patch_features(model, plain, (14, 14, 1024), [0.0, -0.3, 1.0, 1.6]);
+    }
+
+    #[test]
+    #[ignore = "requires the DINOv3 ONNX export cached by explicit setup"]
+    fn dinov3_patch_tokens_leave_the_indexed_embedding_unchanged() {
+        initialize_test_runtime();
+        let model = ImageEmbeddingModel::DinoV3B16;
+        let directory = model.validated_model_directory(true, &()).unwrap().unwrap();
+        let plain = ImageEmbedding::try_new_from_path(
+            directory.join("image.onnx"),
+            &std::fs::read(directory.join("preprocessor_config.json")).unwrap(),
+            fastembed::ImageInitOptionsUserDefined::new(),
+        )
+        .unwrap()
+        .with_output_key("pooler_output");
+        assert_patch_features(model, plain, (14, 14, 768), [0.0, 0.0, 1.0, 1.0]);
     }
 }

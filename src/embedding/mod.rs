@@ -3,6 +3,7 @@
 mod fastembed;
 mod image;
 mod model;
+mod patches;
 
 use anyhow::{Context, Result, bail};
 use tracing::{info, instrument};
@@ -13,6 +14,7 @@ pub use image::{
     ImageEmbedder, ImageEmbedderOptions, ImageEmbeddingModel, ImageQueryEmbedder,
     ImageQueryEmbedderOptions,
 };
+pub use patches::PatchFeatures;
 pub use model::{ParseTextEmbeddingModelError, TextEmbeddingModel};
 
 /// How a [`TextEmbedder`] is built.

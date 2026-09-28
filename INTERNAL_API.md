@@ -23,6 +23,7 @@ Electron owns the configured database paths. Rust owns catalog and metadata poli
 | Underline what matched in an OCR result | `highlights`, see [Highlights](#highlights) |
 | Check vector-search coverage | `GET /v1/text-embeddings` |
 | Check visual-search coverage | `GET /v1/image-embeddings?libraryId=...` — `{total,indexed}`; cataloged images and videos with current vectors for the active image model, excluding stale fingerprints |
+| Visualize where an image matches | `POST /v1/image-embeddings/patches`, see [Image patch features](#image-patch-features) |
 | Start, monitor, and cancel work | `/v1/jobs` |
 | Backfill thumbnail variants | `POST /v1/thumbnails/generate`, then poll the returned job |
 | Explicitly backfill OCR text embeddings | `POST /v1/text-embeddings/generate`, then poll the returned job |
@@ -60,6 +61,13 @@ The state describes sessions in this process, not disk-cache availability: a res
 clears the error and enters `preparing`; a successful attempt enters `ready`. Status reads do not
 wait for download or compilation. OCR continues to use `GET /v1/ocr/models` and its existing
 `ocrModelLoad` job.
+
+`POST /v1/models/load-cached` with `{"model":"clipText"}` loads only the cached paired CLIP
+text-query encoder and returns `{"loaded":true}`. A missing cache or image-only model returns
+`{"loaded":false}` without downloading; a corrupt cached model returns `models_not_ready` and
+records the failure in model status. The desktop requests this after each backend start only when
+the selected library already has indexed CLIP content, so the first visual text search can reuse
+the session. This endpoint does not load OCR models.
 
 `POST /v1/jobs` with `{"type":"modelPrepare","params":{}}` prepares the text, CLIP image,
 and paired CLIP text sessions without indexing a root. It is the Settings prepare/retry action.
@@ -1258,11 +1266,77 @@ scan that picks up the revealed files. `--keep` preserves its temporary database
 The Windows build packages ONNX Runtime libraries; model weights are downloaded separately
 when a model preparation or indexing request requires them.
 
+### Image patch features
+
+`POST /v1/image-embeddings/patches` returns per-patch vectors for one still image in the active
+image model's joint text–image space, for visualizations such as "where does this image match the
+query" or patch-to-patch similarity:
+
+```json
+{ "assetId": 41, "imageQuery": { "components": [{ "text": "a cat", "weight": 1 }] } }
+```
+
+`imageQuery` is optional and follows [Composite image queries](#composite-image-queries); its
+resolved, normalized direction is returned as `query`. The response is `application/octet-stream`
+in [safetensors](https://huggingface.co/docs/safetensors) layout: a little-endian `u64` header
+length, a JSON header padded with spaces to a multiple of 8 bytes, then little-endian `F32` data.
+Every tensor offset is therefore 4-byte aligned, and a renderer can view each tensor as a
+`Float32Array` over the response buffer without copying or parsing:
+
+| Tensor | Shape | Meaning |
+| --- | --- | --- |
+| `patches` | `[rows, columns, dimensions]` | Row-major, unit-length patch vectors |
+| `embedding` | `[dimensions]` | The pooled vector the image index stores for these pixels |
+| `query` | `[dimensions]` | The resolved `imageQuery`, present only when requested |
+
+`__metadata__` holds strings: `model` (the model ID), `assetId`, `method` (`clearclip` or
+`featureMap`), and `region`, a JSON `[x, y, width, height]` of the oriented source image that the
+grid covers, as fractions of its width and height. The grid is square in model input pixels, so its
+cells are stretched to the region's aspect ratio. A model that pads the short axis to a square
+reports a region beyond 0 to 1 on that axis (for example `[0, -0.5, 1, 2]` for a 2:1 image); clip
+the overlay to the image. Cosine similarity to a query is a dot product because both
+sides are normalized. Values are small (typically 0.05 to 0.35 for matching text), so normalize
+each map's range before coloring it.
+
+MetaCLIP2 B/32 (7×7), B/16 (14×14), and L/14 (16×16) use ClearCLIP: the image graph gains a branch
+that recomputes the last attention block as query–query attention without its residual or MLP,
+then applies the model's own final LayerNorm and projection. The experimental SigLIP SwinV2 (14×14)
+uses `featureMap`: its pooled embedding is the normalized mean of its final feature map, so each map
+position is already a patch vector, and the graph only exposes that map. DINOv3 B/16 (14×14)
+exposes its normalized final tokens; the class token and four register tokens are omitted from the
+patch grid. Patch scores use the same pooled image query vector as visual search, including queries
+composed from multiple images. These graph additions are appended to the downloaded graph at load
+time; no other files are downloaded, the indexed pooled output is unchanged, and indexing does not
+copy the patch output off the device. SigLIP2 Base does not provide patch features; runtime status
+reports this per model as `patchFeatures`.
+Those models, videos, and an image graph without the expected layout return `invalid_request`. An unprepared image model returns `models_not_ready`; this route never downloads
+models. The single-asset `/patches` route decodes original still images and does not support videos.
+
+`POST /v1/image-embeddings/patch-scores` returns compact scores for up to 32 still images or cached video frames against
+one required `imageQuery`:
+
+```json
+{ "targets": [{ "assetId": 41 }, { "assetId": 42, "timestampMs": 2000 }], "imageQuery": { "components": [{ "text": "a cat", "weight": 1 }] } }
+```
+
+The JSON response has `model` (the active image model ID) and ordered `results`. A successful
+result contains `assetId`, optional `timestampMs`, `rows`, `columns`, `region`, `pooled`, and `scores`. `scores` has one
+row-major dot product per patch; `pooled` is the pooled embedding's dot product with the query.
+A video target must include the exact indexed sample timestamp; its patch input comes from the
+cached 256-pixel matched-frame thumbnail in `video_thumbnails`, without reading or decoding the video.
+A missing asset, missing video thumbnail, unreadable still image, or decoding failure instead returns an item such as
+`{ "assetId": 42, "error": "asset_not_found" }` with the relevant error code. These per-item
+failures do not fail the batch. The route resolves the query once, decodes original still files or cached video thumbnails, and
+batches uncached model inference. Its 256 MB in-memory patch cache is shared with `/patches` and
+clears when the active model changes. Video cache entries are keyed by sample timestamp. More than 32 targets or an invalid ID returns `invalid_request`;
+an unavailable model returns `models_not_ready`.
+
 ## Image model selection
 
 `GET /v1/runtime` includes `imageModel: {activeModel, selectedModel, restartRequired,
 models}`. Top-level `restartRequired` covers both the provider and model. Each catalog entry contains `id`, `name`, `dimensions`, `license`,
-`url`, and `available`. Published exports download normally; local development overrides can be
+`url`, `available`, `supportsTextQueries`, and `patchFeatures` (whether
+[Image patch features](#image-patch-features) serve the model). Published exports download normally; local development overrides can be
 placed under `NICEGAL_LOCAL_MODELS_DIR`.
 
 `PUT /v1/runtime` accepts `{"imageModel":"facebook/metaclip-2-worldwide-b32"}`
