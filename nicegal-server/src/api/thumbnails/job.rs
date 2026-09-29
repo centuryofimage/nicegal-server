@@ -215,6 +215,16 @@ fn default_backfill_buckets() -> Vec<u16> {
     vec![1024]
 }
 
+impl Spec {
+    pub(crate) fn resume_request(&self) -> serde_json::Value {
+        serde_json::json!({ "type": "thumbnailGenerate", "params": {
+            "libraryId": self.library_id, "buckets": self.buckets, "force": self.force,
+            "sweepStale": self.sweep_stale, "timeline": match self.timeline { Timeline::Modified => "modified", Timeline::Capture => "capture" },
+            "range": { "fromNs": self.from_ns.map(|ns| ns.to_string()), "toNs": self.to_ns.map(|ns| ns.to_string()) }
+        }})
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;

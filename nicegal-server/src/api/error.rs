@@ -18,6 +18,7 @@ pub(crate) enum ErrorCode {
     ThumbnailNotFound,
     JobNotFound,
     JobBusy,
+    SearchSuperseded,
     LibraryNotFound,
     ModelsNotReady,
     MethodNotAllowed,
@@ -39,6 +40,7 @@ impl ErrorCode {
             Self::ThumbnailNotFound => "thumbnail_not_found",
             Self::JobNotFound => "job_not_found",
             Self::JobBusy => "job_busy",
+            Self::SearchSuperseded => "search_superseded",
             Self::LibraryNotFound => "library_not_found",
             Self::ModelsNotReady => "models_not_ready",
             Self::MethodNotAllowed => "method_not_allowed",
@@ -80,6 +82,14 @@ pub(crate) struct ApiError {
 }
 
 impl ApiError {
+    pub(crate) fn search_superseded() -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            ErrorCode::SearchSuperseded,
+            "Search session was superseded",
+        )
+    }
+
     fn new(status: StatusCode, code: ErrorCode, message: impl Into<String>) -> Self {
         Self {
             status,

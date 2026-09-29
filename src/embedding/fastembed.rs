@@ -111,6 +111,7 @@ impl FastEmbedBackend {
             )
             .context("loading local paired text ONNX encoder")
         })?;
+        model.retire_previous_encoder(true);
         Ok(Some((
             Self {
                 inner: Mutex::new(backend),

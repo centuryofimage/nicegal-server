@@ -290,12 +290,13 @@ async fn patches(
             None,
             asset.fingerprint,
         ) {
-            return Ok(safetensors(
+            return safetensors(
                 &features,
                 query.as_deref(),
                 model.model().id(),
                 request.asset_id,
-            ));
+            )
+            .map_err(ApiError::internal);
         }
         let bytes = std::fs::read(&asset.path)
             .with_context(|| format!("reading {}", asset.path))
@@ -311,12 +312,13 @@ async fn patches(
             asset.fingerprint,
             model.patch_features(raster).map_err(ApiError::internal)?,
         );
-        Ok(safetensors(
+        safetensors(
             &features,
             query.as_deref(),
             model.model().id(),
             request.asset_id,
-        ))
+        )
+        .map_err(ApiError::internal)
     })
     .await?;
     Ok(([(header::CONTENT_TYPE, "application/octet-stream")], body))
@@ -330,7 +332,7 @@ fn safetensors(
     query: Option<&[f32]>,
     model: &str,
     asset_id: i64,
-) -> Vec<u8> {
+) -> anyhow::Result<Vec<u8>> {
     let mut tensors = vec![
         (
             "patches",
@@ -346,36 +348,34 @@ fn safetensors(
     if let Some(query) = query {
         tensors.push(("query", vec![query.len()], query));
     }
-    let mut header = serde_json::Map::new();
-    header.insert(
-        "__metadata__".into(),
-        serde_json::json!({
-            "model": model,
-            "assetId": asset_id.to_string(),
-            "method": features.method,
-            "region": serde_json::to_string(&features.region).expect("floats serialize"),
-        }),
-    );
-    let mut offset = 0;
-    for (name, shape, data) in &tensors {
-        let end = offset + data.len() * 4;
-        header.insert(
-            (*name).into(),
-            serde_json::json!({"dtype": "F32", "shape": shape, "data_offsets": [offset, end]}),
-        );
-        offset = end;
-    }
-    let mut header = serde_json::to_vec(&header).expect("header serializes");
-    header.resize(header.len().next_multiple_of(8), b' ');
-    let mut body = Vec::with_capacity(8 + header.len() + offset);
-    body.extend_from_slice(&(header.len() as u64).to_le_bytes());
-    body.extend_from_slice(&header);
-    for (_, _, data) in &tensors {
-        for value in *data {
-            body.extend_from_slice(&value.to_le_bytes());
-        }
-    }
-    body
+    let metadata = HashMap::from([
+        ("model".to_owned(), model.to_owned()),
+        ("assetId".to_owned(), asset_id.to_string()),
+        ("method".to_owned(), features.method.to_owned()),
+        (
+            "region".to_owned(),
+            serde_json::to_string(&features.region)?,
+        ),
+    ]);
+    // Encode the scalar bytes explicitly so the wire format is portable to big-endian hosts.
+    let bytes: Vec<Vec<u8>> = tensors
+        .iter()
+        .map(|(_, _, values)| {
+            values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect()
+        })
+        .collect();
+    let views = tensors
+        .into_iter()
+        .zip(&bytes)
+        .map(|((name, shape, _), bytes)| {
+            safetensors::tensor::TensorView::new(safetensors::Dtype::F32, shape, bytes)
+                .map(|view| (name, view))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    safetensors::tensor::serialize(views, Some(metadata)).context("serializing image patch tensors")
 }
 
 #[cfg(test)]
@@ -439,18 +439,36 @@ mod tests {
             region: [0.0, 0.25, 1.0, 0.5],
             method: "clearclip",
         };
-        let body = safetensors(&features, Some(&[0.0, -1.0]), "m", 7);
-        let length = u64::from_le_bytes(body[..8].try_into().unwrap()) as usize;
-        assert_eq!(length % 8, 0);
-        let header: serde_json::Value = serde_json::from_slice(&body[8..8 + length]).unwrap();
-        assert_eq!(header["__metadata__"]["assetId"], "7");
-        assert_eq!(header["__metadata__"]["region"], "[0.0,0.25,1.0,0.5]");
-        assert_eq!(header["patches"]["shape"], serde_json::json!([1, 2, 2]));
-        assert_eq!(header["query"]["data_offsets"], serde_json::json!([24, 32]));
-        let data = &body[8 + length..];
-        assert_eq!(data.len(), 32);
-        let float =
-            |index: usize| f32::from_le_bytes(data[index * 4..index * 4 + 4].try_into().unwrap());
-        assert_eq!([float(4), float(5), float(7)], [0.6, 0.8, -1.0]);
+        for query in [None, Some([0.0, -1.0].as_slice())] {
+            let body = safetensors(&features, query, "m", 7).unwrap();
+            let (header_length, metadata) = safetensors::SafeTensors::read_metadata(&body).unwrap();
+            assert_eq!(header_length % 8, 0);
+            let metadata = metadata.metadata().as_ref().unwrap();
+            assert_eq!(metadata["assetId"], "7");
+            assert_eq!(metadata["model"], "m");
+            assert_eq!(metadata["method"], "clearclip");
+            assert_eq!(metadata["region"], "[0.0,0.25,1.0,0.5]");
+            let tensors = safetensors::SafeTensors::deserialize(&body).unwrap();
+            assert_eq!(tensors.len(), if query.is_some() { 3 } else { 2 });
+            for (name, shape, expected) in [
+                ("patches", vec![1, 2, 2], features.patches.as_slice()),
+                ("embedding", vec![2], features.embedding.as_slice()),
+            ]
+            .into_iter()
+            .chain(query.map(|values| ("query", vec![2], values)))
+            {
+                let tensor = tensors.tensor(name).unwrap();
+                assert_eq!(tensor.dtype(), safetensors::Dtype::F32);
+                assert_eq!(tensor.shape(), shape);
+                let values: Vec<f32> = tensor
+                    .data()
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|bytes| f32::from_le_bytes(*bytes))
+                    .collect();
+                assert_eq!(values, expected);
+            }
+        }
     }
 }

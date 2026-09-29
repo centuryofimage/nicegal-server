@@ -184,11 +184,14 @@ pub(super) struct Spec {
 pub(super) struct LibraryPurgeRequest {
     library_id: i64,
     #[serde(default)]
+    remove_library: bool,
+    #[serde(default)]
     folders: Vec<PathBuf>,
 }
 
 pub(super) struct LibraryPurgeSpec {
     library_id: i64,
+    remove_library: bool,
     folders: Vec<PathBuf>,
 }
 
@@ -207,7 +210,13 @@ pub(super) fn prepare_library_purge(
             "folder to purge must be absolute: {folder}"
         )));
     }
+    if request.remove_library && !request.folders.is_empty() {
+        return Err(ApiError::bad_request(
+            "library removal cannot be limited to folders",
+        ));
+    }
     Ok(LibraryPurgeSpec {
+        remove_library: request.remove_library,
         library_id: request.library_id,
         folders: request.folders,
     })
@@ -346,7 +355,7 @@ pub(super) fn run_library_purge(
     thumbnails: &ThumbnailService,
     observer: &dyn IndexObserver,
 ) -> anyhow::Result<()> {
-    let assets = AssetCatalog::new(asset_database)?;
+    let mut assets = AssetCatalog::new(asset_database)?;
     let library = libraries::stored(&assets, spec.library_id)?;
     // A whole-library purge retains files another library covers. A folder purge runs after the
     // edited definition is saved, so every current library (including this one) protects shared
@@ -384,6 +393,7 @@ pub(super) fn run_library_purge(
         total: candidates.len(),
     });
 
+    let mut failed = false;
     for chunk in candidates.chunks(PRUNE_BATCH_SIZE) {
         // Libraries can be edited while this runs; a file another library took in since the job
         // started keeps its data.
@@ -422,11 +432,22 @@ pub(super) fn run_library_purge(
                 deleted,
                 ..IndexProgressDelta::default()
             })),
-            Err(error) => report_batch_failure(&assets_to_delete, error, observer),
+            Err(error) => {
+                failed = true;
+                report_batch_failure(&assets_to_delete, error, observer);
+            }
         }
         if cancelled {
             return cancel_if(true);
         }
+    }
+    cancel_if(observer.is_cancelled())?;
+    if spec.remove_library {
+        anyhow::ensure!(
+            !failed,
+            "Library removal did not finish; some indexed data could not be removed"
+        );
+        assets.delete_library(spec.library_id)?;
     }
     Ok(())
 }
@@ -824,6 +845,67 @@ mod tests {
     }
 
     #[test]
+    fn removing_a_library_finishes_in_the_backend_and_keeps_definitions_on_failure()
+    -> anyhow::Result<()> {
+        for outcome in ["complete", "cancel", "failure"] {
+            let temporary = TempDir::new()?;
+            let root = PathBuf::try_from(temporary.path().join("photos"))?;
+            fs::create_dir(&root)?;
+            let source = root.join("photo.png");
+            fs::write(&source, b"original")?;
+            let asset_database = PathBuf::try_from(temporary.path().join("assets.db"))?;
+            let ocr_database = PathBuf::try_from(temporary.path().join("ocr.db"))?;
+            let image_database = PathBuf::try_from(temporary.path().join("clip.db"))?;
+            let thumbnails =
+                ThumbnailService::new(&PathBuf::try_from(temporary.path().join("thumbnails.db"))?)?;
+            let catalog = AssetCatalog::new(&asset_database)?;
+            let asset = catalog.upsert(&source, &fs::metadata(&source)?)?;
+            let id = library(&asset_database, &[&root])?;
+            if outcome == "failure" {
+                fs::write(&ocr_database, b"invalid database")?;
+            }
+            let cancelled = CancelBeforeSecondAsset(AtomicUsize::new(1));
+            let observer: &dyn IndexObserver = if outcome == "cancel" {
+                &cancelled
+            } else {
+                &NeverCancelled
+            };
+            let result = run_library_purge(
+                prepare_library_purge(LibraryPurgeRequest {
+                    library_id: id,
+                    remove_library: true,
+                    folders: Vec::new(),
+                })
+                .unwrap(),
+                &asset_database,
+                &ocr_database,
+                &image_database,
+                512,
+                &thumbnails,
+                observer,
+            );
+            assert_eq!(
+                result.is_ok(),
+                outcome == "complete",
+                "{outcome}: {result:?}"
+            );
+            let catalog = AssetCatalog::new(&asset_database)?;
+            assert_eq!(
+                catalog.library(id)?.is_none(),
+                outcome == "complete",
+                "{outcome}"
+            );
+            assert_eq!(
+                catalog.get(asset.asset_id)?.is_none(),
+                outcome == "complete",
+                "{outcome}"
+            );
+            assert_eq!(fs::read(&source)?, b"original");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn library_purge_does_not_touch_same_prefix_sibling_root() -> anyhow::Result<()> {
         let temporary = TempDir::new()?;
         let root = PathBuf::try_from(temporary.path().join("photos"))?;
@@ -847,6 +929,7 @@ mod tests {
 
         run_library_purge(
             prepare_library_purge(LibraryPurgeRequest {
+                remove_library: false,
                 library_id,
                 folders: Vec::new(),
             })
@@ -887,6 +970,7 @@ mod tests {
 
         let error = run_library_purge(
             prepare_library_purge(LibraryPurgeRequest {
+                remove_library: false,
                 library_id,
                 folders: Vec::new(),
             })
@@ -931,6 +1015,7 @@ mod tests {
 
         run_library_purge(
             prepare_library_purge(LibraryPurgeRequest {
+                remove_library: false,
                 library_id: purged,
                 folders: Vec::new(),
             })
@@ -984,6 +1069,7 @@ mod tests {
 
         run_library_purge(
             prepare_library_purge(LibraryPurgeRequest {
+                remove_library: false,
                 library_id: purged,
                 folders: Vec::new(),
             })

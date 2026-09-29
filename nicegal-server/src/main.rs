@@ -201,6 +201,9 @@ async fn main() -> Result<()> {
         Arc::clone(&ocr_models),
         Arc::clone(&runtime),
     ));
+    if let Err(error) = jobs.recover().await {
+        tracing::error!(?error, "could not recover background work");
+    }
     let state = api::AppState {
         databases,
         thumbnails,
@@ -211,6 +214,7 @@ async fn main() -> Result<()> {
         image_model_settings,
         ocr_models,
         runtime,
+        tags: Default::default(),
     };
     let app = api::router(state, authorization);
 

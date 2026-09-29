@@ -15,6 +15,8 @@ mod prune_jobs;
 mod roots;
 mod runtime;
 mod search;
+mod search_sessions;
+mod tags;
 mod text_embeddings;
 mod thumbnails;
 
@@ -101,6 +103,8 @@ pub(crate) struct AppState {
     /// launch. It is separate from model state because a loaded dynamic library cannot change.
     pub(crate) runtime: Arc<RuntimeSettings>,
     pub(crate) image_model_settings: Arc<ImageModelSettings>,
+    /// The active model's image tags, loaded on first use.
+    pub(crate) tags: Arc<tags::TagSets>,
 }
 
 #[derive(Clone)]
@@ -112,18 +116,24 @@ struct AuthState {
 #[serde(rename_all = "camelCase")]
 struct HealthResponse {
     api_version: u8,
+    instance_id: &'static str,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct StatusResponse {
     api_version: u8,
+    instance_id: &'static str,
     runtime: runtime::RuntimeStatusResponse,
     ocr_models_loaded: bool,
 }
 
 pub(crate) fn router(state: AppState, authorization: HeaderValue) -> Router {
     Router::new()
+        .route(
+            "/v1/search/session",
+            axum::routing::post(search_sessions::cancel),
+        )
         .route("/v1/health", get(health))
         .route("/v1/status", get(status))
         .route("/v1/models", models::route())
@@ -153,6 +163,7 @@ pub(crate) fn router(state: AppState, authorization: HeaderValue) -> Router {
             text_embeddings::generate_route(),
         )
         .route("/v1/ocr/models", ocr_models::route())
+        .route("/v1/assets/tags", tags::route())
         .merge(jobs::routes())
         .route_layer(middleware::from_fn_with_state(
             AuthState { authorization },
@@ -207,12 +218,14 @@ async fn authorize(State(auth): State<AuthState>, request: Request, next: Next) 
 
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse {
+        instance_id: instance_id(),
         api_version: API_VERSION,
     })
 }
 
 async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
     Json(StatusResponse {
+        instance_id: instance_id(),
         api_version: API_VERSION,
         runtime: runtime::status_response(&state),
         ocr_models_loaded: state.ocr_models.is_loaded(),
@@ -233,6 +246,19 @@ async fn run_cancellable<T: Send + 'static>(
     + Send
     + 'static,
 ) -> Result<T, ApiError> {
+    run_cancellable_with(
+        nicegal_core::cancellation::SearchCancellation::default(),
+        task,
+    )
+    .await
+}
+
+async fn run_cancellable_with<T: Send + 'static>(
+    cancellation: nicegal_core::cancellation::SearchCancellation,
+    task: impl FnOnce(nicegal_core::cancellation::SearchCancellation) -> Result<T, ApiError>
+    + Send
+    + 'static,
+) -> Result<T, ApiError> {
     use nicegal_core::cancellation::SearchCancellation;
     struct CancelOnDrop(Option<SearchCancellation>);
     impl Drop for CancelOnDrop {
@@ -243,7 +269,6 @@ async fn run_cancellable<T: Send + 'static>(
             }
         }
     }
-    let cancellation = SearchCancellation::default();
     let mut guard = CancelOnDrop(Some(cancellation.clone()));
     let result = run_blocking(move || {
         cancellation.check()?;
@@ -277,6 +302,21 @@ where
     })
     .await
     .map_err(|error| ApiError::internal(anyhow!("blocking request task failed: {error}")))?
+}
+
+/// Unique for this process lifetime, including restarts while browsers are asleep.
+pub(super) fn instance_id() -> &'static str {
+    static INSTANCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    INSTANCE.get_or_init(|| {
+        format!(
+            "{:x}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        )
+    })
 }
 
 #[cfg(test)]
@@ -411,6 +451,7 @@ mod tests {
         let image_model_settings = Arc::new(ImageModelSettings::new(Arc::clone(&runtime), None));
         let state = AppState {
             image_model_settings,
+            tags: Default::default(),
             jobs: Arc::new(JobManager::new(
                 Arc::clone(&databases),
                 Arc::clone(&thumbnails),
@@ -1508,7 +1549,16 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["error"]["code"], "job_not_found");
 
-        let (status, body) = send(&router, Method::GET, "/v1/jobs/abc").await;
+        let (status, body) = send(&router, Method::GET, "/v1/jobs/old-instance-99").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"]["code"], "job_not_found");
+
+        let (status, body) = send(
+            &router,
+            Method::GET,
+            &format!("/v1/jobs/{}-abc", instance_id()),
+        )
+        .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["code"], "invalid_request");
     }
@@ -1870,6 +1920,44 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         panic!("job did not finish");
+    }
+
+    #[tokio::test]
+    async fn duplicate_job_requests_return_the_same_job_even_after_completion() {
+        let temp = TempDir::new().unwrap();
+        let router = test_router_with_preparation(&temp, false);
+        let request =
+            |force: bool| {
+                Request::builder()
+            .method(Method::POST)
+            .uri("/v1/jobs")
+            .header(header::AUTHORIZATION, TOKEN)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-nicegal-request-id", "retry-thumbnail")
+            .body(Body::from(serde_json::json!({
+                "type": "thumbnailGenerate", "params": { "libraryId": 1, "force": force }
+            }).to_string())).unwrap()
+            };
+        let (first, retry) = tokio::join!(
+            response_parts(&router, request(false)),
+            response_parts(&router, request(false))
+        );
+        assert_eq!(first.0, StatusCode::ACCEPTED, "{}", first.1);
+        assert_eq!(retry.0, StatusCode::ACCEPTED, "{}", retry.1);
+        assert_eq!(first.1["jobId"], retry.1["jobId"]);
+        let completed = wait_for_job(&router, &first.1).await;
+        assert_eq!(completed["status"], "completed", "{completed}");
+        let (_, replay) = response_parts(&router, request(false)).await;
+        assert_eq!(replay["jobId"], first.1["jobId"]);
+        assert_eq!(replay["status"], "completed");
+        let (status, _) = response_parts(&router, request(true)).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a token cannot name different work"
+        );
+        let (_, listed) = send(&router, Method::GET, "/v1/jobs").await;
+        assert_eq!(listed["jobs"].as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]

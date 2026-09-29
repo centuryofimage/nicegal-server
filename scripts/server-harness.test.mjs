@@ -21,15 +21,17 @@ test('SSE snapshots tolerate split CRLF and UTF-8 sequences', async () => {
 
 test('job helpers require a terminal event and report failed jobs', async () => {
   let status = 'running'
+  const jobId = '978c-18d9a538ad85ccbc-1'
   const server = createServer((request, response) => {
     assert.equal(request.headers.authorization, 'Bearer test-token')
     if (request.method === 'POST') {
       request.resume()
       response.writeHead(202, { 'content-type': 'application/json' })
-      response.end(JSON.stringify({ jobId: '1', status: 'queued' }))
+      response.end(JSON.stringify({ jobId, status: 'queued' }))
     } else {
+      assert.equal(request.url, `/v1/jobs/${jobId}/events`)
       response.writeHead(200, { 'content-type': 'text/event-stream' })
-      response.end(`data: ${JSON.stringify({ jobId: '1', status })}\n\n`)
+      response.end(`data: ${JSON.stringify({ jobId, status })}\n\n`)
     }
   })
   server.listen(0, '127.0.0.1')

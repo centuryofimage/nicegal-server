@@ -65,9 +65,10 @@ wait for download or compilation. OCR continues to use `GET /v1/ocr/models` and 
 `POST /v1/models/load-cached` with `{"model":"clipText"}` loads only the cached paired CLIP
 text-query encoder and returns `{"loaded":true}`. A missing cache or image-only model returns
 `{"loaded":false}` without downloading; a corrupt cached model returns `models_not_ready` and
-records the failure in model status. The desktop requests this after each backend start only when
-the selected library already has indexed CLIP content, so the first visual text search can reuse
-the session. This endpoint does not load OCR models.
+records the failure in model status. On a normal start, the desktop requests this when the
+selected library already has indexed CLIP content. After a runtime change, it also requests the
+new model from cache before the first scan has produced vectors. This endpoint does not load OCR
+models.
 
 `POST /v1/jobs` with `{"type":"modelPrepare","params":{}}` prepares the text, CLIP image,
 and paired CLIP text sessions without indexing a root. It is the Settings prepare/retry action.
@@ -989,24 +990,58 @@ the nearest ones, so a query with no semantic relation to the library still come
 large distances. A caller that wants "close enough" rather than "closest" sets `maxDistance`; the
 text modes have no such parameter and reject it.
 
+### Search sessions and process identity
+
+Health and status responses include `instanceId`, unique to the Rust process lifetime. Clients
+must discard process-owned job/subscription state when it changes, even if they missed the
+intervening disconnect. On any reconnect, refresh libraries, runtime state and job subscriptions.
+
+Searches can send `x-nicegal-search-client`, `x-nicegal-search-generation` and
+`x-nicegal-search-lane` together. Client IDs are scoped to a browser document. Generations increase
+with user intent; lanes (`literal`, `files`, `meaning`, `visual`) can run concurrently. Rust cancels
+older generations and earlier work in the same lane, rejecting late superseded requests.
+`POST /v1/search/session` with `{ "client": "...", "throughGeneration": 12 }` cancels work through
+that generation, including requests that have not arrived yet. It cannot cancel a newer generation.
+The registry retains inactive session watermarks for 24 hours and is capped at 4096 clients.
+
 ### Jobs
 
 The server runs one resource-intensive job at a time. Other job types return `409 Conflict` with
 `job_busy` while one runs. A `libraryScan` instead returns `202` with status `queued` if the worker
-is occupied, so a client can request a scan without first waiting for the slot. At most one scan
-waits, and the newest request wins: a request for the queued library returns the same job ID and
-merges into it (`scanMode: "full"` wins over `"fast"`; a request without `pendingOnly` wins over
-one with it; `force` and `retryFailed` stay enabled if
-either request enabled them), while a request for another library cancels the queued scan and
-takes its place. A queued scan lives only in server memory; the folders it would have scanned stay
-`scanPending` for the next request. Job state is held in memory for
-the server's lifetime, with at most 32 recent jobs retained. Electron should retain the returned
-`jobId`, or rediscover it with the collection GET, then poll the item GET while the status is
+is occupied. Each library keeps one queued scan; requests for that library merge
+(`full` wins over `fast`, an unrestricted scan wins over `pendingOnly`, and enabled retry/force
+options are retained). Requests from another client do not replace another library's queue entry.
+The frontend reports its selected library through `POST /v1/library-view` with
+`{ "client": "...", "generation": 1, "libraryId": 7 }` (`libraryId: null` clears a view).
+Rust ignores older view generations, starts a fast scan on the first view in a process, and
+requests pending work on later visits or edits. `DELETE /v1/library-view` with `{ "client": "..." }`
+releases a disconnected client permanently; reconnect uses a fresh client lifetime ID. Automatic
+scans stop only when no client views their library. Accepted thumbnail and purge jobs are
+independent of views. No automatic scans are scheduled for unviewed libraries.
+
+Job IDs are opaque strings containing the backend instance ID. A job ID from a previous process
+is rejected, including for cancellation. Keep the returned `jobId`, or rediscover it using the
+collection GET, then poll while the status is
 nonterminal. For live UI counters, prefer the SSE item-events route: it sends the current snapshot
 immediately, coalesces updates for slow consumers so they receive the newest state, sends a
 keepalive every 15 seconds, and closes after delivering a terminal snapshot. The regular item GET
 is the reconnect and non-streaming fallback. Every library job snapshot, including entries from
 `GET /v1/jobs`, has `libraryId`; jobs not tied to a library omit it.
+
+Job starts may carry `x-nicegal-request-id`. Repeating that key with the same body returns the
+original job while it is retained; changing the body is rejected. Keys are remembered for 24 hours
+within one backend lifetime (at most 4096). A key whose job snapshot was evicted returns
+`job_not_found`, rather than starting the work again. Clients must not retry writes automatically
+across a changed backend instance.
+
+Rust records accepted thumbnail-backfill requests beside the asset database and resumes them on
+startup. Completion, failure, and explicit cancellation clear the record; shutdown retains it.
+The renderer no longer owns a local-storage resume record. Destructive jobs are not automatically
+replayed after a backend crash.
+
+`libraryPurge` accepts `removeLibrary: true` to remove the definition after a successful whole-library
+purge. This option cannot be combined with folder-specific purging. Cancellation or a failed batch
+leaves the definition intact. Finishing this operation never requires an attached browser.
 
 Job creation uses a stable typed envelope so future OCR inference, CLIP, thumbnail, or maintenance
 jobs can share the lifecycle API. Download and compile a PaddleOCR detector and recognizer by
@@ -1339,6 +1374,34 @@ failures do not fail the batch. The route resolves the query once, decodes origi
 batches uncached model inference. Its 256 MB in-memory patch cache is shared with `/patches` and
 clears when the active model changes. Video cache entries are keyed by sample timestamp. More than 32 targets or an invalid ID returns `invalid_request`;
 an unavailable model returns `models_not_ready`.
+
+### Image tags
+
+`GET /v1/assets/tags?assetId=41&hideOffensive=true` returns zero-shot tags for one asset from its
+stored vector in the active image model, ranked against the
+[bep256/clip-tags](https://huggingface.co/bep256/clip-tags) vocabulary:
+
+```json
+{
+  "model": "facebook/metaclip-2-worldwide-l14",
+  "supported": true,
+  "simple": [{ "term": "embarrassed", "source": "metaclip", "sensitivity": "ok", "similarity": 0.22, "score": 0.09 }],
+  "subjects": [{ "term": "sailor suit", "source": "metaclip", "sensitivity": "ok", "similarity": 0.21, "score": 0.08 }],
+  "vibes": [{ "term": "blushing", "source": "metaclip", "sensitivity": "ok", "similarity": 0.24, "score": 0.11 }]
+}
+```
+
+`simple` (common everyday words like car or happy), `subjects` and `vibes` each hold up to 15
+tags, best first. `score` is `similarity` minus the tag's
+mean similarity over a public reference image set, so tags that match most images rank low.
+`sensitivity` is `ok`, `mature` (descriptive adult terms) or `blocked` (slurs and crude or
+sexualizing labels); `hideOffensive`, on unless `false`, leaves out `blocked` tags.
+
+Tags exist for the MetaCLIP2 models and SigLIP2. With any other active model the response has
+`supported: false` and empty lists. The first request for a model downloads `vocabulary.tsv` and
+that model's embeddings file (about 60 to 95 MB) into the Hugging Face cache, so it can take a
+while; later requests read the memory-mapped cache file. Only the active model's tags stay loaded.
+An asset without a current vector in the active index returns `invalid_request`.
 
 ## Image model selection
 

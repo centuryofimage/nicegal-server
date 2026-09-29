@@ -14,8 +14,8 @@ pub use image::{
     ImageEmbedder, ImageEmbedderOptions, ImageEmbeddingModel, ImageQueryEmbedder,
     ImageQueryEmbedderOptions,
 };
-pub use patches::PatchFeatures;
 pub use model::{ParseTextEmbeddingModelError, TextEmbeddingModel};
+pub use patches::PatchFeatures;
 
 /// How a [`TextEmbedder`] is built.
 #[derive(Debug, Clone)]

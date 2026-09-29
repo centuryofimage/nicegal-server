@@ -404,7 +404,7 @@ impl Job {
         JobResponse {
             index_stages: data.index_stages,
             folders: data.folders.clone(),
-            job_id: id.to_string(),
+            job_id: wire_job_id(id),
             library_id,
             kind,
             status: data.status,
@@ -761,10 +761,14 @@ struct JobRegistry {
     active: Option<u64>,
     jobs: BTreeMap<u64, Arc<Job>>,
     queued: VecDeque<(u64, JobSpec)>,
+    views: BTreeMap<String, (u64, Option<i64>, Instant)>,
+    visited: BTreeSet<i64>,
 }
 
 pub(crate) struct JobManager {
     next_id: AtomicU64,
+    view_changes: Mutex<()>,
+    requests: tokio::sync::Mutex<BTreeMap<String, (String, u64, Instant)>>,
     shutting_down: AtomicBool,
     registry: Mutex<JobRegistry>,
     databases: Arc<Databases>,
@@ -788,6 +792,8 @@ impl JobManager {
     ) -> Self {
         Self {
             next_id: AtomicU64::new(1),
+            view_changes: Mutex::new(()),
+            requests: tokio::sync::Mutex::new(BTreeMap::new()),
             shutting_down: AtomicBool::new(false),
             registry: Mutex::new(JobRegistry::default()),
             databases,
@@ -800,6 +806,131 @@ impl JobManager {
         }
     }
 
+    fn resume_path(&self) -> PathBuf {
+        self.databases.assets.with_extension("pending-job.json")
+    }
+
+    fn clear_resume(&self) {
+        if let Err(error) = std::fs::remove_file(self.resume_path())
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::error!(?error, "could not clear interrupted job record");
+        }
+    }
+
+    fn resume_thumbnail_job(self: &Arc<Self>) -> anyhow::Result<()> {
+        match std::fs::read(self.resume_path()) {
+            Ok(bytes) => {
+                let request: JobRequest = serde_json::from_slice(&bytes)?;
+                let spec = request
+                    .prepare()
+                    .map_err(|error| anyhow::anyhow!(error.message))?;
+                if matches!(spec, JobSpec::ThumbnailGenerate(_)) {
+                    self.start(spec)
+                        .map_err(|error| anyhow::anyhow!(error.message))?;
+                } else {
+                    anyhow::bail!("invalid interrupted job record");
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn recover(self: &Arc<Self>) -> anyhow::Result<()> {
+        if let Err(error) = self.resume_thumbnail_job() {
+            tracing::error!(?error, "could not resume thumbnail work");
+        }
+        Ok(())
+    }
+
+    /// A view is client-owned; scan admission and cancellation remain server-owned.
+    pub(super) fn set_view(
+        self: &Arc<Self>,
+        client: String,
+        generation: u64,
+        library: Option<i64>,
+    ) -> Result<(), ApiError> {
+        let _transition = self.view_changes.lock();
+        let (stop, start) = {
+            let mut registry = self.registry();
+            registry.views.retain(|_, (_, library, at)| {
+                library.is_some() || at.elapsed() < Duration::from_secs(86400)
+            });
+            let previous = registry.views.get(&client).copied();
+            if previous.is_some_and(|(seen, _, _)| generation <= seen) {
+                return Ok(());
+            }
+            if previous.is_none() && registry.views.len() >= 4096 {
+                return Err(ApiError::bad_request("too many library views"));
+            }
+            let old_library = previous.and_then(|(_, id, _)| id);
+            let already_viewed = library.is_some_and(|id| {
+                registry
+                    .views
+                    .values()
+                    .any(|(_, value, _)| *value == Some(id))
+            });
+            registry
+                .views
+                .insert(client, (generation, library, Instant::now()));
+            let stop = old_library.filter(|id| {
+                !registry
+                    .views
+                    .values()
+                    .any(|(_, value, _)| *value == Some(*id))
+            });
+            let start = library
+                .filter(|_| !already_viewed)
+                .map(|id| (id, !registry.visited.insert(id)));
+            (stop, start)
+        };
+        if let Some(id) = stop {
+            let ids: Vec<_> = self
+                .registry()
+                .jobs
+                .values()
+                .filter(|job| {
+                    job.kind == JobKind::LibraryScan
+                        && job.library_id == Some(id)
+                        && !job.response().status.is_terminal()
+                })
+                .map(|job| job.id)
+                .collect();
+            for id in ids {
+                self.cancel(id);
+            }
+        }
+        if let Some((id, pending_only)) = start {
+            self.schedule_scan(id, pending_only)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn schedule_viewed_scan(self: &Arc<Self>, library: i64) -> Result<(), ApiError> {
+        let _transition = self.view_changes.lock();
+        let viewed = self
+            .registry()
+            .views
+            .values()
+            .any(|(_, id, _)| *id == Some(library));
+        if viewed {
+            self.schedule_scan(library, true)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn schedule_scan(
+        self: &Arc<Self>,
+        library_id: i64,
+        pending_only: bool,
+    ) -> Result<(), ApiError> {
+        let request: JobRequest = serde_json::from_value(serde_json::json!({"type":"libraryScan", "params": {"libraryId":library_id,"scanMode":"fast","pendingOnly":pending_only}})).map_err(|error| ApiError::internal(error.into()))?;
+        self.start(request.prepare()?)?;
+        Ok(())
+    }
+
     fn registry(&self) -> MutexGuard<'_, JobRegistry> {
         self.registry.lock()
     }
@@ -810,7 +941,6 @@ impl JobManager {
             scan.apply_settings(&self.runtime)
                 .map_err(ApiError::internal)?;
         }
-        let mut replaced = Vec::new();
         let (job, run_now) = {
             let mut registry = self.registry();
             if self.shutting_down.load(Ordering::Acquire) {
@@ -822,10 +952,9 @@ impl JobManager {
                     return Err(ApiError::job_busy());
                 }
             }
-            // At most one scan waits for the worker, and the newest request wins: a request for
-            // the queued library merges into it, and one for another library replaces it.
+            // Each library keeps one queued scan. Clients cannot replace another library's work.
             if let Some(JobSpec::LibraryScan(ref incoming)) = spec
-                && let Some((id, JobSpec::LibraryScan(queued))) = registry.queued.front_mut()
+                && let Some((id, JobSpec::LibraryScan(queued))) = registry.queued.iter_mut().find(|(_, spec)| matches!(spec, JobSpec::LibraryScan(queued) if queued.library_id() == incoming.library_id()))
                 && queued.library_id() == incoming.library_id()
             {
                 queued.merge(incoming);
@@ -834,8 +963,17 @@ impl JobManager {
                     registry.jobs.get(&id).expect("queued job exists"),
                 ));
             }
-            if registry.active.is_some() {
-                replaced.extend(registry.queued.drain(..).map(|(id, _)| id));
+            if let Some(JobSpec::ThumbnailGenerate(thumbnails)) = spec.as_ref() {
+                let path = self.resume_path();
+                let temporary = path.with_extension("json.tmp");
+                std::fs::write(
+                    &temporary,
+                    serde_json::to_vec(&thumbnails.resume_request())
+                        .map_err(|error| ApiError::internal(error.into()))?,
+                )
+                .map_err(|error| ApiError::internal(error.into()))?;
+                std::fs::rename(&temporary, &path)
+                    .map_err(|error| ApiError::internal(error.into()))?;
             }
             evict_retained_jobs(&mut registry);
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -853,10 +991,6 @@ impl JobManager {
             registry.jobs.insert(id, Arc::clone(&job));
             (job, run_now)
         };
-        // Outside the registry lock: cancelling records the replaced scan's folders as stopped.
-        for id in replaced {
-            self.cancel(id);
-        }
         if run_now {
             self.spawn_job(spec.take().unwrap(), Arc::clone(&job));
         }
@@ -884,6 +1018,11 @@ impl JobManager {
                         manager.record_stopped_scan(&worker_job, ScanOutcome::Failed, &message);
                         worker_job.fail(message);
                     }
+                }
+                if worker_job.kind == JobKind::ThumbnailGenerate
+                    && !manager.shutting_down.load(Ordering::Acquire)
+                {
+                    manager.clear_resume();
                 }
                 manager.finish(worker_job.id);
             }
@@ -1086,8 +1225,18 @@ impl JobManager {
     fn cancel(&self, id: u64) -> Option<Arc<Job>> {
         let job = self.get(id)?;
         let queued = job.response().status == JobStatus::Queued;
+        let active = !job.response().status.is_terminal();
         job.request_cancel();
+        if active
+            && job.kind == JobKind::ThumbnailGenerate
+            && !self.shutting_down.load(Ordering::Acquire)
+        {
+            self.clear_resume();
+        }
         if queued {
+            self.registry()
+                .queued
+                .retain(|(queued_id, _)| *queued_id != id);
             self.record_stopped_scan(&job, ScanOutcome::Cancelled, "cancelled");
         }
         Some(job)
@@ -1101,7 +1250,7 @@ impl JobManager {
                     .jobs
                     .get(&id)
                     .filter(|job| !job.response().status.is_terminal())
-                    .map(|_| id.to_string())
+                    .map(|_| wire_job_id(id))
             }),
             jobs: registry
                 .jobs
@@ -1112,12 +1261,22 @@ impl JobManager {
         }
     }
 
-    pub(super) fn has_active_job(&self) -> bool {
+    /// Hold job admission while a runtime configuration write checks and updates its state.
+    pub(super) fn update_runtime(
+        &self,
+        requires_idle: bool,
+        update: impl FnOnce() -> anyhow::Result<()>,
+    ) -> Result<(), ApiError> {
         let registry = self.registry();
-        registry
-            .active
-            .and_then(|id| registry.jobs.get(&id))
-            .is_some_and(|job| !job.data().status.is_terminal())
+        if requires_idle
+            && registry
+                .active
+                .and_then(|id| registry.jobs.get(&id))
+                .is_some_and(|job| !job.data().status.is_terminal())
+        {
+            return Err(ApiError::job_busy());
+        }
+        update().map_err(ApiError::internal)
     }
 
     pub(crate) fn cancel_all(&self) {
@@ -1222,9 +1381,46 @@ async fn list_jobs(State(state): State<AppState>) -> Json<JobListResponse> {
 
 async fn create_job(
     State(state): State<AppState>,
-    ApiJson(request): ApiJson<JobRequest>,
+    headers: axum::http::HeaderMap,
+    ApiJson(value): ApiJson<serde_json::Value>,
 ) -> Result<(StatusCode, Json<JobResponse>), ApiError> {
-    let job = start_job(&state, request.prepare()?).await?;
+    let key = headers
+        .get("x-nicegal-request-id")
+        .map(|value| value.to_str().map(str::to_owned))
+        .transpose()
+        .map_err(|_| ApiError::bad_request("invalid request ID"))?;
+    if key.as_ref().is_some_and(|key| {
+        key.is_empty()
+            || key.len() > 160
+            || !key
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_:".contains(&b))
+    }) {
+        return Err(ApiError::bad_request("invalid request ID"));
+    }
+    let fingerprint =
+        serde_json::to_string(&value).map_err(|error| ApiError::internal(error.into()))?;
+    let request: JobRequest =
+        serde_json::from_value(value).map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let spec = request.prepare()?;
+    let mut requests = state.jobs.requests.lock().await;
+    requests.retain(|_, (_, _, at)| at.elapsed() < Duration::from_secs(86400));
+    if let Some((previous, id, _)) = key.as_ref().and_then(|key| requests.get(key)) {
+        if previous != &fingerprint {
+            return Err(ApiError::bad_request(
+                "request ID was already used for another job",
+            ));
+        }
+        let job = state.jobs.get(*id).ok_or_else(ApiError::job_not_found)?;
+        return Ok((StatusCode::ACCEPTED, Json(job.response())));
+    }
+    if key.is_some() && requests.len() >= 4096 {
+        return Err(ApiError::bad_request("too many retained job requests"));
+    }
+    let job = start_job(&state, spec).await?;
+    if let Some(key) = key {
+        requests.insert(key, (fingerprint, job.id, Instant::now()));
+    }
     Ok((StatusCode::ACCEPTED, Json(job.response())))
 }
 
@@ -1272,7 +1468,14 @@ async fn cancel_job(
     Ok((status, Json(response)))
 }
 
+fn wire_job_id(id: u64) -> String {
+    format!("{}-{id}", super::instance_id())
+}
+
 fn parse_job_id(value: &str) -> Result<u64, ApiError> {
+    let value = value
+        .strip_prefix(&format!("{}-", super::instance_id()))
+        .ok_or_else(ApiError::job_not_found)?;
     let id = value
         .parse::<u64>()
         .map_err(|_| ApiError::bad_request("job identifier must be a positive integer"))?;
@@ -1352,7 +1555,7 @@ mod tests {
         job.request_cancel();
 
         let response = job.response();
-        assert_eq!(response.job_id, "7");
+        assert_eq!(response.job_id, wire_job_id(7));
         assert_eq!(response.kind, JobKind::OcrModelLoad);
         assert_eq!(response.status, JobStatus::Cancelling);
         assert_eq!(response.phase, JobPhase::Scanning);
@@ -1503,8 +1706,8 @@ mod tests {
     }
 
     #[test]
-    fn job_identifiers_must_be_positive_integers() {
-        assert_eq!(parse_job_id("42").unwrap(), 42);
+    fn job_identifiers_belong_to_this_backend_instance() {
+        assert_eq!(parse_job_id(&wire_job_id(42)).unwrap(), 42);
         for invalid in ["0", "-1", "not-a-job"] {
             assert!(parse_job_id(invalid).is_err(), "{invalid}");
         }
@@ -1628,19 +1831,140 @@ mod tests {
         assert!(stream.next().await.is_none());
     }
 
+    // An inert active job keeps scheduling tests deterministic without model loading or I/O work.
+    fn hold_active_job(manager: &JobManager, kind: JobKind) -> Arc<Job> {
+        let id = manager.next_id.fetch_add(1, Ordering::Relaxed);
+        let job = Arc::new(Job::new(id, kind));
+        assert!(job.begin());
+        let mut registry = manager.registry();
+        registry.active = Some(id);
+        registry.jobs.insert(id, Arc::clone(&job));
+        job
+    }
+
+    #[test]
+    fn library_views_share_work_and_ignore_late_updates_after_release() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = test_manager(&temp);
+        hold_active_job(&manager, JobKind::ModelPrepare);
+        manager.schedule_viewed_scan(7).unwrap();
+        assert!(
+            manager.registry().queued.is_empty(),
+            "unviewed libraries stay idle"
+        );
+        manager.set_view("desktop".into(), 1, Some(7)).unwrap();
+        let first = manager.registry().queued[0].0;
+        manager.set_view("phone".into(), 1, Some(7)).unwrap();
+        assert_eq!(manager.registry().queued.len(), 1);
+        manager.set_view("desktop".into(), 2, Some(8)).unwrap();
+        assert_eq!(manager.registry().queued.len(), 2);
+        assert_eq!(
+            manager.get(first).unwrap().response().status,
+            JobStatus::Queued
+        );
+        manager.set_view("phone".into(), u64::MAX, None).unwrap();
+        assert_eq!(
+            manager.get(first).unwrap().response().status,
+            JobStatus::Cancelled
+        );
+        assert_eq!(manager.registry().queued.len(), 1);
+        manager.set_view("phone".into(), 2, Some(7)).unwrap();
+        manager.set_view("desktop".into(), 1, Some(7)).unwrap();
+        assert_eq!(
+            manager.registry().queued.len(),
+            1,
+            "late updates cannot resurrect closed views"
+        );
+        manager.set_view("desktop".into(), 3, Some(7)).unwrap();
+        let registry = manager.registry();
+        assert_eq!(registry.queued.len(), 1);
+        assert_ne!(
+            registry.queued[0].0, first,
+            "returning must not merge into a cancelled scan"
+        );
+    }
+
     #[tokio::test]
-    async fn manager_rejects_concurrent_jobs_and_cancels_queued_work() {
-        crate::api::tests::initialize_test_runtime();
-        let runtime_config_dir = tempfile::TempDir::new().unwrap();
-        let current_dir = PathBuf::try_from(runtime_config_dir.path().to_path_buf()).unwrap();
-        let request: JobRequest = serde_json::from_value(serde_json::json!({
-            "type": "ocrModelLoad",
-            "params": {
-                "detection": { "modelId": "owner/detection" },
-                "recognition": { "modelId": "owner/recognition" }
-            }
-        }))
+    async fn thumbnail_recovery_rejects_destructive_records_and_bad_records_do_not_block_startup() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = test_manager(&temp);
+        for record in [
+            "not json",
+            r#"{"type":"libraryPurge","params":{"libraryId":1,"removeLibrary":true}}"#,
+        ] {
+            std::fs::write(manager.resume_path(), record).unwrap();
+            assert!(manager.resume_thumbnail_job().is_err());
+            manager.recover().await.unwrap();
+            assert!(manager.list().jobs.is_empty());
+        }
+    }
+
+    #[test]
+    fn thumbnail_resume_record_survives_old_cancellation_and_shutdown_but_not_explicit_cancel() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = test_manager(&temp);
+        let old = hold_active_job(&manager, JobKind::ThumbnailGenerate);
+        old.complete(false);
+        let current = hold_active_job(&manager, JobKind::ThumbnailGenerate);
+        std::fs::write(manager.resume_path(), b"pending work").unwrap();
+        manager.cancel(old.id).unwrap();
+        assert!(manager.resume_path().exists());
+        manager.cancel(current.id).unwrap();
+        assert!(!manager.resume_path().exists());
+        std::fs::write(manager.resume_path(), b"pending work").unwrap();
+        manager.cancel_all();
+        assert!(manager.resume_path().exists());
+    }
+
+    #[tokio::test]
+    async fn interrupted_thumbnails_resume_without_a_frontend_and_completed_work_is_not_replayed() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let manager = test_manager(&temp);
+        let library = nicegal_core::assets::AssetCatalog::new(&manager.databases.assets)
+            .unwrap()
+            .create_library(
+                &nicegal_core::libraries::LibraryDefinition {
+                    include: vec![PathBuf::try_from(temp.path().to_path_buf()).unwrap()],
+                    exclude: Vec::new(),
+                    options: Default::default(),
+                },
+                None,
+            )
+            .unwrap();
+        let nicegal_core::libraries::Created::New(library) = library else {
+            panic!("new library expected")
+        };
+        std::fs::write(
+            manager.resume_path(),
+            serde_json::json!({
+                "type": "thumbnailGenerate", "params": { "libraryId": library.id }
+            })
+            .to_string(),
+        )
         .unwrap();
+        manager.recover().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if manager.registry().active.is_none() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("recovered empty-library job should complete");
+        let jobs = manager.list().jobs;
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].status, JobStatus::Completed, "{jobs:?}");
+        assert!(!manager.resume_path().exists());
+        let restarted = test_manager(&temp);
+        restarted.recover().await.unwrap();
+        assert!(restarted.list().jobs.is_empty());
+    }
+
+    fn test_manager(runtime_config_dir: &tempfile::TempDir) -> Arc<JobManager> {
+        crate::api::tests::initialize_test_runtime();
+        let current_dir = PathBuf::try_from(runtime_config_dir.path().to_path_buf()).unwrap();
         let thumbnail_path = current_dir.join("unused-thumbnails.db");
         let runtime = Arc::new(
             crate::api::RuntimeSettings::load(
@@ -1649,7 +1973,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let manager = Arc::new(JobManager::new(
+        Arc::new(JobManager::new(
             Arc::new(Databases {
                 assets: current_dir.join("unused-assets.db"),
                 images: current_dir.join("unused-images.db"),
@@ -1670,7 +1994,21 @@ mod tests {
                 nicegal_core::runtime::ExecutionProvider::Cpu,
             )),
             runtime,
-        ));
+        ))
+    }
+
+    #[tokio::test]
+    async fn manager_rejects_concurrent_jobs_and_cancels_queued_work() {
+        let runtime_config_dir = tempfile::TempDir::new().unwrap();
+        let manager = test_manager(&runtime_config_dir);
+        let request: JobRequest = serde_json::from_value(serde_json::json!({
+            "type": "ocrModelLoad",
+            "params": {
+                "detection": { "modelId": "owner/detection" },
+                "recognition": { "modelId": "owner/recognition" }
+            }
+        }))
+        .unwrap();
         let job = manager.start(request.prepare().unwrap()).unwrap();
 
         let second: JobRequest = serde_json::from_value(serde_json::json!({
@@ -1703,11 +2041,11 @@ mod tests {
         assert_ne!(replacement.id, queued.id);
         assert_eq!(
             queued.response().status,
-            JobStatus::Cancelled,
-            "another library replaces it"
+            JobStatus::Queued,
+            "another library keeps its place"
         );
         assert_eq!(replacement.response().status, JobStatus::Queued);
-        assert_eq!(manager.registry().queued.len(), 1);
+        assert_eq!(manager.registry().queued.len(), 2);
 
         let mut updates = job.subscribe();
         manager.cancel_all();

@@ -30,12 +30,14 @@ fastembed = { path = "vendor/fastembed", version = "7.1.0", default-features = f
 fast_image_resize = { version = "6.1.0", default-features = false, features = ["std"] }
 gif = { version = "0.14.2", default-features = false, features = ["std"] }
 glob = "0.3.4"
+half = "2.7.1"
 hf-hub = { version = "0.5.0", default-features = false, features = ["native-tls", "tokio", "ureq"] }
 imagesize = "0.15.0"
 image = { version = "0.25.10", default-features = false, features = ["bmp"] }
 image-webp = "0.2.4"
 itertools = "0.15.0"
 libc = "0.2"
+memmap2 = "0.9.11"
 kdam = { version = "0.6.4", features = ["rayon"] }
 mozjpeg = "0.10.13"
 ndarray = { version = "0.17.2", default-features = false }
@@ -44,6 +46,7 @@ ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "
 png = "0.18.1"
 rayon = "1.12.0"
 regex = { version = "1.13.1", optional = true }
+safetensors = "0.8.0"
 rusqlite = { version = "0.40.2", features = ["bundled", "hooks", "functions"] }
 sqlite-vec = "0.1.9"
 serde = { version = "1.0.229", features = ["derive"] }

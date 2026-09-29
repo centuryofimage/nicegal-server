@@ -430,23 +430,20 @@ async fn update(
         .map(str::parse::<nicegal_core::embedding::ImageEmbeddingModel>)
         .transpose()
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    if state.jobs.has_active_job()
-        && (request.execution_provider.is_some() || request.image_model.is_some())
-    {
-        return Err(ApiError::job_busy());
-    }
     if let Some(model) = model
         && !model.available()
     {
         return Err(ApiError::bad_request("Image model is unavailable"));
     }
     let runtime = Arc::clone(&state.runtime);
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        runtime.update_all(execution_provider, model, ocr_models.as_ref())
+    let jobs = Arc::clone(&state.jobs);
+    tokio::task::spawn_blocking(move || {
+        jobs.update_runtime(execution_provider.is_some() || model.is_some(), || {
+            runtime.update_all(execution_provider, model, ocr_models.as_ref())
+        })
     })
     .await
-    .map_err(|error| ApiError::internal(anyhow!("runtime settings task failed: {error}")))?
-    .map_err(ApiError::internal)?;
+    .map_err(|error| ApiError::internal(anyhow!("runtime settings task failed: {error}")))??;
     Ok((StatusCode::OK, Json(status_response(&state))))
 }
 

@@ -1,10 +1,11 @@
 //! Library definitions: named-by-folder groups of included and excluded directories.
 //!
 //! A library's scope is evaluated against catalog paths on every read, so these endpoints only
-//! write definitions. Folders that gain visible files are marked `scanPending`; the client
-//! requests the scan when it wants the library brought up to date.
+//! write definitions. Folders that gain visible files are marked `scanPending` and queued
+//! by the backend, independently of the client that saved the edit.
 
 use std::io::ErrorKind;
+use std::sync::Arc;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -41,6 +42,10 @@ pub(super) fn scope(databases: &Databases, library_id: i64) -> Result<PathScope,
 pub(super) fn routes() -> Router<AppState> {
     Router::new()
         .route("/v1/libraries", get(list).post(create))
+        .route(
+            "/v1/library-view",
+            axum::routing::post(set_view).delete(release_view),
+        )
         .route(
             "/v1/libraries/{library_id}",
             get(read).put(update).delete(remove),
@@ -152,11 +157,67 @@ async fn read(
     Ok(Json(library.into()))
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LibraryView {
+    client: String,
+    generation: u64,
+    library_id: Option<i64>,
+}
+
+async fn set_view(
+    State(state): State<AppState>,
+    ApiJson(view): ApiJson<LibraryView>,
+) -> Result<StatusCode, ApiError> {
+    validate_view_client(&view.client)?;
+    run_blocking(move || {
+        if let Some(id) = view.library_id {
+            scope(&state.databases, id)?;
+        }
+        state
+            .jobs
+            .set_view(view.client, view.generation, view.library_id)?;
+        Ok(StatusCode::NO_CONTENT)
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReleaseView {
+    client: String,
+}
+
+fn validate_view_client(client: &str) -> Result<(), ApiError> {
+    if client.is_empty()
+        || client.len() > 128
+        || !client
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_:".contains(&b))
+    {
+        return Err(ApiError::bad_request("invalid view client"));
+    }
+    Ok(())
+}
+
+async fn release_view(
+    State(state): State<AppState>,
+    ApiJson(view): ApiJson<ReleaseView>,
+) -> Result<StatusCode, ApiError> {
+    validate_view_client(&view.client)?;
+    run_blocking(move || {
+        state.jobs.set_view(view.client, u64::MAX, None)?;
+        Ok(StatusCode::NO_CONTENT)
+    })
+    .await
+}
+
 async fn create(
     State(state): State<AppState>,
     ApiJson(request): ApiJson<CreateRequest>,
 ) -> Result<(StatusCode, Json<LibraryResponse>), ApiError> {
-    run_blocking(move || {
+    let jobs = Arc::clone(&state.jobs);
+    let result: (StatusCode, Json<LibraryResponse>) = run_blocking(move || {
         let defaults = LibraryOptions::default();
         let allow_missing = request.import_key.is_some();
         let definition = LibraryDefinition {
@@ -179,7 +240,11 @@ async fn create(
             },
         )
     })
-    .await
+    .await?;
+    if let Err(error) = jobs.schedule_viewed_scan(result.1.0.id) {
+        tracing::warn!(?error, "saved library scan remains pending");
+    }
+    Ok(result)
 }
 
 /// Replace a library's definition. There is no edit conflict check: the server has exactly one
@@ -189,7 +254,8 @@ async fn update(
     Path(library_id): Path<i64>,
     ApiJson(request): ApiJson<UpdateRequest>,
 ) -> Result<Json<LibraryResponse>, ApiError> {
-    run_blocking(move || {
+    let jobs = Arc::clone(&state.jobs);
+    let result = run_blocking(move || {
         let mut catalog = AssetCatalog::new(&state.databases.assets)?;
         let current = catalog
             .library(library_id)?
@@ -212,7 +278,11 @@ async fn update(
             .map(|library| Json(library.into()))
             .ok_or_else(|| ApiError::library_not_found(library_id))
     })
-    .await
+    .await?;
+    if let Err(error) = jobs.schedule_viewed_scan(library_id) {
+        tracing::warn!(?error, library_id, "saved library scan remains pending");
+    }
+    Ok(result)
 }
 
 async fn remove(

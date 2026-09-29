@@ -10,6 +10,9 @@ use hf_hub::api::tokio::{Api, ApiBuilder, Progress};
 use hf_hub::{Cache, Repo, RepoType};
 use tracing::{debug, error, info};
 
+mod retire;
+pub(crate) use retire::retire_files;
+
 #[derive(Debug)]
 struct DownloadCancelled;
 

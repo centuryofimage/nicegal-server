@@ -45,9 +45,9 @@ export async function createAndWaitForJob(endpoint, token, type, params, stderrT
 }
 
 export async function waitForJob(endpoint, token, job, stderrTail = () => '') {
-  if (!/^[1-9]\d*$/.test(job.jobId)) throw new Error(`invalid job ID: ${job.jobId}`)
+  if (typeof job.jobId !== 'string' || job.jobId.length === 0) throw new Error(`invalid job ID: ${job.jobId}`)
   if (!terminalStatuses.has(job.status)) {
-    const response = await fetch(`${endpoint}/v1/jobs/${job.jobId}/events`, {
+    const response = await fetch(`${endpoint}/v1/jobs/${encodeURIComponent(job.jobId)}/events`, {
       headers: { authorization: `Bearer ${token}` }
     })
     if (response.status !== 200) {

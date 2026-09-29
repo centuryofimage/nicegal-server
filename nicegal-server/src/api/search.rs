@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use super::error::ApiError;
 use super::external_image::{self, ExternalImageRequest};
 use super::extract::{ApiJson, ApiQuery};
-use super::{AppState, libraries, run_cancellable as run_search};
+use super::{AppState, libraries, run_cancellable_with as run_search};
 
 const DEFAULT_LIMIT: usize = 100_000;
 const MAX_LIMIT: usize = 250_000;
@@ -405,6 +405,7 @@ pub(super) fn route() -> MethodRouter<AppState> {
 
 async fn search(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     ApiQuery(request): ApiQuery<SearchRequest>,
 ) -> Result<Json<SearchResponse>, ApiError> {
     let query = validate_query(&request.q)?.to_owned();
@@ -431,8 +432,11 @@ async fn search(
         queries: vec![plan],
         fusion: None,
     };
-    let response =
-        run_search(move |cancellation| execute_search(state, batch, cancellation, false)).await?;
+    let session = super::search_sessions::begin(&headers)?;
+    let response = run_search(session.cancellation.clone(), move |cancellation| {
+        execute_search(state, batch, cancellation, false)
+    })
+    .await?;
     let QueryResponse {
         total,
         results: hits,
@@ -451,12 +455,16 @@ async fn search(
 
 async fn multi_search(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     ApiJson(request): ApiJson<MultiSearchRequest>,
 ) -> Result<Json<MultiSearchResponse>, ApiError> {
     let plan = plan_multi_search(request)?;
-    run_search(move |cancellation| execute_search(state, plan, cancellation, true))
-        .await
-        .map(Json)
+    let session = super::search_sessions::begin(&headers)?;
+    run_search(session.cancellation.clone(), move |cancellation| {
+        execute_search(state, plan, cancellation, true)
+    })
+    .await
+    .map(Json)
 }
 
 struct MultiSearchPlan {
@@ -1551,7 +1559,7 @@ mod tests {
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (resume_tx, resume_rx) = std::sync::mpsc::channel();
         let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
-        let request = tokio::spawn(run_search(move |cancellation| {
+        let request = tokio::spawn(super::super::run_cancellable(move |cancellation| {
             started_tx.send(()).unwrap();
             resume_rx
                 .recv_timeout(std::time::Duration::from_secs(5))
@@ -1568,7 +1576,7 @@ mod tests {
 
     #[tokio::test]
     async fn completing_search_does_not_cancel_its_token() {
-        let cancellation = run_search(Ok).await.unwrap();
+        let cancellation = super::super::run_cancellable(Ok).await.unwrap();
         assert!(cancellation.check().is_ok());
     }
 

@@ -34,6 +34,8 @@ struct ModelSpec {
     dimensions: usize,
     license: &'static str,
     context_length: usize,
+    /// Whether query text is lowercased before tokenization, matching how the model was trained.
+    lowercase_text: bool,
     published_export: Option<(&'static str, &'static str)>,
     required_files: &'static [&'static str],
 }
@@ -75,9 +77,10 @@ impl ImageEmbeddingModel {
                 dimensions: 512,
                 license: "CC-BY-NC-4.0",
                 context_length: 77,
+                lowercase_text: false,
                 published_export: Some((
                     "bep256/metaclip-2-worldwide-b32-ONNX",
-                    "a70ddb6e8ac8a2be823ce11f2d296684e150802d",
+                    "b4ee5fd6043c2b33df398eb0288a6282706c1687",
                 )),
                 required_files: PAIRED_MODEL_FILES,
             },
@@ -87,9 +90,10 @@ impl ImageEmbeddingModel {
                 dimensions: 512,
                 license: "CC-BY-NC-4.0",
                 context_length: 77,
+                lowercase_text: false,
                 published_export: Some((
                     "bep256/metaclip-2-worldwide-b16-ONNX",
-                    "33cd628449b4e87dfc3f348d9843b32d32713860",
+                    "d96138fa24aa9cc3f46abf34a06f45f35e71bbba",
                 )),
                 required_files: PAIRED_MODEL_FILES,
             },
@@ -99,9 +103,10 @@ impl ImageEmbeddingModel {
                 dimensions: 768,
                 license: "CC-BY-NC-4.0",
                 context_length: 77,
+                lowercase_text: false,
                 published_export: Some((
                     "bep256/metaclip-2-worldwide-l14-ONNX",
-                    "c7193980d96e63812a6f70f8ef3feb934549326f",
+                    "77e0837a2b1d7134c6d5678133a5abadaa933bde",
                 )),
                 required_files: PAIRED_MODEL_FILES_WITH_TEXT_DATA,
             },
@@ -111,9 +116,10 @@ impl ImageEmbeddingModel {
                 dimensions: 768,
                 license: "Apache-2.0",
                 context_length: 64,
+                lowercase_text: true,
                 published_export: Some((
                     "bep256/siglip2-base-patch16-256-ONNX",
-                    "9b5bf05e40e88b58d8076b2508cc7495e75b3224",
+                    "1fa886058822dbe657d57cfa4e5686c6b886f910",
                 )),
                 required_files: PAIRED_MODEL_FILES,
             },
@@ -123,6 +129,7 @@ impl ImageEmbeddingModel {
                 dimensions: 1024,
                 license: "Apache-2.0",
                 context_length: 128,
+                lowercase_text: false,
                 published_export: None,
                 required_files: PAIRED_MODEL_FILES,
             },
@@ -132,6 +139,7 @@ impl ImageEmbeddingModel {
                 dimensions: 768,
                 license: "DINOv3 License",
                 context_length: 0,
+                lowercase_text: false,
                 published_export: Some((
                     "bep256/dinov3-vitb16-pretrain-lvd1689m-ONNX",
                     "05f9d720e2169b6b7ffa499db098d08dd374bd9d",
@@ -173,6 +181,17 @@ impl ImageEmbeddingModel {
     /// Image-only encoders cannot resolve descriptions in their vector space.
     pub const fn supports_text_queries(self) -> bool {
         self.context_length() > 0
+    }
+
+    /// The text a paired query encoder tokenizes for `text`. SigLIP2 was trained on lowercased
+    /// text and its published `tokenizer.json` does not lowercase, so its queries are lowercased
+    /// here. Other models see the text unchanged.
+    pub(super) fn prepare_query_text(self, text: &str) -> std::borrow::Cow<'_, str> {
+        if self.spec().lowercase_text {
+            std::borrow::Cow::Owned(text.to_lowercase())
+        } else {
+            std::borrow::Cow::Borrowed(text)
+        }
     }
 
     pub const fn is_deepghs(self) -> bool {
@@ -300,6 +319,37 @@ impl ImageEmbeddingModel {
         self.spec().required_files
     }
 
+    /// Called only after the replacement encoder has loaded successfully. Local overrides
+    /// never remove shared downloads. Old metadata stays available for provenance.
+    pub(super) fn retire_previous_encoder(self, text: bool) {
+        if self.local_directory().is_some() {
+            return;
+        }
+        let previous = match self {
+            Self::MetaClip2B32 => "a70ddb6e8ac8a2be823ce11f2d296684e150802d",
+            Self::MetaClip2B16 => "33cd628449b4e87dfc3f348d9843b32d32713860",
+            Self::MetaClip2L14 => "c7193980d96e63812a6f70f8ef3feb934549326f",
+            Self::SigLip2Base256 => "9b5bf05e40e88b58d8076b2508cc7495e75b3224",
+            _ => return,
+        };
+        let Some((repo, current)) = self.spec().published_export else {
+            return;
+        };
+        if current == previous {
+            return;
+        }
+        let files: &[&str] = if text {
+            &["text.onnx", "text.onnx_data"]
+        } else {
+            &["image.onnx"]
+        };
+        if let Err(error) =
+            crate::hub::retire_files(&crate::hub::cache_dir(), repo, previous, files)
+        {
+            warn!(%error, model = %self, "could not retire old encoder files; will retry on next load");
+        }
+    }
+
     pub fn available(self) -> bool {
         if self.is_deepghs() {
             return true;
@@ -361,7 +411,54 @@ impl ImageEmbeddingModel {
         {
             bail!("DINOv3 needs the validated 224px ONNX export");
         }
+        for filename in self.external_export_files(&manifest)? {
+            if self.local_directory().is_some() {
+                if !path.join(filename).is_file() {
+                    if cached_only {
+                        return Ok(None);
+                    }
+                    bail!("local export is missing {filename}");
+                }
+            } else {
+                let source = self
+                    .published_source(filename)
+                    .context("missing export source")?;
+                let file = if cached_only {
+                    source.cached()
+                } else {
+                    Some(source.get_sync_with_progress(progress)?)
+                };
+                let Some(file) = file else { return Ok(None) };
+                if file.parent() != Some(path.as_path()) {
+                    bail!("external model files were cached in different directories");
+                }
+            }
+        }
         Ok(Some(path))
+    }
+
+    /// Fixed filenames only: a manifest cannot request arbitrary paths or repositories.
+    fn external_export_files(
+        self,
+        manifest: &serde_json::Value,
+    ) -> Result<&'static [&'static str]> {
+        match manifest
+            .get("storageFormat")
+            .and_then(serde_json::Value::as_str)
+        {
+            None => Ok(&[]),
+            Some("external-weights-v1") => match self {
+                Self::MetaClip2B32 | Self::MetaClip2B16 | Self::MetaClip2L14 => {
+                    if manifest["patchGraph"].as_str() != Some("clearclip-v1") {
+                        bail!("external MetaCLIP export requires the clearclip-v1 graph");
+                    }
+                    Ok(&["image.onnx_data", "text.onnx_data", "image_patched.onnx"])
+                }
+                Self::SigLip2Base256 => Ok(&["image.onnx_data", "text.onnx_data"]),
+                _ => bail!("external-weights-v1 is not supported for {self}"),
+            },
+            Some(format) => bail!("unsupported export storage format: {format}"),
+        }
     }
 
     /// Model-specific database filename derived from the complete publisher/model slug.
@@ -613,12 +710,26 @@ impl ImageEmbedder {
             )
         };
         // Built once, outside provider retries: the graph with its patch output appended.
-        let patched_graph = options.model.patch_method().and_then(|method| {
-            Self::patched_graph(
-                &image,
-                method,
-                options.model == ImageEmbeddingModel::DinoV3B16,
-            )
+        let static_patch = if !deepghs {
+            let directory = image
+                .parent()
+                .context("image graph has no parent directory")?;
+            let manifest: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(directory.join("manifest.json"))?)?;
+            (manifest["patchGraph"].as_str() == Some("clearclip-v1")
+                && manifest["storageFormat"].as_str() == Some("external-weights-v1"))
+            .then(|| PatchedGraph::File(directory.join("image_patched.onnx")))
+        } else {
+            None
+        };
+        let patched_graph = static_patch.or_else(|| {
+            options.model.patch_method().and_then(|method| {
+                Self::patched_graph(
+                    &image,
+                    method,
+                    options.model == ImageEmbeddingModel::DinoV3B16,
+                )
+            })
         });
         let (backend, execution_provider) = runtime::with_fallback(options.runtime, |provider| {
             let configured = runtime::configure_provider(provider, options.runtime.intra_threads)?;
@@ -687,6 +798,7 @@ impl ImageEmbedder {
             execution_provider,
             patch_setup,
         };
+        options.model.retire_previous_encoder(false);
         info!(
             dimensions = embedder.dimensions(),
             max_batch = embedder.max_batch_size,
@@ -1102,9 +1214,10 @@ impl ImageQueryEmbedder {
             bail!("cannot embed an empty query");
         }
         let text = super::truncate_on_boundary(text, self.max_input_bytes);
+        let text = self.model.prepare_query_text(text);
         let mut vectors = self
             .backend
-            .embed(&[text], 1)
+            .embed(&[text.as_ref()], 1)
             .with_context(|| format!("running the {} image query model", self.model))?;
         if vectors.len() != 1 {
             bail!(
@@ -1213,6 +1326,24 @@ mod tests {
             assert_eq!(manifest["modelId"].as_str(), Some(model.id()));
         }
         Ok(())
+    }
+
+    #[test]
+    fn only_siglip2_lowercases_query_text() {
+        assert_eq!(
+            ImageEmbeddingModel::SigLip2Base256.prepare_query_text("A Dog On The BEACH"),
+            "a dog on the beach"
+        );
+        for model in [
+            ImageEmbeddingModel::MetaClip2B32,
+            ImageEmbeddingModel::MetaClip2B16,
+            ImageEmbeddingModel::MetaClip2L14,
+        ] {
+            assert_eq!(
+                model.prepare_query_text("A Dog On The BEACH"),
+                "A Dog On The BEACH"
+            );
+        }
     }
 
     #[test]
@@ -1353,6 +1484,49 @@ mod tests {
             (7, 7, 512),
             [0.0, 0.0, 1.0, 1.0],
         );
+    }
+
+    #[test]
+    #[ignore = "downloads the four paired exports and runs both encoders"]
+    fn published_external_exports_load_and_infer() {
+        initialize_test_runtime();
+        assert!(std::env::var_os("NICEGAL_LOCAL_MODELS_DIR").is_none());
+        for model in [
+            ImageEmbeddingModel::MetaClip2B32,
+            ImageEmbeddingModel::MetaClip2B16,
+            ImageEmbeddingModel::MetaClip2L14,
+            ImageEmbeddingModel::SigLip2Base256,
+        ] {
+            eprintln!("Validating published export: {model}");
+            let image = ImageEmbedder::load(&ImageEmbedderOptions {
+                model,
+                ..ImageEmbedderOptions::default()
+            })
+            .unwrap();
+            let raster = crate::imaging::Raster::Rgb {
+                width: 224,
+                height: 224,
+                pixels: vec![127; 224 * 224 * 3],
+            };
+            let embedding = image.embed_raster(raster.clone()).unwrap();
+            assert_eq!(embedding.len(), model.dimensions());
+            assert!(embedding.iter().all(|x| x.is_finite()));
+            if model.supports_patch_features() {
+                assert!(image.supports_patch_features());
+                let patches = image.patch_features(raster).unwrap();
+                assert_eq!(patches.dimensions, model.dimensions());
+                assert!(patches.patches.iter().all(|x| x.is_finite()));
+            }
+            drop(image);
+            let text = ImageQueryEmbedder::load(&ImageQueryEmbedderOptions {
+                model,
+                ..ImageQueryEmbedderOptions::default()
+            })
+            .unwrap();
+            let query = text.embed_query("a photo of a cat").unwrap();
+            assert_eq!(query.len(), model.dimensions());
+            assert!(query.iter().all(|x| x.is_finite()));
+        }
     }
 
     #[test]

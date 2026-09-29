@@ -65,14 +65,16 @@ fn main() -> Result<()> {
         let Some(text_encoder) = ImageQueryEmbedder::load_cached(&ImageQueryEmbedderOptions {
             model,
             ..Default::default()
-        })? else {
+        })?
+        else {
             println!("{}: text encoder is not cached", model.name());
             continue;
         };
         let Some(image_encoder) = ImageEmbedder::load_cached(&ImageEmbedderOptions {
             model,
             ..Default::default()
-        })? else {
+        })?
+        else {
             println!("{}: image encoder is not cached", model.name());
             continue;
         };
