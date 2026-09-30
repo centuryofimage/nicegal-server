@@ -13,6 +13,7 @@ pub mod libraries;
 pub mod logging;
 pub mod metadata;
 pub mod ocr;
+pub mod portal_paths;
 pub mod poster;
 pub mod runtime;
 mod schema;

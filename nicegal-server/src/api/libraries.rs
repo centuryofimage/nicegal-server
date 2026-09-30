@@ -96,6 +96,8 @@ struct LibraryResponse {
 #[serde(rename_all = "camelCase")]
 struct FolderResponse {
     path: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    host_path: Option<PathBuf>,
     scan_pending: bool,
     /// Why the latest scan attempt stopped short: `unavailable`, `incomplete`, `cancelled` or
     /// `failed`. `scan_error` is its human-readable detail.
@@ -113,6 +115,7 @@ impl From<Library> for LibraryResponse {
                 .include
                 .into_iter()
                 .map(|folder| FolderResponse {
+                    host_path: nicegal_core::portal_paths::host_path(&folder.path),
                     path: folder.path,
                     scan_pending: folder.scan_pending,
                     scan_outcome: folder.scan_outcome.map(ScanOutcome::as_str),
