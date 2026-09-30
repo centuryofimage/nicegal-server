@@ -581,6 +581,7 @@ impl ImageIndexDb {
     }
 
     /// Return one asset's vector only while it is current with the attached catalog.
+    /// Videos use the earliest indexed frame, matching their gallery poster.
     ///
     /// Query-reference assets deliberately are not constrained to a search root: an image from
     /// one library may be the example used to search another. They must still belong to this
@@ -602,10 +603,12 @@ impl ImageIndexDb {
                   CROSS JOIN image_embeddings
                   WHERE samples.asset_id = ?1
                     AND image_embeddings.embedding_id = samples.embedding_id
-                    AND samples.timestamp_ms IS NULL
-                    AND catalog.assets.media_kind = 'image'
-                    AND image_embedding_state.sampling_version = 0",
-                [asset_id],
+                    AND ((catalog.assets.media_kind = 'image' AND samples.timestamp_ms IS NULL
+                          AND image_embedding_state.sampling_version = 0)
+                      OR (catalog.assets.media_kind = 'video' AND samples.timestamp_ms IS NOT NULL
+                          AND image_embedding_state.sampling_version = ?2))
+                  ORDER BY samples.timestamp_ms, samples.embedding_id LIMIT 1",
+                (asset_id, crate::video::SAMPLING_VERSION),
                 |row| row.get(0),
             )
             .optional()
@@ -884,7 +887,7 @@ mod sample_tests {
             &video(1),
             vec![
                 (300, vec![1.0, 0.0]),
-                (100, vec![1.0, 0.0]),
+                (100, vec![0.6, 0.8]),
                 (200, vec![0.0, 1.0]),
             ],
         )?;
@@ -900,7 +903,7 @@ mod sample_tests {
         )?;
         assert_eq!(total, 2);
         assert_eq!(hits.len(), 1);
-        assert_eq!((hits[0].asset_id, hits[0].timestamp_ms), (1, Some(100)));
+        assert_eq!((hits[0].asset_id, hits[0].timestamp_ms), (1, Some(300)));
         let filtered = filters
             .clone()
             .with_files([crate::file_filter::FileFilter::path("VIDEO2.MP4", false)]);
@@ -914,7 +917,19 @@ mod sample_tests {
         assert_eq!(filtered_hits[0].asset_id, 2);
         assert_eq!(reader.coverage(&filters)?, (2, 2));
         assert!(reader.is_asset_indexed(1)?);
+        assert_eq!(reader.current_vector(1)?, Some(vec![0.6, 0.8]));
+        catalog_conn.execute("UPDATE assets SET source_size = 101 WHERE asset_id = 1", [])?;
         assert!(reader.current_vector(1)?.is_none());
+        catalog_conn.execute("UPDATE assets SET source_size = 100 WHERE asset_id = 1", [])?;
+        db.conn.execute(
+            "UPDATE image_embedding_state SET sampling_version = -1 WHERE asset_id = 1",
+            [],
+        )?;
+        assert!(reader.current_vector(1)?.is_none());
+        db.conn.execute(
+            "UPDATE image_embedding_state SET sampling_version = ?1 WHERE asset_id = 1",
+            [crate::video::SAMPLING_VERSION],
+        )?;
         drop(reader);
 
         db.save_video_embeddings(&video(1), vec![(900, vec![0.0, 1.0])])?;

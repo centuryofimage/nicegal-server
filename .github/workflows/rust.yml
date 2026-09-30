@@ -19,25 +19,27 @@ env:
 
 jobs:
   check:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
+    container: debian:12
+    defaults:
+      run:
+        shell: bash
     steps:
+      - name: Install Linux build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates git curl xz-utils unzip build-essential pkg-config libssl-dev libclang-dev cmake nasm libvulkan1
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           submodules: recursive
 
-      - name: Install Linux build dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config libssl-dev libclang-dev cmake nasm libvulkan1
-
-
       - name: Setup Rust with cache
         uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           cache: true
-          cache-key: ubuntu-24.04
+          cache-key: debian-12
           build-warnings: warn
 
       - name: Setup uv

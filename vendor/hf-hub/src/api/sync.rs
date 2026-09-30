@@ -347,11 +347,13 @@ impl ApiBuilder {
     pub fn build(self) -> Result<Api, ApiError> {
         let headers = self.build_headers();
 
-        let builder = builder()?.redirect_auth_headers(RedirectAuthHeaders::SameHost);
-        let agent: Agent = builder.build().into();
+        let agent: Agent = builder()?
+            .redirect_auth_headers(RedirectAuthHeaders::SameHost)
+            .build()
+            .into();
         let client = HeaderAgent::new(agent, headers.clone());
 
-        let no_redirect_agent: Agent = Agent::config_builder()
+        let no_redirect_agent: Agent = builder()?
             // .try_proxy_from_env(true)
             .max_redirects(0)
             .build()

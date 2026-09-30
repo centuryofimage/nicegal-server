@@ -434,7 +434,13 @@ impl ImageEmbeddingModel {
                 }
             }
         }
-        Ok(Some(path))
+        let files: Vec<&str> = self
+            .required_files()
+            .iter()
+            .copied()
+            .chain(self.external_export_files(&manifest)?.iter().copied())
+            .collect();
+        Ok(Some(local_external_weights_directory(&path, &files)?))
     }
 
     /// Fixed filenames only: a manifest cannot request arbitrary paths or repositories.
@@ -479,6 +485,53 @@ impl ImageEmbeddingModel {
         stem.push_str(".db");
         stem
     }
+}
+
+/// ONNX Runtime rejects external tensor files that resolve outside the graph directory.
+/// Python's HF cache uses symlinks into `blobs`; keep that shared cache intact and expose
+/// the validated export through hard links instead. This also covers the text encoder.
+fn local_external_weights_directory(
+    source: &std::path::Path,
+    files: &[&str],
+) -> Result<std::path::PathBuf> {
+    use std::hash::{Hash, Hasher};
+    let linked_weights = files.iter().any(|name| {
+        name.ends_with(".onnx_data")
+            && std::fs::symlink_metadata(source.join(name))
+                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    });
+    if !linked_weights {
+        return Ok(source.to_path_buf());
+    }
+    // File identity changes produce a fresh view, including for mutable local overrides.
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    let mut resolved = Vec::with_capacity(files.len());
+    for name in files {
+        let path = source
+            .join(name)
+            .canonicalize()
+            .with_context(|| format!("resolving model file {name}"))?;
+        let metadata = std::fs::metadata(&path)?;
+        name.hash(&mut hash);
+        path.hash(&mut hash);
+        metadata.len().hash(&mut hash);
+        metadata.modified()?.hash(&mut hash);
+        resolved.push((name, path));
+    }
+    let directory = source.join(format!("nicegal-onnx-v1-{:016x}", hash.finish()));
+    std::fs::create_dir_all(&directory).context("creating local ONNX model view")?;
+    for (name, path) in resolved {
+        let target = directory.join(name);
+        match std::fs::hard_link(&path, &target) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && target.is_file() => {
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("linking local ONNX file {name}"));
+            }
+        }
+    }
+    Ok(directory)
 }
 
 impl std::str::FromStr for ImageEmbeddingModel {
@@ -1243,6 +1296,92 @@ impl ImageQueryEmbedder {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn external_weight_symlinks_get_a_reusable_local_view() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let snapshot = temp.path().join("snapshot");
+        let blobs = temp.path().join("blobs");
+        std::fs::create_dir_all(&snapshot)?;
+        std::fs::create_dir_all(&blobs)?;
+        let files = [
+            "image.onnx",
+            "image.onnx_data",
+            "text.onnx",
+            "text.onnx_data",
+        ];
+        for name in files {
+            let blob = blobs.join(name);
+            std::fs::write(&blob, name)?;
+            #[cfg(windows)]
+            std::os::windows::fs::symlink_file(&blob, snapshot.join(name))?;
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&blob, snapshot.join(name))?;
+        }
+        let view = local_external_weights_directory(&snapshot, &files)?;
+        assert_ne!(view, snapshot);
+        for name in files {
+            assert_eq!(std::fs::read(view.join(name))?, name.as_bytes());
+            assert_eq!(
+                view.join(name).canonicalize()?.parent(),
+                Some(view.canonicalize()?.as_path())
+            );
+            assert!(
+                std::fs::symlink_metadata(snapshot.join(name))?
+                    .file_type()
+                    .is_symlink()
+            );
+        }
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let snapshot = snapshot.clone();
+                std::thread::spawn(move || local_external_weights_directory(&snapshot, &files))
+            })
+            .collect();
+        for handle in handles {
+            assert_eq!(handle.join().unwrap()?, view);
+        }
+        std::fs::remove_file(blobs.join("image.onnx_data"))?;
+        std::fs::write(blobs.join("image.onnx_data"), "replacement weights")?;
+        let updated = local_external_weights_directory(&snapshot, &files)?;
+        assert_ne!(updated, view);
+        assert_eq!(
+            std::fs::read(updated.join("image.onnx_data"))?,
+            b"replacement weights"
+        );
+        assert_eq!(local_external_weights_directory(&updated, &files)?, updated);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires cached L/14 weights and ONNX Runtime"]
+    fn cached_l14_external_weights_load_and_infer() -> Result<()> {
+        initialize_test_runtime();
+        let model = ImageEmbeddingModel::MetaClip2L14;
+        let image = ImageEmbedder::load_cached(&ImageEmbedderOptions {
+            model,
+            ..ImageEmbedderOptions::default()
+        })?
+        .context("L/14 image weights are not cached")?;
+        let vector = image.embed_raster(crate::imaging::Raster::Rgb {
+            width: 224,
+            height: 224,
+            pixels: vec![127; 224 * 224 * 3],
+        })?;
+        assert_eq!(vector.len(), model.dimensions());
+        assert!(vector.iter().all(|value| value.is_finite()));
+        assert!(image.supports_patch_features());
+        drop(image);
+        let text = ImageQueryEmbedder::load_cached(&ImageQueryEmbedderOptions {
+            model,
+            ..ImageQueryEmbedderOptions::default()
+        })?
+        .context("L/14 text weights are not cached")?;
+        let vector = text.embed_query("a photo of a cat")?;
+        assert_eq!(vector.len(), model.dimensions());
+        assert!(vector.iter().all(|value| value.is_finite()));
+        Ok(())
+    }
+
     use super::*;
 
     #[test]

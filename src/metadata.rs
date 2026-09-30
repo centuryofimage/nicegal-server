@@ -170,6 +170,10 @@ pub fn inspect(asset: &Asset) -> FileMetadata {
                 (ExifTag::Copyright, "Copyright"),
             ] {
                 if let Some(value) = exif.get(tag) {
+                    // Identity orientation adds no useful camera information.
+                    if tag == ExifTag::Orientation && value.as_u16() == Some(1) {
+                        continue;
+                    }
                     let value = value
                         .to_string()
                         .trim_matches('\0')
@@ -286,6 +290,27 @@ mod tests {
         assert_eq!(inspect(&asset).source_state, SourceState::Changed);
         fs::remove_file(&path)?;
         assert_eq!(inspect(&asset).source_state, SourceState::Missing);
+        Ok(())
+    }
+
+    #[test]
+    fn inspector_hides_identity_orientation_and_keeps_rotation() -> anyhow::Result<()> {
+        let temp = tempfile::TempDir::new()?;
+        let root = Utf8PathBuf::try_from(temp.path().to_path_buf())?;
+        let catalog = AssetCatalog::new(&root.join("assets.db"))?;
+        for orientation in [1, 6] {
+            let path = root.join(format!("orientation{orientation}.jpg"));
+            fs::write(
+                &path,
+                crate::imaging::test_support::jpeg_with_orientation(orientation)?,
+            )?;
+            let asset = catalog.upsert(&path, &fs::metadata(&path)?)?;
+            let info = inspect(&asset);
+            assert_eq!(
+                info.exif.iter().any(|field| field.label == "Orientation"),
+                orientation != 1
+            );
+        }
         Ok(())
     }
 
