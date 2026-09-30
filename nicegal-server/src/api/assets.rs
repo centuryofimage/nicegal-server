@@ -62,6 +62,8 @@ struct AssetResponse {
     asset_id: i64,
     path: PathBuf,
     display_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    host_path: Option<PathBuf>,
     folder_path: Option<PathBuf>,
     extension: Option<String>,
     source_modified_ns: String,
@@ -85,6 +87,7 @@ impl AssetResponse {
         let folder_path = asset.path.parent().map(|path| path.to_path_buf());
         Self {
             asset_id: asset.asset_id,
+            host_path: nicegal_core::portal_paths::host_path(&asset.path),
             path: asset.path,
             display_name,
             folder_path,

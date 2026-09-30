@@ -172,6 +172,8 @@ impl From<Asset> for GalleryAssetResponse {
 #[serde(rename_all = "camelCase")]
 struct MetadataResponse {
     asset: GalleryAssetResponse,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    host_path: Option<Utf8PathBuf>,
     file: FileMetadataResponse,
     ocr_state: IndexStateResponse,
     ocr_text: Option<String>,
@@ -266,6 +268,7 @@ async fn metadata(
                 .is_asset_indexed(asset.asset_id)?;
             let file = nicegal_core::metadata::inspect(&asset).into();
             Ok(MetadataResponse {
+                host_path: nicegal_core::portal_paths::host_path(&asset.path),
                 asset: asset.into(),
                 file,
                 ocr_state,
