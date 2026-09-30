@@ -272,7 +272,7 @@ mod tests {
         let temp = tempfile::TempDir::new()?;
         let root = Utf8PathBuf::try_from(temp.path().to_path_buf())?;
         let path = root.join("image.png");
-        image::RgbImage::new(2, 3).save(&path)?;
+        fs::write(&path, crate::imaging::encode_png(2, 3, &[0; 24])?)?;
         let catalog = AssetCatalog::new(&root.join("assets.db"))?;
         let asset = catalog.upsert(&path, &fs::metadata(&path)?)?;
         let info = inspect(&asset);

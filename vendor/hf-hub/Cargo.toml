@@ -149,6 +149,7 @@ optional = true
 
 [dependencies.ureq]
 version = "3"
+default-features = false
 features = [
     "json",
     "socks-proxy",
