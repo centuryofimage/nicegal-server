@@ -1,0 +1,6 @@
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-feature=+sse4.2,+popcnt"]
+
+# NASM objects lack a Mach-O platform command; ld assumes macOS correctly.
+[target.'cfg(all(target_arch = "x86_64", target_os = "macos"))']
+rustflags = ["-A", "linker_messages"]

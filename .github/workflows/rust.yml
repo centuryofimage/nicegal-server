@@ -39,8 +39,9 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           cache: true
-          cache-key: debian-12
           build-warnings: warn
+          rustflags: ""
+          cache-key: debian-12-${{ hashFiles('Cargo.toml', '.cargo/config.toml') }}
 
       - name: Setup uv
         uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0

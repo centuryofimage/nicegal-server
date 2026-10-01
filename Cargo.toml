@@ -69,8 +69,6 @@ hf-hub = { path = "vendor/hf-hub" }
 ffmpeg-sys-the-third = { path = "vendor/ffmpeg-the-third/ffmpeg-sys-the-third" }
 
 [profile.release]
-opt-level = 3
-strip = false
 debug = 1     # for perf analysis
 lto = "thin"
 
