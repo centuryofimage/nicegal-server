@@ -1,6 +1,6 @@
 //! Zero-shot image tags from the `bep256/clip-tags` vocabulary.
 //!
-//! The repository holds one shared `vocabulary.tsv` and, for each supported image model, a
+//! The repository holds one shared extensionless `vocabulary` and, for each supported image model, a
 //! safetensors file with a float16 text embedding per tag (`embeddings`) and the mean image vector
 //! of a public reference set (`reference_mean`). A tag's score for an image is its cosine
 //! similarity to the image minus its similarity to that mean, so tags that match nearly every
@@ -16,8 +16,8 @@ use crate::embedding::ImageEmbeddingModel;
 use crate::hub::ModelSource;
 
 const REPOSITORY: &str = "bep256/clip-tags";
-const REVISION: &str = "df99841e781c8aa8f3a90d6291d95e22481668b6";
-const VOCABULARY: &str = "vocabulary.tsv";
+const REVISION: &str = "1973bb7963b91efeee3d0afb139beb2db74a2492";
+const VOCABULARY: &str = "vocabulary";
 const HEADER: &str = "term\tkind\tsource\tsensitivity";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,23 +79,29 @@ pub struct TagSet {
 }
 
 impl TagSet {
-    /// Whether tags were published for `model`. Models without a text encoder have none.
+    /// Whether published or explicitly staged local tags exist for `model`.
     pub fn supports(model: ImageEmbeddingModel) -> bool {
-        matches!(
-            model,
-            ImageEmbeddingModel::MetaClip2B32
-                | ImageEmbeddingModel::MetaClip2B16
-                | ImageEmbeddingModel::MetaClip2L14
-                | ImageEmbeddingModel::SigLip2Base256
-        )
+        if let Some(directory) = local_directory() {
+            return directory.join(VOCABULARY).is_file()
+                && directory.join(embedding_filename(model)).is_file();
+        }
+        model.published_tags()
     }
 
     /// Load `model`'s tags, downloading the vocabulary and the model's embeddings on a cache miss.
     pub fn load(model: ImageEmbeddingModel) -> Result<Self> {
         ensure!(Self::supports(model), "no tags are published for {model}");
-        let vocabulary = source(VOCABULARY).get_sync()?;
-        let embeddings =
-            source(&format!("{}.safetensors", model.id().replace('/', "--"))).get_sync()?;
+        let (vocabulary, embeddings) = if let Some(directory) = local_directory() {
+            (
+                directory.join(VOCABULARY),
+                directory.join(embedding_filename(model)),
+            )
+        } else {
+            (
+                source(VOCABULARY).get_sync()?,
+                source(&embedding_filename(model)).get_sync()?,
+            )
+        };
         let tags = parse_vocabulary(
             &std::fs::read_to_string(&vocabulary)
                 .with_context(|| format!("reading {}", vocabulary.display()))?,
@@ -167,18 +173,22 @@ impl TagSet {
     }
 }
 
+fn local_directory() -> Option<std::path::PathBuf> {
+    std::env::var_os("NICEGAL_TAGS_DIR").map(std::path::PathBuf::from)
+}
+
+fn embedding_filename(model: ImageEmbeddingModel) -> String {
+    format!("{}.safetensors", model.id().replace('/', "--"))
+}
+
 fn source(filename: &str) -> ModelSource {
-    ModelSource {
-        model_id: REPOSITORY.to_owned(),
-        revision: Some(REVISION.to_owned()),
-        filename: filename.to_owned(),
-    }
+    ModelSource::pinned(REPOSITORY, REVISION, filename)
 }
 
 fn map(path: &Path) -> Result<Mmap> {
     let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    // SAFETY: Hugging Face cache files are content-addressed and never rewritten in place; the
-    // map is only read.
+    // SAFETY: Hugging Face cache files are content-addressed. Explicit local tag exports must
+    // likewise remain unchanged while loaded; the map is only read.
     unsafe { Mmap::map(&file) }.with_context(|| format!("mapping {}", path.display()))
 }
 
@@ -295,5 +305,21 @@ mod tests {
         assert!(parse_vocabulary(&format!("{HEADER}\ncozy\tvibe\tmetaclip\n")).is_err());
         assert!(parse_vocabulary(&format!("{HEADER}\ncozy\tvibe\tmetaclip\tok\textra\n")).is_err());
         assert!(parse_vocabulary(&format!("{HEADER}\ncozy\tmood\tmetaclip\tok\n")).is_err());
+    }
+
+    #[test]
+    #[ignore = "downloads the pinned published vocabulary and every supported model's tags"]
+    fn published_tags_load_for_every_supported_model() {
+        assert!(local_directory().is_none());
+        let models: Vec<_> = ImageEmbeddingModel::ALL
+            .into_iter()
+            .filter(|model| TagSet::supports(*model))
+            .collect();
+        assert_eq!(models.len(), 6);
+        for model in models {
+            let tags = TagSet::load(model).unwrap();
+            assert!(!tags.tags.is_empty());
+            assert_eq!(tags.baselines.len(), tags.tags.len());
+        }
     }
 }

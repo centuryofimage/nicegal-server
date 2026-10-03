@@ -113,6 +113,9 @@ pub struct IndexProgressDelta {
     pub thumbnail_failures: usize,
     pub prune_candidates: usize,
     pub embedded: usize,
+    /// Images run through the embedding model, one per still or sampled video frame. It
+    /// measures image embedding throughput; `phase_completed` still counts files.
+    pub images_inferred: usize,
     pub indexed: usize,
     pub skipped: usize,
     pub failed: usize,

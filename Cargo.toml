@@ -72,6 +72,14 @@ ffmpeg-sys-the-third = { path = "vendor/ffmpeg-the-third/ffmpeg-sys-the-third" }
 debug = 1     # for perf analysis
 lto = "thin"
 
+# Keep CPU resize/preprocessing and inference tensor assembly usable during development,
+# while the application/core code retains the normal dev debugging settings.
+[profile.dev.package.fast_image_resize]
+opt-level = 3
+
+[profile.dev.package.fastembed]
+opt-level = 3
+
 [dev-dependencies]
 tempfile = "3.27.0"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["std", "fmt", "ansi", "env-filter", "json", "registry"] }

@@ -4,6 +4,8 @@ set -euo pipefail
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 cd "$repo_root"
 
+uv run --no-project --python 3.13 python scripts/collect-licenses.py
+
 if [[ "$(uname -s)" == Linux ]]; then
     features=regex
     for provider in ${NICEGAL_LINUX_PROVIDERS:-webgpu}; do

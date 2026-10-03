@@ -17,7 +17,7 @@ Build a deployable server with `build-server.cmd` on Windows or `./build-server.
 
 ## Image search models
 
-MetaCLIP2 B/32 is the default. The model selector offers these six choices:
+MetaCLIP2 B/32 is the default. The model selector groups models by indexing speed; performance varies by GPU. The published models are:
 
 | Model | Input | Dimensions | Model license |
 | --- | --- | --- | --- |
@@ -32,7 +32,7 @@ DINOv3 accepts image examples only; it does not support text queries. Model weig
 
 ## License
 
-Original application code is [AGPL-3.0-only with a DirectML linking exception](LICENSE), Copyright 2026 bep. Modified third-party code in `vendor/` remains Apache-2.0 under its retained license files and notices. The [dependency license inventory](third-party-licenses.json) and [native runtime notices](third-party-notices/README.md) identify other separately licensed components.
+Original application code is [AGPL-3.0-only with a DirectML linking exception](LICENSE), Copyright 2026 bep. Modified third-party code in `vendor/` remains Apache-2.0 under its retained license files and notices. Server builds generate `target/third-party-licenses.json` from locked Cargo metadata. This dependency inventory and the [native runtime notices](third-party-notices/README.md) identify other separately licensed components.
 
 To verify a downloaded server ZIP's GitHub build provenance, run:
 

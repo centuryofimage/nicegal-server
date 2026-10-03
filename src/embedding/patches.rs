@@ -34,6 +34,9 @@ pub(super) enum PatchMethod {
     FeatureMap(&'static str),
     /// DINOv3's final normalized token sequence: class, four registers, then spatial patches.
     DinoTokens(&'static str),
+    /// PE Core's attention pool applied to each final token alone: class, then spatial patches.
+    /// It ships only as the export's prebuilt `image_patched.onnx`.
+    PeAttnPool,
 }
 
 impl PatchMethod {
@@ -43,6 +46,7 @@ impl PatchMethod {
             Self::ClearClip => clearclip_fragment(model),
             Self::FeatureMap(tensor) => feature_map_fragment(model, tensor),
             Self::DinoTokens(tensor) => feature_map_fragment(model, tensor),
+            Self::PeAttnPool => bail!("PE patch features ship only as a prebuilt graph"),
         }
     }
 
@@ -52,13 +56,14 @@ impl PatchMethod {
             Self::ClearClip => "clearclip",
             Self::FeatureMap(_) => "featureMap",
             Self::DinoTokens(_) => "dinoTokens",
+            Self::PeAttnPool => "peAttnPool",
         }
     }
 
     /// Number of nonspatial tokens before a flat patch sequence.
     pub(super) fn prefix_tokens(self) -> usize {
         match self {
-            Self::ClearClip => 1,
+            Self::ClearClip | Self::PeAttnPool => 1,
             Self::DinoTokens(_) => 5,
             Self::FeatureMap(_) => 0,
         }

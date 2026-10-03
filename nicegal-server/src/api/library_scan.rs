@@ -115,6 +115,20 @@ pub(crate) fn prepare(request: Request) -> Result<Spec, ApiError> {
 }
 
 impl Spec {
+    /// A fast scan of what a viewed library has pending, with the saved OCR models applied later.
+    pub(crate) fn fast(library_id: i64, pending_only: bool) -> Self {
+        Self {
+            library_id,
+            ocr_models: None,
+            pending_only,
+            scan_mode: ScanMode::Fast,
+            force: false,
+            retry_failed: false,
+            max_dimensions: None,
+            debug_limit: None,
+        }
+    }
+
     pub(crate) fn library_id(&self) -> i64 {
         self.library_id
     }

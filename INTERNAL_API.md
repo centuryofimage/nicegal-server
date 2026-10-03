@@ -1213,6 +1213,11 @@ show these updates.
 | `libraryPurge` | `pruning` | `phaseCompleted`, `processed`, `deleted`, `failed` | Library assets no other library covers | `phaseCompleted / total`; `deleted` and `failed` are cumulative per-asset outcomes. |
 | `libraryPurge` | `finished` | None | Last value is retained until the terminal snapshot | Terminal state, no progress bar. |
 
+`itemsPerSecond` is the work done since the current phase began divided by its elapsed time, and
+is `null` until that work is nonzero. Work is `phaseCompleted`, except that OCR leaves out skipped
+files and `imageEmbedding` counts images run through the model, one per still or sampled video
+frame, so its rate is images per second while `phaseCompleted` and `total` count files.
+
 Cancellation after OCR but before or during text embedding leaves a `libraryScan` cancelled without
 starting more text embedding batches, and its folders stay pending.
 
@@ -1333,8 +1338,8 @@ Every tensor offset is therefore 4-byte aligned, and a renderer can view each te
 | `embedding` | `[dimensions]` | The pooled vector the image index stores for these pixels |
 | `query` | `[dimensions]` | The resolved `imageQuery`, present only when requested |
 
-`__metadata__` holds strings: `model` (the model ID), `assetId`, `method` (`clearclip` or
-`featureMap`), and `region`, a JSON `[x, y, width, height]` of the oriented source image that the
+`__metadata__` holds strings: `model` (the model ID), `assetId`, `method` (`clearclip`,
+`featureMap`, `dinoTokens`, or `peAttnPool`), and `region`, a JSON `[x, y, width, height]` of the oriented source image that the
 grid covers, as fractions of its width and height. The grid is square in model input pixels, so its
 cells are stretched to the region's aspect ratio. A model that pads the short axis to a square
 reports a region beyond 0 to 1 on that axis (for example `[0, -0.5, 1, 2]` for a 2:1 image); clip
@@ -1348,11 +1353,14 @@ then applies the model's own final LayerNorm and projection. The experimental Si
 uses `featureMap`: its pooled embedding is the normalized mean of its final feature map, so each map
 position is already a patch vector, and the graph only exposes that map. DINOv3 B/16 (14×14)
 exposes its normalized final tokens; the class token and four register tokens are omitted from the
-patch grid. Patch scores use the same pooled image query vector as visual search, including queries
-composed from multiple images. These graph additions are appended to the downloaded graph at load
-time; no other files are downloaded, the indexed pooled output is unchanged, and indexing does not
-copy the patch output off the device. SigLIP2 Base does not provide patch features; runtime status
-reports this per model as `patchFeatures`.
+patch grid. PE Core B/16 (14×14) and L/14 (24×24) use `peAttnPool`: each final token passes alone through the
+model's attention pool and projection, and the class token is omitted. Patch scores use the same
+pooled image query vector as visual search, including queries composed from multiple images.
+MetaCLIP2 and PE exports ship this branch as a prebuilt `image_patched.onnx` beside the shared
+weights; the other models' branches are appended to the downloaded graph at load time. The indexed
+pooled output is unchanged, and indexing does not copy the patch output off the device. SigLIP2
+Base does not provide patch features; runtime status reports this per model as
+`patchFeatures`.
 Those models, videos, and an image graph without the expected layout return `invalid_request`. An unprepared image model returns `models_not_ready`; this route never downloads
 models. The single-asset `/patches` route decodes original still images and does not support videos.
 
@@ -1397,9 +1405,12 @@ mean similarity over a public reference image set, so tags that match most image
 `sensitivity` is `ok`, `mature` (descriptive adult terms) or `blocked` (slurs and crude or
 sexualizing labels); `hideOffensive`, on unless `false`, leaves out `blocked` tags.
 
-Tags exist for the MetaCLIP2 models and SigLIP2. With any other active model the response has
-`supported: false` and empty lists. The first request for a model downloads `vocabulary.tsv` and
-that model's embeddings file (about 60 to 95 MB) into the Hugging Face cache, so it can take a
+Tags exist for the MetaCLIP2 models, SigLIP2, and PE B/16 and L/14 in the pinned public tag set.
+It contains an extensionless UTF-8 tab-separated `vocabulary` and per-model safetensors files.
+`NICEGAL_TAGS_DIR` points to a local folder with the same layout instead, such as
+`projects/clip-tags/data/hf` while preparing a new tag set. Unsupported models return
+`supported: false` and empty lists. A first remote request downloads the shared vocabulary and
+that model's embeddings file (about 60 to 125 MB) into the Hugging Face cache, so it can take a
 while; later requests read the memory-mapped cache file. Only the active model's tags stay loaded.
 An asset without a current vector in the active index returns `invalid_request`.
 

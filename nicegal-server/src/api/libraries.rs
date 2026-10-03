@@ -19,7 +19,10 @@ use serde::{Deserialize, Serialize};
 
 use super::error::ApiError;
 use super::extract::ApiJson;
+use super::identifier::validate_identifier;
 use super::{AppState, Databases, roots, run_blocking};
+
+const MAX_VIEW_CLIENT_LEN: usize = 128;
 
 /// A library a job was started for. It existed when the job was accepted, so its absence here
 /// means it was deleted since.
@@ -192,15 +195,7 @@ struct ReleaseView {
 }
 
 fn validate_view_client(client: &str) -> Result<(), ApiError> {
-    if client.is_empty()
-        || client.len() > 128
-        || !client
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"-_:".contains(&b))
-    {
-        return Err(ApiError::bad_request("invalid view client"));
-    }
-    Ok(())
+    validate_identifier(client, MAX_VIEW_CLIENT_LEN, "invalid view client")
 }
 
 async fn release_view(

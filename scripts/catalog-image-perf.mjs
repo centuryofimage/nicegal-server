@@ -12,10 +12,14 @@ const { values } = parseArgs({ options: {
   corpus: { type: 'string', default: join(homedir(), 'Pictures') },
   limit: { type: 'string', default: '2000' }, rounds: { type: 'string', default: '2' },
   output: { type: 'string', default: 'target/catalog-image-perf' },
+  model: { type: 'string', default: 'facebook/metaclip-2-worldwide-b32' },
+  provider: { type: 'string', default: 'directml' },
+  'images-only': { type: 'boolean', default: false },
+  'trace-stages': { type: 'boolean', default: false },
   help: { type: 'boolean', default: false }
 } })
 if (values.help) {
-  console.log('Usage: node scripts/catalog-image-perf.mjs --before EXE --after EXE [--corpus DIR] [--limit 2000] [--rounds 2] [--output DIR]\nUses fresh databases, DirectML, and MetaCLIP2 B/32. Retains results and logs in a unique output directory.')
+  console.log('Usage: node scripts/catalog-image-perf.mjs --before EXE --after EXE [--corpus DIR] [--limit 2000] [--rounds 2] [--model ID] [--provider directml|webgpu|cpu] [--images-only] [--trace-stages] [--output DIR]\nUses fresh databases and verifies the selected provider. Retains results and logs in a unique output directory.')
   process.exit(0)
 }
 assert.ok(values.before && values.after, '--before and --after executables are required')
@@ -25,8 +29,10 @@ const corpus = await realpath(values.corpus)
 const executables = { before: await realpath(values.before), after: await realpath(values.after) }
 await mkdir(resolve(values.output), { recursive: true })
 const output = await mkdtemp(join(resolve(values.output), 'run-'))
-const model = 'facebook/metaclip-2-worldwide-b32'
-const report = { corpus, limit, model, provider: 'directml', executables, runs: [] }
+const model = values.model
+const provider = values.provider
+assert.ok(['directml', 'webgpu', 'cpu'].includes(provider), 'unsupported benchmark provider')
+const report = { corpus, limit, model, imagesOnly: values['images-only'], provider, executables, runs: [] }
 console.log(`Results: ${output}`)
 for (let round = 0; round < rounds; round += 1) {
   for (const variant of round % 2 ? ['after', 'before'] : ['before', 'after']) {
@@ -52,15 +58,19 @@ function positiveInteger(value) {
 async function benchmark(variant, round, stateDirectory) {
   const token = randomBytes(32).toString('hex')
   const child = spawnServer({ executable: executables[variant], repository: process.cwd(), stateDirectory, token,
-    env: { NICEGAL_EXECUTION_PROVIDER: 'directml', NICEGAL_IMAGE_MODEL: model,
-      RUST_LOG: 'warn,nicegal_core::index=info,nicegal_core::image_index=info,nicegal_core::embedding=info,nicegal_core::runtime=info,nom_exif=off' } })
+    env: { NICEGAL_EXECUTION_PROVIDER: provider, NICEGAL_IMAGE_MODEL: model,
+      RUST_LOG: values['trace-stages']
+        ? 'warn,nicegal_core::index=info,nicegal_core::image_index=debug,nicegal_core::embedding=debug,nicegal_core::imaging=debug,nicegal_core::runtime=info,nom_exif=off'
+        : 'warn,nicegal_core::index=info,nicegal_core::image_index=info,nicegal_core::embedding=info,nicegal_core::runtime=info,nom_exif=off' } })
   let stderr = ''
   child.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-32000) })
   try {
     const { endpoint } = await withTimeout(readReadyMessage(child, () => stderr), 60000, 'server readiness')
-    const libraryId = await createLibrary(endpoint, token, { include: [corpus], ocr: false, image: false })
+    const libraryId = await createLibrary(endpoint, token, { include: [corpus], ocr: false, image: false,
+      videos: !values['images-only'] })
     // A library with no search indexes only catalogs, so this measures cataloging alone.
-    const catalog = await measureJob(endpoint, token, 'libraryScan', { libraryId, debugLimit: limit }, `${variant}/${round}`)
+    const catalog = await measureJob(endpoint, token, 'libraryScan',
+      { libraryId, debugLimit: values['images-only'] ? undefined : limit }, `${variant}/${round}`)
     const db = new DatabaseSync(join(stateDirectory, 'assets.db'), { readOnly: true })
     let sources
     try {
@@ -69,18 +79,56 @@ async function benchmark(variant, round, stateDirectory) {
       sources = statement.all()
     } finally { db.close() }
     const sourceHash = createHash('sha256').update(JSON.stringify(sources, (_, value) => typeof value === 'bigint' ? value.toString() : value)).digest('hex')
+    // Image selection is capped independently from cataloging. Image-only runs catalog the
+    // root so videos encountered during walking cannot reduce the requested image sample.
     const image = await measureJob(endpoint, token, 'imageEmbed', { libraryId, debugLimit: limit }, `${variant}/${round}`)
+    if (values['images-only']) assert.equal(image.progress.embedded, limit, 'expected the requested number of image assets')
     await stopChild(child)
     const trace = (await readFile(join(stateDirectory, 'nicegal-server.log'), 'utf8')).trim().split('\n').map(line => JSON.parse(line))
     const catalogTrace = trace.find(event => event.span?.name === 'catalog' && event.fields?.message === 'close')
     const imageTrace = trace.find(event => event.span?.name === 'image_index' && event.fields?.message === 'close')
     const providers = [...new Set(trace.filter(event => event.fields?.message === 'loaded the image embedding model').map(event => event.fields.execution_provider))]
-    assert.deepEqual(providers, ['directml'], 'benchmark must actually run image inference on DirectML')
-    return { variant, round, sourceCount: sources.length, sourceHash, providers, catalog, image, catalogTrace, imageTrace }
+    assert.deepEqual(providers, [provider], 'benchmark must actually run image inference on the requested provider')
+    return { variant, round, sourceCount: sources.length, sourceHash, providers, catalog, image, catalogTrace, imageTrace,
+      stageTimings: summarizeStages(trace),
+      loadedModel: trace.filter(event => event.fields?.message === 'loaded the image embedding model')
+        .map(event => ({ batchSize: event.fields.max_batch, provider: event.fields.execution_provider,
+          dimensions: event.fields.dimensions })) }
   } catch (error) {
     await writeFile(join(stateDirectory, 'failure.txt'), `${error.stack}\n${stderr}`)
     throw error
   } finally { await stopChild(child) }
+}
+
+function durationMs(text) {
+  const match = /^([\d.]+)(ns|µs|us|ms|s)$/.exec(text ?? '')
+  return match ? Number(match[1]) * { ns: 1e-6, 'µs': 1e-3, us: 1e-3, ms: 1, s: 1000 }[match[2]] : 0
+}
+
+function summarizeStages(trace) {
+  const stages = {}
+  for (const event of trace) {
+    if (event.fields?.message !== 'close' || !event.span?.name) continue
+    const name = event.span.name
+    if (!['decode_image', 'preprocess_image', 'embed_preprocessed_images', 'save_image_embeddings',
+      'image_index', 'video_preprocess'].includes(name)) continue
+    const item = stages[name] ??= { count: 0, totalMs: 0, maxMs: 0, samplesMs: [], batchCounts: {} }
+    const elapsed = durationMs(event.fields['time.busy']) + durationMs(event.fields['time.idle'])
+    item.count += 1
+    item.totalMs += elapsed
+    item.maxMs = Math.max(item.maxMs, elapsed)
+    item.samplesMs.push(elapsed)
+    if (event.span.batch !== undefined) {
+      item.batchCounts[event.span.batch] = (item.batchCounts[event.span.batch] ?? 0) + 1
+    }
+  }
+  for (const item of Object.values(stages)) {
+    item.samplesMs.sort((a, b) => a - b)
+    item.medianMs = item.samplesMs[Math.floor(item.count / 2)]
+    item.p95Ms = item.samplesMs[Math.min(item.count - 1, Math.floor(item.count * .95))]
+    delete item.samplesMs
+  }
+  return stages
 }
 
 async function measureJob(endpoint, token, type, params, label) {

@@ -12,6 +12,11 @@ fn main() -> Result<()> {
         .context("pass model ID; NICEGAL_LOCAL_MODELS_DIR must be set")?;
     let model: ImageEmbeddingModel = id.parse()?;
     let root = model.local_directory().context("model must be local")?;
+    let provider = std::env::var("NICEGAL_VALIDATION_PROVIDER")
+        .ok()
+        .map(|value| value.parse())
+        .transpose()?
+        .unwrap_or(ExecutionProvider::Cpu);
     if let Some(path) = std::env::var_os("NICEGAL_VALIDATION_ORT") {
         runtime::initialize_from_dylib(Path::new(&path))?;
     } else {
@@ -55,9 +60,25 @@ fn main() -> Result<()> {
     drop(text);
     let image = ImageEmbedder::load(&ImageEmbedderOptions {
         model,
+        runtime: runtime::RuntimeOptions {
+            execution_provider: provider,
+            allow_cpu_fallback: false,
+            ..Default::default()
+        },
         ..Default::default()
     })?;
     let image_cases = read_cases::<ImageCase>(root.join("image-tests.json"))?;
+    // Native decoding/filtering can differ by one RGB level from Pillow. PE's larger
+    // inputs amplify this slightly; inference on identical exported tensors is checked
+    // separately by the exporter and DirectML profiling workflow.
+    let minimum_reference_cosine = if matches!(
+        model,
+        ImageEmbeddingModel::PeCoreB16 | ImageEmbeddingModel::PeCoreL14
+    ) {
+        0.9995
+    } else {
+        0.9999
+    };
     let mut minimum_cosine = 1.0_f32;
     let mut image_max_error = 0.0_f32;
     let mut image_count = 0;
@@ -88,16 +109,51 @@ fn main() -> Result<()> {
         let (error, similarity) = compare(&actual, &case.embedding)?;
         // Pillow and Rust bicubic filters are not bit-identical; compare semantic vectors.
         ensure!(
-            similarity > 0.9999,
+            similarity > minimum_reference_cosine,
             "image vector differs in case {image_count}: {error}, {similarity}"
         );
         minimum_cosine = minimum_cosine.min(similarity);
         image_max_error = image_max_error.max(error);
         image_count += 1;
     }
+    // Exercise full batches and a short final batch through the application's padding path.
+    for cases in image_cases.chunks(image.max_batch_size()) {
+        let tensors = cases
+            .iter()
+            .map(|case| {
+                let raster = image.decode_image(&fs::read(&case.path)?)?;
+                let rgb = image::RgbImage::from_raw(
+                    raster.width(),
+                    raster.height(),
+                    raster.into_rgb_bytes(),
+                )
+                .context("RGB shape")?;
+                image.preprocess_image(rgb)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let vectors = image.embed_preprocessed_images(tensors)?;
+        ensure!(
+            vectors.len() == cases.len(),
+            "padded vectors leaked into output"
+        );
+        for (vector, case) in vectors.iter().zip(cases) {
+            ensure!(
+                compare(vector, &case.embedding)?.1 > minimum_reference_cosine,
+                "batched vector differs"
+            );
+        }
+    }
+    let pixels = image.preprocess_image(image::RgbImage::new(17, 13))?;
+    ensure!(
+        image
+            .embed_preprocessed_images(vec![pixels.clone(), pixels])?
+            .len()
+            == 2,
+        "partial batch did not discard padding"
+    );
     println!(
         "{}",
-        serde_json::json!({"modelId": id, "textCases": text_count,
+        serde_json::json!({"modelId": id, "provider": provider.to_string(), "textCases": text_count,
         "textMaxAbsoluteError": text_max_error, "imageCases": image_count,
         "imageMaxAbsoluteError": image_max_error, "imageMinimumCosine": minimum_cosine})
     );

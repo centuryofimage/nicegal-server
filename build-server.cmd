@@ -21,5 +21,8 @@ if /I "%NICEGAL_ENABLE_CUDA%"=="1" (
     set "NICEGAL_CUDA_FEATURE=--features ort-cuda"
 )
 
+uv run --no-project --python 3.13 python scripts/collect-licenses.py
+if errorlevel 1 exit /b 1
+
 call "%~dp0dev.cmd" build --release --locked -p nicegal-server %NICEGAL_CUDA_FEATURE%
 if errorlevel 1 exit /b 1

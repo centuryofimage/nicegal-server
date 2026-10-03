@@ -2,6 +2,7 @@ mod assets;
 mod catalog;
 mod error;
 mod extract;
+mod identifier;
 mod image_embeddings;
 mod image_model;
 mod image_patches;
@@ -19,6 +20,7 @@ mod search_sessions;
 mod tags;
 mod text_embeddings;
 mod thumbnails;
+mod ttl_map;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

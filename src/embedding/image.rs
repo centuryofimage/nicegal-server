@@ -26,6 +26,8 @@ pub enum ImageEmbeddingModel {
     SigLip2Base256,
     SigLipBetaSwinV2Frozen,
     DinoV3B16,
+    PeCoreL14,
+    PeCoreB16,
 }
 
 struct ModelSpec {
@@ -36,9 +38,54 @@ struct ModelSpec {
     context_length: usize,
     /// Whether query text is lowercased before tokenization, matching how the model was trained.
     lowercase_text: bool,
-    published_export: Option<(&'static str, &'static str)>,
-    required_files: &'static [&'static str],
+    source: Source,
+    /// The pooled output the image index stores.
+    embedding_output: &'static str,
+    /// How the image graph gains patch features, if it has useful ones.
+    patch_method: Option<PatchMethod>,
+    /// The batch size DirectML sessions are fixed to, so it fuses the whole graph; short image
+    /// batches are padded. Larger models use smaller batches to keep each GPU submission short.
+    fixed_batch: Option<usize>,
+    /// Whether `bep256/clip-tags` publishes tags for this model.
+    published_tags: bool,
 }
+
+enum Source {
+    /// An ONNX export pinned to one commit.
+    Export(Export),
+    /// One checkpoint folder in DeepGHS's shared, pinned `siglip_beta` repository.
+    DeepGhs(&'static str),
+}
+
+#[derive(Clone, Copy)]
+struct Export {
+    repo: &'static str,
+    revision: &'static str,
+    files: &'static [&'static str],
+    /// Whether the export may declare the `external-weights-v1` storage format.
+    external_weights: bool,
+    /// The `patchGraph` whose prebuilt `image_patched.onnx` an external-weights export ships.
+    patch_graph: Option<&'static str>,
+    /// The image graph's external tensor file, which a derived patched graph must sit beside.
+    image_data: Option<&'static str>,
+    /// `imageSize` and `compatibility` the manifest must declare.
+    requires: Option<(u64, &'static str)>,
+}
+
+const PAIRED_EXPORT: Export = Export {
+    repo: "",
+    revision: "",
+    files: PAIRED_MODEL_FILES,
+    external_weights: true,
+    patch_graph: None,
+    image_data: None,
+    requires: None,
+};
+
+const DEEPGHS_REPO: &str = "deepghs/siglip_beta";
+const DEEPGHS_REVISION: &str = "03aa79c8a4a6c41e06ca87aa6e44fee563b2491d";
+const EXTERNAL_WEIGHTS: &str = "external-weights-v1";
+const PREBUILT_PATCH_GRAPH: &str = "image_patched.onnx";
 
 const PAIRED_MODEL_FILES: &[&str] = &[
     "image.onnx",
@@ -68,6 +115,26 @@ const IMAGE_ONLY_MODEL_FILES: &[&str] = &[
     "preprocessor_config.json",
 ];
 
+/// The `manifest.json` fields an export is checked against. Other fields are ignored.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Manifest {
+    model_id: String,
+    dimensions: usize,
+    context_length: usize,
+    storage_format: Option<String>,
+    patch_graph: Option<String>,
+    image_size: Option<u64>,
+    compatibility: Option<String>,
+}
+
+/// A validated export directory.
+pub(super) struct ModelDirectory {
+    pub(super) path: std::path::PathBuf,
+    /// The prebuilt patch graph an external-weights export ships.
+    prebuilt_patch_graph: Option<std::path::PathBuf>,
+}
+
 impl ImageEmbeddingModel {
     const fn spec(self) -> ModelSpec {
         match self {
@@ -78,11 +145,16 @@ impl ImageEmbeddingModel {
                 license: "CC-BY-NC-4.0",
                 context_length: 77,
                 lowercase_text: false,
-                published_export: Some((
-                    "bep256/metaclip-2-worldwide-b32-ONNX",
-                    "b4ee5fd6043c2b33df398eb0288a6282706c1687",
-                )),
-                required_files: PAIRED_MODEL_FILES,
+                source: Source::Export(Export {
+                    repo: "bep256/metaclip-2-worldwide-b32-ONNX",
+                    revision: "b4ee5fd6043c2b33df398eb0288a6282706c1687",
+                    patch_graph: Some("clearclip-v1"),
+                    ..PAIRED_EXPORT
+                }),
+                embedding_output: "image_embeds",
+                patch_method: Some(PatchMethod::ClearClip),
+                fixed_batch: None,
+                published_tags: true,
             },
             Self::MetaClip2B16 => ModelSpec {
                 id: "facebook/metaclip-2-worldwide-b16",
@@ -91,11 +163,16 @@ impl ImageEmbeddingModel {
                 license: "CC-BY-NC-4.0",
                 context_length: 77,
                 lowercase_text: false,
-                published_export: Some((
-                    "bep256/metaclip-2-worldwide-b16-ONNX",
-                    "d96138fa24aa9cc3f46abf34a06f45f35e71bbba",
-                )),
-                required_files: PAIRED_MODEL_FILES,
+                source: Source::Export(Export {
+                    repo: "bep256/metaclip-2-worldwide-b16-ONNX",
+                    revision: "d96138fa24aa9cc3f46abf34a06f45f35e71bbba",
+                    patch_graph: Some("clearclip-v1"),
+                    ..PAIRED_EXPORT
+                }),
+                embedding_output: "image_embeds",
+                patch_method: Some(PatchMethod::ClearClip),
+                fixed_batch: None,
+                published_tags: true,
             },
             Self::MetaClip2L14 => ModelSpec {
                 id: "facebook/metaclip-2-worldwide-l14",
@@ -104,11 +181,17 @@ impl ImageEmbeddingModel {
                 license: "CC-BY-NC-4.0",
                 context_length: 77,
                 lowercase_text: false,
-                published_export: Some((
-                    "bep256/metaclip-2-worldwide-l14-ONNX",
-                    "77e0837a2b1d7134c6d5678133a5abadaa933bde",
-                )),
-                required_files: PAIRED_MODEL_FILES_WITH_TEXT_DATA,
+                source: Source::Export(Export {
+                    repo: "bep256/metaclip-2-worldwide-l14-ONNX",
+                    revision: "77e0837a2b1d7134c6d5678133a5abadaa933bde",
+                    files: PAIRED_MODEL_FILES_WITH_TEXT_DATA,
+                    patch_graph: Some("clearclip-v1"),
+                    ..PAIRED_EXPORT
+                }),
+                embedding_output: "image_embeds",
+                patch_method: Some(PatchMethod::ClearClip),
+                fixed_batch: None,
+                published_tags: true,
             },
             Self::SigLip2Base256 => ModelSpec {
                 id: "google/siglip2-base-patch16-256",
@@ -117,11 +200,16 @@ impl ImageEmbeddingModel {
                 license: "Apache-2.0",
                 context_length: 64,
                 lowercase_text: true,
-                published_export: Some((
-                    "bep256/siglip2-base-patch16-256-ONNX",
-                    "1fa886058822dbe657d57cfa4e5686c6b886f910",
-                )),
-                required_files: PAIRED_MODEL_FILES,
+                source: Source::Export(Export {
+                    repo: "bep256/siglip2-base-patch16-256-ONNX",
+                    revision: "1fa886058822dbe657d57cfa4e5686c6b886f910",
+                    ..PAIRED_EXPORT
+                }),
+                embedding_output: "image_embeds",
+                // The attention-pooling head gives maps too weak to be worth showing.
+                patch_method: None,
+                fixed_batch: None,
+                published_tags: true,
             },
             Self::SigLipBetaSwinV2Frozen => ModelSpec {
                 id: "deepghs/siglip_beta/smilingwolf/siglip_swinv2_base_2025_02_22_18h56m54s",
@@ -130,8 +218,14 @@ impl ImageEmbeddingModel {
                 license: "Apache-2.0",
                 context_length: 128,
                 lowercase_text: false,
-                published_export: None,
-                required_files: PAIRED_MODEL_FILES,
+                source: Source::DeepGhs("smilingwolf/siglip_swinv2_base_2025_02_22_18h56m54s"),
+                embedding_output: "embeddings",
+                // `encodings` is the spatial mean of this map and `embeddings` its L2 normalization.
+                patch_method: Some(PatchMethod::FeatureMap(
+                    "/siglip_model/norm/LayerNormalization_output_0",
+                )),
+                fixed_batch: None,
+                published_tags: false,
             },
             Self::DinoV3B16 => ModelSpec {
                 id: "facebook/dinov3-vitb16-pretrain-lvd1689m",
@@ -140,11 +234,56 @@ impl ImageEmbeddingModel {
                 license: "DINOv3 License",
                 context_length: 0,
                 lowercase_text: false,
-                published_export: Some((
-                    "bep256/dinov3-vitb16-pretrain-lvd1689m-ONNX",
-                    "05f9d720e2169b6b7ffa499db098d08dd374bd9d",
-                )),
-                required_files: IMAGE_ONLY_MODEL_FILES,
+                source: Source::Export(Export {
+                    repo: "bep256/dinov3-vitb16-pretrain-lvd1689m-ONNX",
+                    revision: "05f9d720e2169b6b7ffa499db098d08dd374bd9d",
+                    files: IMAGE_ONLY_MODEL_FILES,
+                    external_weights: false,
+                    image_data: Some("model.onnx_data"),
+                    requires: Some((224, "reshape-nonzero-v1")),
+                    ..PAIRED_EXPORT
+                }),
+                embedding_output: "pooler_output",
+                // Its normalized tokens before class pooling.
+                patch_method: Some(PatchMethod::DinoTokens("/norm/LayerNormalization_output_0")),
+                fixed_batch: None,
+                published_tags: false,
+            },
+            Self::PeCoreL14 => ModelSpec {
+                id: "facebook/PE-Core-L14-336",
+                name: "PE Core L/14 336",
+                dimensions: 1024,
+                license: "Apache-2.0",
+                context_length: 32,
+                lowercase_text: false,
+                source: Source::Export(Export {
+                    repo: "bep256/PE-Core-L14-336-ONNX",
+                    revision: "068dd79adf87bca2800d51f49185ddad1e2c943d",
+                    patch_graph: Some("pe-attnpool-v1"),
+                    ..PAIRED_EXPORT
+                }),
+                embedding_output: "image_embeds",
+                patch_method: Some(PatchMethod::PeAttnPool),
+                fixed_batch: Some(4),
+                published_tags: true,
+            },
+            Self::PeCoreB16 => ModelSpec {
+                id: "facebook/PE-Core-B16-224",
+                name: "PE Core B/16 224",
+                dimensions: 1024,
+                license: "Apache-2.0",
+                context_length: 32,
+                lowercase_text: false,
+                source: Source::Export(Export {
+                    repo: "bep256/PE-Core-B16-224-ONNX",
+                    revision: "0eb23bd6615c5d45a0a31259ca4fd6cb3d6b44d0",
+                    patch_graph: Some("pe-attnpool-v1"),
+                    ..PAIRED_EXPORT
+                }),
+                embedding_output: "image_embeds",
+                patch_method: Some(PatchMethod::PeAttnPool),
+                fixed_batch: Some(8),
+                published_tags: true,
             },
         }
     }
@@ -159,13 +298,15 @@ impl ImageEmbeddingModel {
         self.spec().dimensions
     }
 
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 8] = [
         Self::MetaClip2B32,
         Self::MetaClip2B16,
         Self::SigLip2Base256,
         Self::MetaClip2L14,
         Self::SigLipBetaSwinV2Frozen,
         Self::DinoV3B16,
+        Self::PeCoreL14,
+        Self::PeCoreB16,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -194,8 +335,19 @@ impl ImageEmbeddingModel {
         }
     }
 
+    /// DeepGHS checkpoints use their own file layout, preprocessing and tokenizer loading.
     pub const fn is_deepghs(self) -> bool {
-        matches!(self, Self::SigLipBetaSwinV2Frozen)
+        matches!(self.spec().source, Source::DeepGhs(_))
+    }
+
+    /// The batch size DirectML sessions are fixed to, if any.
+    pub const fn fixed_batch(self) -> Option<usize> {
+        self.spec().fixed_batch
+    }
+
+    /// Whether `bep256/clip-tags` publishes tags for this model.
+    pub const fn published_tags(self) -> bool {
+        self.spec().published_tags
     }
 
     /// Whether [`ImageEmbedder::patch_features`] can expose spatial image features.
@@ -203,71 +355,39 @@ impl ImageEmbeddingModel {
         self.patch_method().is_some()
     }
 
-    /// How the image graph gains patch features. SigLIP2's attention-pooling head gives maps too
-    /// weak to be worth showing. DINOv3 exposes its normalized tokens before class pooling.
     pub(super) const fn patch_method(self) -> Option<PatchMethod> {
-        match self {
-            Self::MetaClip2B32 | Self::MetaClip2B16 | Self::MetaClip2L14 => {
-                Some(PatchMethod::ClearClip)
-            }
-            // `encodings` is the spatial mean of this map and `embeddings` its L2 normalization.
-            Self::SigLipBetaSwinV2Frozen => Some(PatchMethod::FeatureMap(
-                "/siglip_model/norm/LayerNormalization_output_0",
-            )),
-            Self::DinoV3B16 => Some(PatchMethod::DinoTokens("/norm/LayerNormalization_output_0")),
-            Self::SigLip2Base256 => None,
-        }
+        self.spec().patch_method
     }
 
-    /// The pooled output the image index stores.
     const fn embedding_output(self) -> &'static str {
-        if self.is_deepghs() {
-            "embeddings"
-        } else if matches!(self, Self::DinoV3B16) {
-            "pooler_output"
-        } else {
-            "image_embeds"
-        }
+        self.spec().embedding_output
     }
 
     pub fn source_url(self) -> String {
-        if self.is_deepghs() {
-            format!(
-                "https://huggingface.co/deepghs/siglip_beta/tree/main/{}",
-                self.deepghs_subdirectory().expect("DeepGHS model")
-            )
-        } else {
-            format!("https://huggingface.co/{}", self.id())
+        match self.spec().source {
+            Source::DeepGhs(folder) => {
+                format!("https://huggingface.co/{DEEPGHS_REPO}/tree/main/{folder}")
+            }
+            Source::Export(_) => format!("https://huggingface.co/{}", self.id()),
         }
     }
 
-    fn deepghs_subdirectory(self) -> Option<&'static str> {
-        self.id().strip_prefix("deepghs/siglip_beta/")
-    }
-
-    fn deepghs_source(self, filename: &str) -> Result<crate::hub::ModelSource> {
-        let subdirectory = self
-            .deepghs_subdirectory()
-            .context("model is not a DeepGHS checkpoint")?;
-        Ok(crate::hub::ModelSource {
-            model_id: "deepghs/siglip_beta".to_owned(),
-            revision: Some("03aa79c8a4a6c41e06ca87aa6e44fee563b2491d".to_owned()),
-            filename: format!("{subdirectory}/{filename}"),
-        })
-    }
-
+    /// Resolve one file of a DeepGHS checkpoint. Cached-only loading never accesses the network.
     pub(super) fn deepghs_file(
         self,
         filename: &str,
         cached_only: bool,
         progress: &dyn crate::hub::DownloadObserver,
     ) -> Result<Option<std::path::PathBuf>> {
-        let source = self.deepghs_source(filename)?;
-        if cached_only {
-            Ok(source.cached())
-        } else {
-            source.get_sync_with_progress(progress).map(Some)
-        }
+        let Source::DeepGhs(folder) = self.spec().source else {
+            bail!("{self} is not a DeepGHS checkpoint");
+        };
+        crate::hub::ModelSource::pinned(
+            DEEPGHS_REPO,
+            DEEPGHS_REVISION,
+            &format!("{folder}/{filename}"),
+        )
+        .resolve(cached_only, progress)
     }
 
     pub(super) fn validate_deepghs_meta(self, path: &std::path::Path) -> Result<()> {
@@ -296,71 +416,43 @@ impl ImageEmbeddingModel {
         Ok(Some((image, std::fs::read(preprocessor)?)))
     }
 
+    const fn export(self) -> Option<Export> {
+        match self.spec().source {
+            Source::Export(export) => Some(export),
+            Source::DeepGhs(_) => None,
+        }
+    }
+
+    /// The image graph's external tensor file, which a derived patched graph must sit beside.
+    const fn export_image_data(self) -> Option<&'static str> {
+        match self.export() {
+            Some(export) => export.image_data,
+            None => None,
+        }
+    }
+
+    fn published_source(self, filename: &str) -> Option<crate::hub::ModelSource> {
+        let export = self.export()?;
+        Some(crate::hub::ModelSource::pinned(
+            export.repo,
+            export.revision,
+            filename,
+        ))
+    }
+
     /// Local export override for development and validation.
     pub fn local_directory(self) -> Option<std::path::PathBuf> {
-        if self.is_deepghs() {
-            return None;
-        }
+        self.export()?;
         std::env::var_os("NICEGAL_LOCAL_MODELS_DIR").map(|root| {
             std::path::PathBuf::from(root).join(self.database_file_name().trim_end_matches(".db"))
         })
     }
 
-    fn published_source(self, filename: &str) -> Option<crate::hub::ModelSource> {
-        let (model_id, revision) = self.spec().published_export?;
-        Some(crate::hub::ModelSource {
-            model_id: model_id.to_owned(),
-            revision: Some(revision.to_owned()),
-            filename: filename.to_owned(),
-        })
-    }
-
-    fn required_files(self) -> &'static [&'static str] {
-        self.spec().required_files
-    }
-
-    /// Called only after the replacement encoder has loaded successfully. Local overrides
-    /// never remove shared downloads. Old metadata stays available for provenance.
-    pub(super) fn retire_previous_encoder(self, text: bool) {
-        if self.local_directory().is_some() {
-            return;
-        }
-        let previous = match self {
-            Self::MetaClip2B32 => "a70ddb6e8ac8a2be823ce11f2d296684e150802d",
-            Self::MetaClip2B16 => "33cd628449b4e87dfc3f348d9843b32d32713860",
-            Self::MetaClip2L14 => "c7193980d96e63812a6f70f8ef3feb934549326f",
-            Self::SigLip2Base256 => "9b5bf05e40e88b58d8076b2508cc7495e75b3224",
-            _ => return,
-        };
-        let Some((repo, current)) = self.spec().published_export else {
-            return;
-        };
-        if current == previous {
-            return;
-        }
-        let files: &[&str] = if text {
-            &["text.onnx", "text.onnx_data"]
-        } else {
-            &["image.onnx"]
-        };
-        if let Err(error) =
-            crate::hub::retire_files(&crate::hub::cache_dir(), repo, previous, files)
-        {
-            warn!(%error, model = %self, "could not retire old encoder files; will retry on next load");
-        }
-    }
-
     pub fn available(self) -> bool {
-        if self.is_deepghs() {
-            return true;
+        match (self.export(), self.local_directory()) {
+            (Some(export), Some(path)) => export.files.iter().all(|file| path.join(file).is_file()),
+            _ => true,
         }
-        if let Some(path) = self.local_directory() {
-            return self
-                .required_files()
-                .iter()
-                .all(|file| path.join(file).is_file());
-        }
-        self.published_source("manifest.json").is_some()
     }
 
     /// Resolve one complete pinned snapshot. Cached-only loading never accesses the network.
@@ -368,102 +460,103 @@ impl ImageEmbeddingModel {
         self,
         cached_only: bool,
         progress: &dyn crate::hub::DownloadObserver,
-    ) -> Result<Option<std::path::PathBuf>> {
-        let path = if let Some(path) = self.local_directory() {
-            if cached_only && !self.available() {
-                return Ok(None);
-            }
-            path
-        } else {
-            let mut directory = None;
-            for filename in self.required_files() {
-                let source = self.published_source(filename).with_context(|| {
-                    format!("No published ONNX export is configured for {self}")
-                })?;
-                let file = if cached_only {
-                    source.cached()
-                } else {
-                    Some(source.get_sync_with_progress(progress)?)
-                };
-                let Some(file) = file else { return Ok(None) };
-                let parent = file.parent().context("model cache file has no directory")?;
-                if let Some(current) = &directory {
-                    if current != parent {
-                        bail!("model files for {self} were cached in different directories");
+    ) -> Result<Option<ModelDirectory>> {
+        let export = self
+            .export()
+            .with_context(|| format!("No ONNX export is configured for {self}"))?;
+        let local = self.local_directory();
+        // Every file must come from the same snapshot directory.
+        let resolve =
+            |files: &[&str], directory: &mut Option<std::path::PathBuf>| -> Result<bool> {
+                for filename in files {
+                    let file = match &local {
+                        Some(path) => {
+                            let file = path.join(filename);
+                            if !file.is_file() {
+                                if cached_only {
+                                    return Ok(false);
+                                }
+                                bail!("local export is missing {filename}");
+                            }
+                            file
+                        }
+                        None => match self
+                            .published_source(filename)
+                            .context("missing export source")?
+                            .resolve(cached_only, progress)?
+                        {
+                            Some(file) => file,
+                            None => return Ok(false),
+                        },
+                    };
+                    let parent = file.parent().context("model cache file has no directory")?;
+                    match directory {
+                        Some(current) if current != parent => {
+                            bail!("model files for {self} were cached in different directories")
+                        }
+                        Some(_) => {}
+                        None => *directory = Some(parent.to_path_buf()),
                     }
-                } else {
-                    directory = Some(parent.to_path_buf());
                 }
-            }
-            directory.context("model has no required files")?
-        };
-        let manifest: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(path.join("manifest.json"))?)?;
-        if manifest["modelId"].as_str() != Some(self.id())
-            || manifest["dimensions"].as_u64() != Some(self.dimensions() as u64)
-            || manifest["contextLength"].as_u64() != Some(self.context_length() as u64)
+                Ok(true)
+            };
+        let mut directory = None;
+        if !resolve(export.files, &mut directory)? {
+            return Ok(None);
+        }
+        let path = directory.context("model has no required files")?;
+        let manifest: Manifest =
+            serde_json::from_slice(&std::fs::read(path.join("manifest.json"))?)
+                .context("reading the export manifest")?;
+        if manifest.model_id != self.id()
+            || manifest.dimensions != self.dimensions()
+            || manifest.context_length != self.context_length()
         {
-            bail!("local export manifest does not match {}", self);
+            bail!("export manifest does not match {self}");
         }
-        if self == Self::DinoV3B16
-            && (manifest["imageSize"].as_u64() != Some(224)
-                || manifest["compatibility"].as_str() != Some("reshape-nonzero-v1"))
+        if let Some((image_size, compatibility)) = export.requires
+            && (manifest.image_size != Some(image_size)
+                || manifest.compatibility.as_deref() != Some(compatibility))
         {
-            bail!("DINOv3 needs the validated 224px ONNX export");
+            bail!("{self} needs the validated {image_size}px ONNX export");
         }
-        for filename in self.external_export_files(&manifest)? {
-            if self.local_directory().is_some() {
-                if !path.join(filename).is_file() {
-                    if cached_only {
-                        return Ok(None);
-                    }
-                    bail!("local export is missing {filename}");
-                }
-            } else {
-                let source = self
-                    .published_source(filename)
-                    .context("missing export source")?;
-                let file = if cached_only {
-                    source.cached()
-                } else {
-                    Some(source.get_sync_with_progress(progress)?)
-                };
-                let Some(file) = file else { return Ok(None) };
-                if file.parent() != Some(path.as_path()) {
-                    bail!("external model files were cached in different directories");
-                }
-            }
+        let external = self.external_files(&export, &manifest)?;
+        let mut directory = Some(path);
+        if !resolve(&external, &mut directory)? {
+            return Ok(None);
         }
-        let files: Vec<&str> = self
-            .required_files()
-            .iter()
-            .copied()
-            .chain(self.external_export_files(&manifest)?.iter().copied())
-            .collect();
-        Ok(Some(local_external_weights_directory(&path, &files)?))
+        let path = directory.context("model has no required files")?;
+        let mut files: Vec<&str> = export.files.to_vec();
+        files.extend(
+            external
+                .iter()
+                .copied()
+                .filter(|file| !export.files.contains(file)),
+        );
+        let path = local_external_weights_directory(&path, &files)?;
+        Ok(Some(ModelDirectory {
+            prebuilt_patch_graph: external
+                .contains(&PREBUILT_PATCH_GRAPH)
+                .then(|| path.join(PREBUILT_PATCH_GRAPH)),
+            path,
+        }))
     }
 
     /// Fixed filenames only: a manifest cannot request arbitrary paths or repositories.
-    fn external_export_files(
-        self,
-        manifest: &serde_json::Value,
-    ) -> Result<&'static [&'static str]> {
-        match manifest
-            .get("storageFormat")
-            .and_then(serde_json::Value::as_str)
-        {
-            None => Ok(&[]),
-            Some("external-weights-v1") => match self {
-                Self::MetaClip2B32 | Self::MetaClip2B16 | Self::MetaClip2L14 => {
-                    if manifest["patchGraph"].as_str() != Some("clearclip-v1") {
-                        bail!("external MetaCLIP export requires the clearclip-v1 graph");
+    fn external_files(self, export: &Export, manifest: &Manifest) -> Result<Vec<&'static str>> {
+        match manifest.storage_format.as_deref() {
+            None => Ok(Vec::new()),
+            Some(EXTERNAL_WEIGHTS) if export.external_weights => {
+                let mut files = vec!["image.onnx_data", "text.onnx_data"];
+                if let Some(graph) = export.patch_graph {
+                    if manifest.patch_graph.as_deref() != Some(graph) {
+                        bail!("external {self} export requires the {graph} graph");
                     }
-                    Ok(&["image.onnx_data", "text.onnx_data", "image_patched.onnx"])
+                    files.push(PREBUILT_PATCH_GRAPH);
                 }
-                Self::SigLip2Base256 => Ok(&["image.onnx_data", "text.onnx_data"]),
-                _ => bail!("external-weights-v1 is not supported for {self}"),
-            },
-            Some(format) => bail!("unsupported export storage format: {format}"),
+                Ok(files)
+            }
+            Some(format) => bail!("unsupported export storage format for {self}: {format}"),
         }
     }
 
@@ -577,6 +670,8 @@ pub struct ImageEmbedder {
     preprocessor: ImagePreprocessor,
     model: ImageEmbeddingModel,
     max_batch_size: usize,
+    /// Whether the session only accepts full batches of `max_batch_size`.
+    fixed_batch: bool,
     execution_provider: ExecutionProvider,
     /// Present when the session was built with [`patches::PATCH_OUTPUT`].
     patch_setup: Option<PatchSetup>,
@@ -742,55 +837,43 @@ impl ImageEmbedder {
             bail!("image embedding batch size must be greater than zero");
         }
         let cache_dir = crate::hub::cache_dir();
+        let model = options.model;
         // Resolve and validate files once; only session construction belongs in provider retries.
-        let (image, preprocessor_config, deepghs) = if options.model.is_deepghs() {
-            let Some(files) = options.model.deepghs_image_files(cached_only, progress)? else {
+        let (image, preprocessor_config, prebuilt_patch_graph) = if model.is_deepghs() {
+            let Some((image, config)) = model.deepghs_image_files(cached_only, progress)? else {
                 return Ok(None);
             };
-            (files.0, files.1, true)
+            (image, config, None)
         } else {
-            let Some(path) = options
-                .model
-                .validated_model_directory(cached_only, progress)?
-            else {
+            let Some(directory) = model.validated_model_directory(cached_only, progress)? else {
                 return Ok(None);
             };
             (
-                path.join("image.onnx"),
-                std::fs::read(path.join("preprocessor_config.json"))
+                directory.path.join("image.onnx"),
+                std::fs::read(directory.path.join("preprocessor_config.json"))
                     .context("reading image preprocessor configuration")?,
-                false,
+                directory.prebuilt_patch_graph,
             )
         };
         // Built once, outside provider retries: the graph with its patch output appended.
-        let static_patch = if !deepghs {
-            let directory = image
-                .parent()
-                .context("image graph has no parent directory")?;
-            let manifest: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(directory.join("manifest.json"))?)?;
-            (manifest["patchGraph"].as_str() == Some("clearclip-v1")
-                && manifest["storageFormat"].as_str() == Some("external-weights-v1"))
-            .then(|| PatchedGraph::File(directory.join("image_patched.onnx")))
-        } else {
-            None
-        };
-        let patched_graph = static_patch.or_else(|| {
-            options.model.patch_method().and_then(|method| {
-                Self::patched_graph(
-                    &image,
-                    method,
-                    options.model == ImageEmbeddingModel::DinoV3B16,
-                )
-            })
+        let patched_graph = prebuilt_patch_graph.map(PatchedGraph::File).or_else(|| {
+            model
+                .patch_method()
+                .and_then(|method| Self::patched_graph(&image, method, model.export_image_data()))
         });
+        let fixed_batch = |provider| {
+            model
+                .fixed_batch()
+                .filter(|_| provider == ExecutionProvider::Directml)
+                .map(|batch| batch.min(options.max_batch_size))
+        };
         let (backend, execution_provider) = runtime::with_fallback(options.runtime, |provider| {
             let configured = runtime::configure_provider(provider, options.runtime.intra_threads)?;
             let init = fastembed::ImageInitOptionsUserDefined::new()
                 .with_execution_providers(vec![configured.dispatch])
                 .with_intra_threads(configured.intra_threads.get());
-            if let Some(graph) = &patched_graph {
-                let preprocessor = if deepghs {
+            let backend = if patched_graph.is_some() || fixed_batch(provider).is_some() {
+                let preprocessor = if model.is_deepghs() {
                     ImagePreprocessor::from_deepghs_config(&preprocessor_config)
                 } else {
                     ImagePreprocessor::from_local_config(&preprocessor_config)
@@ -798,36 +881,31 @@ impl ImageEmbedder {
                 .context("preparing image preprocessing")?;
                 let mut builder = ImageEmbedding::session_builder(init)
                     .context("configuring image ONNX session")?;
-                let session = match graph {
-                    PatchedGraph::Memory(bytes) => builder.commit_from_memory(bytes),
-                    PatchedGraph::File(path) => builder.commit_from_file(path),
+                if let Some(batch) = fixed_batch(provider) {
+                    builder = builder
+                        .with_dimension_override("batch", i64::try_from(batch)?)
+                        .map_err(|error| anyhow::anyhow!("fixing the batch dimension: {error}"))?;
                 }
-                .context("loading image ONNX encoder with patch features")?;
-                return Ok(Some(
-                    ImageEmbedding::try_new_from_session(session, preprocessor)
-                        .with_output_key(options.model.embedding_output()),
-                ));
-            }
-            let backend = if deepghs {
+                let session = match &patched_graph {
+                    Some(PatchedGraph::Memory(bytes)) => builder.commit_from_memory(bytes),
+                    Some(PatchedGraph::File(path)) => builder.commit_from_file(path),
+                    None => builder.commit_from_file(&image),
+                }
+                .context("loading image ONNX encoder")?;
+                ImageEmbedding::try_new_from_session(session, preprocessor)
+            } else if model.is_deepghs() {
                 ImageEmbedding::try_new_from_deepghs_path(&image, &preprocessor_config, init)
                     .context("loading DeepGHS image ONNX encoder")?
             } else {
                 ImageEmbedding::try_new_from_path(&image, &preprocessor_config, init)
                     .context("loading local image ONNX encoder")?
             };
-            Ok(Some(if options.model == ImageEmbeddingModel::DinoV3B16 {
-                backend.with_output_key("pooler_output")
-            } else {
-                backend
-            }))
+            Ok(backend.with_output_key(model.embedding_output()))
         })?;
-        let Some(backend) = backend else {
-            return Ok(None);
-        };
-        let patch_setup = match (patched_graph.is_some(), options.model.patch_method()) {
+        let patch_setup = match (patched_graph.is_some(), model.patch_method()) {
             (true, Some(method)) => Some(PatchSetup {
                 method,
-                geometry: if deepghs {
+                geometry: if model.is_deepghs() {
                     InputGeometry::from_deepghs_config(&preprocessor_config)?
                 } else {
                     InputGeometry::from_config(&preprocessor_config)?
@@ -847,11 +925,11 @@ impl ImageEmbedder {
             backend: Mutex::new(backend),
             preprocessor,
             model: options.model,
-            max_batch_size: options.max_batch_size,
+            max_batch_size: fixed_batch(execution_provider).unwrap_or(options.max_batch_size),
+            fixed_batch: fixed_batch(execution_provider).is_some(),
             execution_provider,
             patch_setup,
         };
-        options.model.retire_previous_encoder(false);
         info!(
             dimensions = embedder.dimensions(),
             max_batch = embedder.max_batch_size,
@@ -904,6 +982,7 @@ impl ImageEmbedder {
 
     fn preprocess_raster(&self, raster: crate::imaging::Raster) -> Result<Array3<f32>> {
         let (width, height) = (raster.width(), raster.height());
+        // DeepGHS composites transparency onto white, as its training pipeline did.
         let pixels = if self.model.is_deepghs() {
             raster.flatten_rgb([255, 255, 255])
         } else {
@@ -919,15 +998,15 @@ impl ImageEmbedder {
     fn patched_graph(
         path: &std::path::Path,
         method: PatchMethod,
-        file_backed: bool,
+        external_data: Option<&str>,
     ) -> Option<PatchedGraph> {
         let result = std::fs::read(path)
             .context("reading image ONNX encoder")
             .and_then(|mut graph| {
                 let fragment = method.fragment(&graph)?;
                 graph.extend_from_slice(&fragment);
-                if file_backed {
-                    Self::write_patched_graph(path, &graph).map(PatchedGraph::File)
+                if let Some(external_data) = external_data {
+                    Self::write_patched_graph(path, &graph, external_data).map(PatchedGraph::File)
                 } else {
                     Ok(PatchedGraph::Memory(graph))
                 }
@@ -947,7 +1026,11 @@ impl ImageEmbedder {
     /// Keep the patched graph and external data in one derived cache directory. Hugging Face's
     /// snapshot uses a symlink to a blob outside that directory, which ONNX Runtime rejects for a
     /// newly written graph; a hard link to the same blob keeps paths local without copying weights.
-    fn write_patched_graph(source: &std::path::Path, bytes: &[u8]) -> Result<std::path::PathBuf> {
+    fn write_patched_graph(
+        source: &std::path::Path,
+        bytes: &[u8],
+        external_data: &str,
+    ) -> Result<std::path::PathBuf> {
         static NEXT_TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         use std::hash::{Hash, Hasher};
         use std::sync::atomic::Ordering;
@@ -956,10 +1039,10 @@ impl ImageEmbedder {
             .context("image graph has no parent directory")?;
         let directory = snapshot.join("nicegal-patches-v1");
         std::fs::create_dir_all(&directory).context("creating patched image graph cache")?;
-        let external = directory.join("model.onnx_data");
+        let external = directory.join(external_data);
         if !external.is_file() {
-            std::fs::hard_link(snapshot.join("model.onnx_data").canonicalize()?, &external)
-                .context("linking DINOv3 external tensor data")?;
+            std::fs::hard_link(snapshot.join(external_data).canonicalize()?, &external)
+                .context("linking external tensor data")?;
         }
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         bytes.hash(&mut hasher);
@@ -1025,10 +1108,16 @@ impl ImageEmbedder {
             .map(|raster| setup.geometry.region(raster.width(), raster.height()))
             .collect();
         let embedding_output = self.model.embedding_output();
-        let pixels: Vec<_> = rasters
+        let expected = rasters.len();
+        let mut pixels: Vec<_> = rasters
             .into_par_iter()
             .map(|raster| self.preprocess_raster(raster))
             .collect::<Result<_>>()?;
+        // Images never attend to each other, so padding repeats of the last one is discarded.
+        if self.fixed_batch {
+            pixels.resize(self.max_batch_size, pixels[expected - 1].clone());
+        }
+        let submitted = pixels.len();
         let pixels = ndarray::stack(
             ndarray::Axis(0),
             &pixels
@@ -1056,10 +1145,10 @@ impl ImageEmbedder {
         let (embedding_shape, embedding) = outputs[embedding_output].try_extract_tensor::<f32>()?;
         let (shape, data) = outputs[patches::PATCH_OUTPUT].try_extract_tensor::<f32>()?;
         let shape: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
-        let grids = patches::patch_grids(&shape, data, setup.method.prefix_tokens())?;
-        if grids.len() != regions.len()
+        let mut grids = patches::patch_grids(&shape, data, setup.method.prefix_tokens())?;
+        if grids.len() != submitted
             || embedding_shape.len() != 2
-            || embedding_shape[0] != regions.len() as i64
+            || embedding_shape[0] != submitted as i64
             || embedding_shape[1] != self.dimensions() as i64
         {
             bail!(
@@ -1067,6 +1156,7 @@ impl ImageEmbedder {
                 self.model
             );
         }
+        grids.truncate(expected);
         Ok(grids
             .into_iter()
             .zip(regions)
@@ -1099,7 +1189,7 @@ impl ImageEmbedder {
         skip_all,
         fields(batch = images.len())
     )]
-    pub fn embed_preprocessed_images(&self, images: Vec<Array3<f32>>) -> Result<Vec<Vec<f32>>> {
+    pub fn embed_preprocessed_images(&self, mut images: Vec<Array3<f32>>) -> Result<Vec<Vec<f32>>> {
         if images.len() > self.max_batch_size {
             bail!(
                 "image batch of {} exceeds the {} the {} backend accepts",
@@ -1112,20 +1202,26 @@ impl ImageEmbedder {
             return Ok(Vec::new());
         }
         let expected = images.len();
+        // Repeat the last real image for short batches; padded vectors never enter the index.
+        if self.fixed_batch {
+            images.resize(self.max_batch_size, images[expected - 1].clone());
+        }
+        let submitted = images.len();
         let mut backend = self
             .backend
             .lock()
             .map_err(|_| anyhow::anyhow!("image embedding model lock was poisoned"))?;
-        let vectors = backend
+        let mut vectors = backend
             .embed_preprocessed(images)
             .context("running FastEmbed image inference")?;
-        if vectors.len() != expected {
+        if vectors.len() != submitted {
             bail!(
-                "{} returned {} vectors for {expected} images",
+                "{} returned {} vectors for {submitted} submitted images",
                 self.model,
                 vectors.len()
             );
         }
+        vectors.truncate(expected);
         if let Some(vector) = vectors
             .iter()
             .find(|vector| vector.len() != self.dimensions())
@@ -1411,36 +1507,28 @@ mod tests {
                     ImageEmbeddingModel::MetaClip2L14
                     | ImageEmbeddingModel::SigLip2Base256
                     | ImageEmbeddingModel::DinoV3B16 => 768,
-                    ImageEmbeddingModel::SigLipBetaSwinV2Frozen => 1024,
+                    ImageEmbeddingModel::SigLipBetaSwinV2Frozen
+                    | ImageEmbeddingModel::PeCoreL14
+                    | ImageEmbeddingModel::PeCoreB16 => 1024,
                     _ => 512,
                 }
             );
         }
         assert!("../unknown".parse::<ImageEmbeddingModel>().is_err());
-        assert_eq!(ImageEmbeddingModel::ALL.len(), 6);
+        assert_eq!(ImageEmbeddingModel::ALL.len(), 8);
     }
 
     #[test]
     fn deepghs_sources_point_inside_the_shared_pinned_repository() {
         let model = ImageEmbeddingModel::SigLipBetaSwinV2Frozen;
         assert!(model.is_deepghs());
-        let source = model.deepghs_source("image_encode.onnx").unwrap();
-        assert_eq!(source.model_id, "deepghs/siglip_beta");
+        let Source::DeepGhs(folder) = model.spec().source else {
+            panic!("expected a DeepGHS source");
+        };
+        assert_eq!(model.id(), format!("{DEEPGHS_REPO}/{folder}"));
         assert_eq!(
-            source.revision.as_deref(),
-            Some("03aa79c8a4a6c41e06ca87aa6e44fee563b2491d")
-        );
-        assert_eq!(
-            source.filename,
-            format!(
-                "{}/image_encode.onnx",
-                model.id().strip_prefix("deepghs/siglip_beta/").unwrap()
-            )
-        );
-        assert!(
-            model
-                .source_url()
-                .ends_with(model.deepghs_subdirectory().unwrap())
+            model.source_url(),
+            format!("https://huggingface.co/deepghs/siglip_beta/tree/main/{folder}")
         );
     }
 
@@ -1610,7 +1698,8 @@ mod tests {
         let directory = ImageEmbeddingModel::MetaClip2B32
             .validated_model_directory(true, &())
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .path;
         let plain = ImageEmbedding::try_new_from_path(
             directory.join("image.onnx"),
             &std::fs::read(directory.join("preprocessor_config.json")).unwrap(),
@@ -1626,7 +1715,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "downloads the four paired exports and runs both encoders"]
+    #[ignore = "downloads the six paired exports and runs both encoders"]
     fn published_external_exports_load_and_infer() {
         initialize_test_runtime();
         assert!(std::env::var_os("NICEGAL_LOCAL_MODELS_DIR").is_none());
@@ -1635,6 +1724,8 @@ mod tests {
             ImageEmbeddingModel::MetaClip2B16,
             ImageEmbeddingModel::MetaClip2L14,
             ImageEmbeddingModel::SigLip2Base256,
+            ImageEmbeddingModel::PeCoreB16,
+            ImageEmbeddingModel::PeCoreL14,
         ] {
             eprintln!("Validating published export: {model}");
             let image = ImageEmbedder::load(&ImageEmbedderOptions {
@@ -1669,6 +1760,79 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "downloads the PE Core L/14 export"]
+    fn pe_l14_patch_features_match_the_indexed_embedding_on_cpu() {
+        initialize_test_runtime();
+        let image = ImageEmbedder::load(&ImageEmbedderOptions {
+            model: ImageEmbeddingModel::PeCoreL14,
+            ..ImageEmbedderOptions::default()
+        })
+        .unwrap();
+        assert!(!image.fixed_batch);
+        let raster = crate::imaging::Raster::Rgb {
+            width: 336,
+            height: 336,
+            pixels: (0..336 * 336 * 3).map(|i| (i % 251) as u8).collect(),
+        };
+        let embedding = image.embed_raster(raster.clone()).unwrap();
+        let patches = image.patch_features(raster).unwrap();
+        assert_eq!((patches.rows, patches.columns), (24, 24));
+        assert_eq!(patches.method, "peAttnPool");
+        assert!(patches.patches.iter().all(|x| x.is_finite()));
+        let cosine: f32 = embedding
+            .iter()
+            .zip(&patches.embedding)
+            .map(|(a, b)| a * b)
+            .sum();
+        assert!(cosine > 0.9999, "cosine {cosine}");
+    }
+
+    #[cfg(feature = "ort-directml")]
+    #[test]
+    #[ignore = "downloads the PE Core B/16 export and requires a DirectML device"]
+    fn fixed_batch_pads_only_on_directml() {
+        initialize_test_runtime();
+        let load = |execution_provider| {
+            ImageEmbedder::load(&ImageEmbedderOptions {
+                model: ImageEmbeddingModel::PeCoreB16,
+                runtime: RuntimeOptions {
+                    execution_provider,
+                    allow_cpu_fallback: false,
+                    ..RuntimeOptions::default()
+                },
+                ..ImageEmbedderOptions::default()
+            })
+            .unwrap()
+        };
+        let raster = crate::imaging::Raster::Rgb {
+            width: 224,
+            height: 224,
+            pixels: (0..224 * 224 * 3).map(|i| (i % 251) as u8).collect(),
+        };
+        let cosine = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(a, b)| a * b).sum::<f32>();
+        let cpu = load(ExecutionProvider::Cpu);
+        assert!(!cpu.fixed_batch);
+        let expected = cpu.embed_raster(raster.clone()).unwrap();
+        let expected_patches = cpu.patch_features(raster.clone()).unwrap();
+        drop(cpu);
+        let directml = load(ExecutionProvider::Directml);
+        assert!(directml.fixed_batch);
+        let single = directml.embed_raster(raster.clone()).unwrap();
+        assert!(cosine(&expected, &single) > 0.999);
+        let patches = directml.patch_features(raster).unwrap();
+        assert_eq!((patches.rows, patches.columns), (14, 14));
+        assert!(cosine(&expected_patches.embedding, &patches.embedding) > 0.999);
+        let dimensions = patches.dimensions;
+        let minimum = patches
+            .patches
+            .chunks_exact(dimensions)
+            .zip(expected_patches.patches.chunks_exact(dimensions))
+            .map(|(a, b)| cosine(a, b))
+            .fold(f32::INFINITY, f32::min);
+        assert!(minimum > 0.999, "minimum patch cosine {minimum}");
+    }
+
+    #[test]
     #[ignore = "requires the SigLIP SwinV2 checkpoint cached by explicit setup"]
     fn swinv2_feature_map_leaves_the_indexed_embedding_unchanged() {
         initialize_test_runtime();
@@ -1689,7 +1853,11 @@ mod tests {
     fn dinov3_patch_tokens_leave_the_indexed_embedding_unchanged() {
         initialize_test_runtime();
         let model = ImageEmbeddingModel::DinoV3B16;
-        let directory = model.validated_model_directory(true, &()).unwrap().unwrap();
+        let directory = model
+            .validated_model_directory(true, &())
+            .unwrap()
+            .unwrap()
+            .path;
         let plain = ImageEmbedding::try_new_from_path(
             directory.join("image.onnx"),
             &std::fs::read(directory.join("preprocessor_config.json")).unwrap(),

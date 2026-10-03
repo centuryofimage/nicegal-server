@@ -82,11 +82,11 @@ impl FastEmbedBackend {
         cached_only: bool,
         progress: &dyn crate::hub::DownloadObserver,
     ) -> Result<Option<(Self, PathBuf, ExecutionProvider)>> {
-        let path = {
+        let directory = {
             let _span = tracing::debug_span!("image_query_cache_validation").entered();
             model.validated_model_directory(cached_only, progress)?
         };
-        let Some(path) = path else {
+        let Some(super::image::ModelDirectory { path, .. }) = directory else {
             return Ok(None);
         };
         let (backend, provider) = runtime::with_fallback(options, |provider| {
@@ -101,17 +101,16 @@ impl FastEmbedBackend {
                     config_file: std::fs::read(path.join("config.json"))?,
                 }
             };
-            TextEmbedding::try_new_from_path(
-                path.join("text.onnx"),
-                files,
-                fastembed::InitOptionsUserDefined::new()
-                    .with_max_length(model.context_length())
-                    .with_execution_providers(vec![configured.dispatch])
-                    .with_intra_threads(configured.intra_threads.get()),
-            )
-            .context("loading local paired text ONNX encoder")
+            let mut init = fastembed::InitOptionsUserDefined::new()
+                .with_max_length(model.context_length())
+                .with_execution_providers(vec![configured.dispatch])
+                .with_intra_threads(configured.intra_threads.get());
+            if model.fixed_batch().is_some() {
+                init = init.with_dimension_override("batch", 1);
+            }
+            TextEmbedding::try_new_from_path(path.join("text.onnx"), files, init)
+                .context("loading local paired text ONNX encoder")
         })?;
-        model.retire_previous_encoder(true);
         Ok(Some((
             Self {
                 inner: Mutex::new(backend),

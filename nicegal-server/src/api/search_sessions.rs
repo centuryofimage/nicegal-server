@@ -1,18 +1,18 @@
 //! Ordering belongs to the search service, independently of HTTP or Electron delivery order.
 use std::collections::HashMap;
 use std::sync::LazyLock;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use axum::{Json, http::HeaderMap};
 use nicegal_core::cancellation::SearchCancellation;
 use parking_lot::Mutex;
 use serde::Deserialize;
 
-use super::{error::ApiError, extract::ApiJson};
+use super::ttl_map::{Retained, TtlMap};
+use super::{error::ApiError, extract::ApiJson, identifier::validate_identifier};
 
-static SESSIONS: LazyLock<Mutex<HashMap<String, Session>>> = LazyLock::new(Mutex::default);
-const RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
-const MAX_SESSIONS: usize = 4096;
+static SESSIONS: LazyLock<Mutex<TtlMap<Session>>> = LazyLock::new(Mutex::default);
+const MAX_CLIENT_LEN: usize = 128;
 
 struct Session {
     generation: u64,
@@ -20,6 +20,16 @@ struct Session {
     touched: Instant,
     lanes: HashMap<String, (u64, SearchCancellation)>,
     next_request: u64,
+}
+
+impl Retained for Session {
+    fn touched_at(&self) -> Instant {
+        self.touched
+    }
+
+    fn pinned(&self) -> bool {
+        !self.lanes.is_empty()
+    }
 }
 
 impl Session {
@@ -64,34 +74,24 @@ fn header<'a>(headers: &'a HeaderMap, name: &str) -> Result<Option<&'a str>, Api
 }
 
 fn validate_client(client: &str) -> Result<(), ApiError> {
-    if client.is_empty()
-        || client.len() > 128
-        || !client
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"-_:".contains(&b))
-    {
-        return Err(ApiError::bad_request("invalid search client"));
-    }
-    Ok(())
+    validate_identifier(client, MAX_CLIENT_LEN, "invalid search client")
 }
 
 fn session<'a>(
-    sessions: &'a mut HashMap<String, Session>,
+    sessions: &'a mut TtlMap<Session>,
     client: &str,
 ) -> Result<&'a mut Session, ApiError> {
-    sessions.retain(|_, s| !s.lanes.is_empty() || s.touched.elapsed() < RETENTION);
-    if !sessions.contains_key(client) && sessions.len() >= MAX_SESSIONS {
+    sessions.sweep();
+    if !sessions.has_room_for(client) {
         return Err(ApiError::bad_request("too many search sessions"));
     }
-    Ok(sessions
-        .entry(client.to_owned())
-        .or_insert_with(|| Session {
-            generation: 0,
-            closed: false,
-            touched: Instant::now(),
-            lanes: HashMap::new(),
-            next_request: 0,
-        }))
+    Ok(sessions.get_or_insert_with(client, || Session {
+        generation: 0,
+        closed: false,
+        touched: Instant::now(),
+        lanes: HashMap::new(),
+        next_request: 0,
+    }))
 }
 
 pub(super) fn begin(headers: &HeaderMap) -> Result<SearchLease, ApiError> {

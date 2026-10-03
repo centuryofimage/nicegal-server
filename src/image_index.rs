@@ -736,7 +736,12 @@ fn embed_sample_batches(
         if chunk.is_empty() {
             break;
         }
+        let count = chunk.len();
         vectors.extend(embedder.embed_preprocessed_images(chunk)?);
+        observer.on_event(IndexEvent::Progress(IndexProgressDelta {
+            images_inferred: count,
+            ..IndexProgressDelta::default()
+        }));
     }
     Ok(vectors)
 }

@@ -10,9 +10,6 @@ use hf_hub::api::tokio::{Api, ApiBuilder, Progress};
 use hf_hub::{Cache, Repo, RepoType};
 use tracing::{debug, error, info};
 
-mod retire;
-pub(crate) use retire::retire_files;
-
 #[derive(Debug)]
 struct DownloadCancelled;
 
@@ -119,6 +116,15 @@ pub struct ModelSource {
 }
 
 impl ModelSource {
+    /// A file from a repository pinned to one commit.
+    pub fn pinned(model_id: &str, revision: &str, filename: &str) -> Self {
+        Self {
+            model_id: model_id.to_owned(),
+            revision: Some(revision.to_owned()),
+            filename: filename.to_owned(),
+        }
+    }
+
     pub fn repo(&self) -> Repo {
         match &self.revision {
             Some(revision) => {
@@ -280,6 +286,19 @@ impl ModelSource {
         }
     }
 
+    /// The cached file, downloading it on a cache miss unless `cached_only` is set.
+    pub fn resolve(
+        &self,
+        cached_only: bool,
+        observer: &dyn DownloadObserver,
+    ) -> Result<Option<PathBuf>> {
+        if cached_only {
+            Ok(self.cached())
+        } else {
+            self.get_sync_with_progress(observer).map(Some)
+        }
+    }
+
     pub fn cached(&self) -> Option<PathBuf> {
         let cache = cache();
         self.cached_in(&cache)
@@ -364,11 +383,11 @@ mod tests {
     #[test]
     #[ignore = "requires Hugging Face network access"]
     fn pinned_deepghs_metadata_downloads_into_the_shared_cache() {
-        let source = ModelSource {
-            model_id: "deepghs/siglip_beta".into(),
-            revision: Some("03aa79c8a4a6c41e06ca87aa6e44fee563b2491d".into()),
-            filename: "smilingwolf/siglip_swinv2_base_2025_02_22_18h56m54s/meta.json".into(),
-        };
+        let source = ModelSource::pinned(
+            "deepghs/siglip_beta",
+            "03aa79c8a4a6c41e06ca87aa6e44fee563b2491d",
+            "smilingwolf/siglip_swinv2_base_2025_02_22_18h56m54s/meta.json",
+        );
         let path = source.get_sync().unwrap();
         let metadata: serde_json::Value =
             serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();

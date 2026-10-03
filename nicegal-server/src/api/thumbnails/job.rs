@@ -3,14 +3,14 @@ use camino::Utf8PathBuf as PathBuf;
 use nicegal_core::assets::{Asset, AssetCatalog, Timeline};
 use nicegal_core::index::{IndexEvent, IndexObserver, IndexPhase, IndexProgressDelta};
 use nicegal_core::thumbs::{GENERATOR_VERSION, SIZE_BUCKETS, ThumbnailService};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use nicegal_core::scope::PathScope;
 
 use super::super::error::ApiError;
 use super::super::libraries;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct Request {
     library_id: i64,
@@ -25,7 +25,7 @@ pub(crate) struct Request {
     range: Option<TimelineRange>,
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 enum TimelineRequest {
     #[default]
@@ -33,14 +33,17 @@ enum TimelineRequest {
     Capture,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct TimelineRange {
     from_ns: Option<String>,
     to_ns: Option<String>,
 }
 
+#[derive(Debug, PartialEq)]
 pub(crate) struct Spec {
+    /// The validated request, kept so an interrupted job resumes from exactly what was accepted.
+    request: Request,
     library_id: i64,
     buckets: Vec<u16>,
     force: bool,
@@ -69,6 +72,7 @@ pub(crate) fn prepare(mut request: Request) -> Result<Spec, ApiError> {
     }
     let (from_ns, to_ns) = request
         .range
+        .clone()
         .map(|range| -> Result<_, ApiError> {
             Ok((
                 parse_ns("fromNs", range.from_ns)?,
@@ -91,7 +95,7 @@ pub(crate) fn prepare(mut request: Request) -> Result<Spec, ApiError> {
     }
     Ok(Spec {
         library_id: request.library_id,
-        buckets: request.buckets,
+        buckets: request.buckets.clone(),
         force: request.force,
         sweep_stale: request.sweep_stale,
         timeline: match request.timeline {
@@ -100,6 +104,7 @@ pub(crate) fn prepare(mut request: Request) -> Result<Spec, ApiError> {
         },
         from_ns,
         to_ns,
+        request,
     })
 }
 
@@ -215,13 +220,16 @@ fn default_backfill_buckets() -> Vec<u16> {
     vec![1024]
 }
 
+/// The job as `POST /jobs` accepts it, so a resume record parses as a `JobRequest`.
+#[derive(Serialize)]
+#[serde(tag = "type", content = "params", rename_all = "camelCase")]
+pub(crate) enum ResumeRecord<'a> {
+    ThumbnailGenerate(&'a Request),
+}
+
 impl Spec {
-    pub(crate) fn resume_request(&self) -> serde_json::Value {
-        serde_json::json!({ "type": "thumbnailGenerate", "params": {
-            "libraryId": self.library_id, "buckets": self.buckets, "force": self.force,
-            "sweepStale": self.sweep_stale, "timeline": match self.timeline { Timeline::Modified => "modified", Timeline::Capture => "capture" },
-            "range": { "fromNs": self.from_ns.map(|ns| ns.to_string()), "toNs": self.to_ns.map(|ns| ns.to_string()) }
-        }})
+    pub(crate) fn resume_request(&self) -> ResumeRecord<'_> {
+        ResumeRecord::ThumbnailGenerate(&self.request)
     }
 }
 
@@ -247,6 +255,42 @@ mod tests {
         assert_eq!(spec.timeline, Timeline::Capture);
         assert_eq!(spec.from_ns, Some(1_704_067_200_000_000_000));
         assert_eq!(spec.to_ns, Some(1_735_689_600_000_000_000));
+    }
+
+    #[test]
+    fn resume_record_round_trips_every_field() {
+        let request: Request = serde_json::from_value(serde_json::json!({
+            "libraryId": 9,
+            "buckets": [1024, 256, 256],
+            "force": true,
+            "sweepStale": false,
+            "timeline": "capture",
+            "range": { "fromNs": "-5", "toNs": "1735689600000000000" }
+        }))
+        .unwrap();
+        let spec = prepare(request).unwrap();
+        assert_eq!(spec.buckets, vec![256, 1024]);
+        let record = serde_json::to_value(spec.resume_request()).unwrap();
+        assert_eq!(record["type"], "thumbnailGenerate");
+        let resumed = prepare(serde_json::from_value(record["params"].clone()).unwrap()).unwrap();
+        assert_eq!(resumed, spec);
+        assert_eq!(resumed.library_id, 9);
+        assert!(resumed.force);
+        assert_eq!(resumed.timeline, Timeline::Capture);
+        assert_eq!(resumed.from_ns, Some(-5));
+        assert_eq!(resumed.to_ns, Some(1_735_689_600_000_000_000));
+
+        let sweep: Request = serde_json::from_value(serde_json::json!({
+            "libraryId": 2,
+            "buckets": SIZE_BUCKETS,
+            "sweepStale": true
+        }))
+        .unwrap();
+        let spec = prepare(sweep).unwrap();
+        let record = serde_json::to_value(spec.resume_request()).unwrap();
+        let resumed = prepare(serde_json::from_value(record["params"].clone()).unwrap()).unwrap();
+        assert!(resumed.sweep_stale);
+        assert_eq!(resumed, spec);
     }
 
     #[test]

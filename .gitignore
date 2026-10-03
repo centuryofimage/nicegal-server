@@ -1,4 +1,5 @@
 /target
+__pycache__/
 /testdata/video/
 /.deps/
 /libs/*/target

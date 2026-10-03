@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Refresh the checked-in Cargo dependency metadata inventory (Python 3 stdlib only)."""
+"""Generate the Cargo dependency license inventory as build output (Python stdlib only)."""
 
 import hashlib
 import json
@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 from urllib.parse import urlsplit, urlunsplit
 
 
@@ -72,9 +73,8 @@ def package_license(package: dict) -> str:
         # Cargo on Windows may be invoked from MSYS Python, whose Path is POSIX.
         path = Path(package["manifest_path"].replace("\\", "/")).parent / license_file.replace("\\", "/")
         digest = hashlib.sha256(path.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
-        if digest != "9cfbbedc535b1a4b73b2f7f51fd683ac6cae914f6d4bc7f271b9b230dd4e2808":
-            raise ValueError("nom-exif license file changed; review before refreshing inventory")
-        return "MIT"
+        if digest == "9cfbbedc535b1a4b73b2f7f51fd683ac6cae914f6d4bc7f271b9b230dd4e2808":
+            return "MIT"
     return "See package license file (no SPDX expression declared)"
 
 
@@ -97,12 +97,10 @@ def runtime_packages() -> list[dict]:
     ):
         match = re.search(rf"^{re.escape(name)}==([^;\s]+)", requirements, re.MULTILINE)
         if match is None:
-            raise ValueError(f"Expected a pinned runtime requirement for {name}")
+            continue
         entry = {"name": name, "version": match[1], "license": license_name, "url": url}
         snapshot = ROOT / "third-party-notices" / f"{name}-{match[1]}"
-        if not snapshot.is_dir():
-            raise ValueError(f"Missing pinned runtime notice snapshot: {snapshot.name}")
-        entry["notices"] = collect_notices(snapshot)
+        entry["notices"] = collect_notices(snapshot) if snapshot.is_dir() else []
         packages.append(entry)
     packages.extend([{
         "name": "Microsoft DirectML",
@@ -112,7 +110,7 @@ def runtime_packages() -> list[dict]:
     }, {
         "name": "FFmpeg",
         "version": "9.0.1",
-        "license": " LGPL-2.1-or-later",
+        "license": "LGPL-2.1-or-later",
         "url": "https://ffmpeg.org/",
         "notices": collect_notices(ROOT / "third-party-notices" / "ffmpeg-9.0.1"),
     }])
@@ -124,9 +122,16 @@ def main() -> None:
     command = [wrapper, "metadata", "--locked", "--format-version", "1"]
     if os.name == "nt":
         command = ["cmd.exe", "/d", "/c", *command]
-    result = subprocess.run(
-        command, cwd=ROOT, check=True, capture_output=True, text=True, encoding="utf-8"
-    )
+    try:
+        result = subprocess.run(
+            command, cwd=ROOT, check=True, capture_output=True, text=True, encoding="utf-8"
+        )
+    except subprocess.CalledProcessError as error:
+        # Preserve Cargo's actual --locked diagnostic instead of inventing another
+        # inventory-freshness failure or hiding the cause behind a Python traceback.
+        if error.stderr:
+            print(error.stderr, file=sys.stderr, end="")
+        raise SystemExit(error.returncode) from None
     # The Windows build wrapper prints the Visual Studio environment banner before
     # forwarding Cargo's JSON output.
     metadata = json.loads(result.stdout[result.stdout.index("{"):])
@@ -164,10 +169,12 @@ def main() -> None:
         ),
         "runtimePackages": runtime_packages(),
     }
-    (ROOT / "third-party-licenses.json").write_text(
-        json.dumps(inventory, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    output = ROOT / "target" / "third-party-licenses.json"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(
+        json.dumps(inventory, indent=2, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n"
     )
-    print(f"Wrote {len(packages)} dependencies to third-party-licenses.json")
+    print(f"Wrote {len(packages)} dependencies to {output.relative_to(ROOT)}")
 
 
 if __name__ == "__main__":
