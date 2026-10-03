@@ -47,10 +47,9 @@ fn wrap_read<P: Progress, R: Read>(inner: R, progress: &mut P) -> Wrapper<'_, P,
 impl<P: Progress, R: Read> Read for Wrapper<'_, P, R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if self.progress.is_cancelled() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "download cancelled",
-            ));
+            // `io::copy` retries Interrupted forever. Cancellation must leave the copy loop
+            // so download_tempfile can remove the partial file and return ApiError::Cancelled.
+            return Err(std::io::Error::other("download cancelled"));
         }
         let read = self.inner.read(buf)?;
         self.progress.update(read);
@@ -949,7 +948,42 @@ mod tests {
         let mut progress = Cancelled;
         let mut reader = wrap_read(std::io::Cursor::new([1_u8, 2, 3]), &mut progress);
         let error = reader.read(&mut [0_u8; 3]).unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+    }
+
+    #[test]
+    fn cancellation_stops_file_copy_after_download_progress() {
+        struct CancelAfterProgress {
+            downloaded: usize,
+            checks: std::cell::Cell<usize>,
+        }
+        impl Progress for CancelAfterProgress {
+            fn init(&mut self, _: usize, _: &str) {}
+            fn update(&mut self, size: usize) {
+                self.downloaded += size;
+            }
+            fn finish(&mut self) {}
+            fn is_cancelled(&self) -> bool {
+                let checks = self.checks.get() + 1;
+                self.checks.set(checks);
+                // Bound retries so a regression fails instead of hanging the test runner.
+                assert!(checks <= 4, "file copy kept retrying cancellation");
+                self.downloaded > 0
+            }
+        }
+        let mut progress = CancelAfterProgress {
+            downloaded: 0,
+            checks: std::cell::Cell::new(0),
+        };
+        let mut reader = wrap_read(std::io::Cursor::new(vec![1_u8; 32_768]), &mut progress);
+        let mut output = Vec::new();
+        let error = std::io::copy(&mut reader, &mut output).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert!(
+            !output.is_empty(),
+            "download made progress before cancellation"
+        );
+        assert_eq!(output.len(), progress.downloaded);
     }
 
     #[test]

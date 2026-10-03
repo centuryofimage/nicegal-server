@@ -148,9 +148,16 @@ impl<T, O> LazyModel<T, O> {
                 Ok(None)
             }
             Err(error) => {
-                *self.status.lock() = ModelStatus {
-                    state: ModelState::Failed,
-                    error: Some(format!("{error:#}")),
+                *self.status.lock() = if super::jobs::is_cancelled(&error) {
+                    ModelStatus {
+                        state: ModelState::NotLoaded,
+                        error: None,
+                    }
+                } else {
+                    ModelStatus {
+                        state: ModelState::Failed,
+                        error: Some(format!("{error:#}")),
+                    }
                 };
                 Err(error)
             }
@@ -356,6 +363,28 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    #[test]
+    fn cancelled_preparation_returns_to_not_loaded_and_can_retry() {
+        for asynchronous in [false, true] {
+            let model = LazyModel::new_with_loader((), "test model", |_| Ok(42));
+            let error = model
+                .prepare_with(|| {
+                    if asynchronous {
+                        Err(hf_hub::api::tokio::ApiError::Cancelled.into())
+                    } else {
+                        Err(hf_hub::api::sync::ApiError::Cancelled.into())
+                    }
+                })
+                .unwrap_err();
+            assert!(super::super::jobs::is_cancelled(&error));
+            assert_eq!(model.status().state, ModelState::NotLoaded);
+            assert!(model.status().error.is_none());
+            assert!(model.ready().is_err());
+            assert_eq!(*model.prepare().unwrap(), 42);
+            assert_eq!(model.status().state, ModelState::Ready);
+        }
+    }
 
     #[test]
     fn successful_lazy_load_records_its_provider_across_restarts() -> Result<()> {
