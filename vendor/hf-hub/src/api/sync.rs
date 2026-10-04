@@ -442,7 +442,15 @@ fn make_relative(src: &Path, dst: &Path) -> PathBuf {
     }
 }
 
-fn symlink_or_rename(src: &Path, dst: &Path) -> Result<(), std::io::Error> {
+/// Whether `blob` holds a finished download of `size` bytes. Blobs only
+/// appear by renaming a completed temp file, so this is enough to reuse one.
+fn cached_blob(blob: &Path, size: usize) -> bool {
+    std::fs::metadata(blob).is_ok_and(|meta| meta.is_file() && meta.len() == size as u64)
+}
+
+/// Points `dst` at `src` while keeping `src` in the blob store, so a later
+/// revision that shares the blob can reuse it.
+fn link_blob(src: &Path, dst: &Path) -> Result<(), std::io::Error> {
     if dst.exists() {
         return Ok(());
     }
@@ -450,8 +458,10 @@ fn symlink_or_rename(src: &Path, dst: &Path) -> Result<(), std::io::Error> {
     let rel_src = make_relative(src, dst);
     #[cfg(target_os = "windows")]
     {
-        if std::os::windows::fs::symlink_file(rel_src, dst).is_err() {
-            std::fs::rename(src, dst)?;
+        if std::os::windows::fs::symlink_file(rel_src, dst).is_err()
+            && std::fs::hard_link(src, dst).is_err()
+        {
+            std::fs::copy(src, dst)?;
         }
     }
 
@@ -828,13 +838,19 @@ impl ApiRepo {
         std::fs::create_dir_all(blob_path.parent().unwrap())?;
 
         let lock = lock_file(blob_path.clone())?;
-        let mut tmp_path = blob_path.clone();
-        tmp_path.set_extension(EXTENSION);
-        let tmp_filename =
-            self.api
-                .download_tempfile(&url, metadata.size, progress, tmp_path, filename)?;
-
-        std::fs::rename(tmp_filename, &blob_path)?;
+        if cached_blob(&blob_path, metadata.size) {
+            let mut progress = progress;
+            progress.init(metadata.size, filename);
+            progress.update(metadata.size);
+            progress.finish();
+        } else {
+            let mut tmp_path = blob_path.clone();
+            tmp_path.set_extension(EXTENSION);
+            let tmp_filename =
+                self.api
+                    .download_tempfile(&url, metadata.size, progress, tmp_path, filename)?;
+            std::fs::rename(tmp_filename, &blob_path)?;
+        }
         drop(lock);
 
         let mut pointer_path = self
@@ -845,7 +861,7 @@ impl ApiRepo {
         pointer_path.push(filename);
         std::fs::create_dir_all(pointer_path.parent().unwrap()).ok();
 
-        symlink_or_rename(&blob_path, &pointer_path)?;
+        link_blob(&blob_path, &pointer_path)?;
         self.api
             .cache
             .repo(self.repo.clone())
@@ -932,6 +948,23 @@ mod tests {
         fn drop(&mut self) {
             std::fs::remove_dir_all(&self.path).unwrap()
         }
+    }
+
+    #[test]
+    fn linked_blob_stays_reusable_for_the_next_snapshot() {
+        let tmp = TempDir::new();
+        let blob = tmp.path.join("blobs").join("etag");
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::write(&blob, b"weights").unwrap();
+
+        for commit in ["first", "second"] {
+            let pointer = tmp.path.join("snapshots").join(commit).join("model.onnx");
+            std::fs::create_dir_all(pointer.parent().unwrap()).unwrap();
+            assert!(cached_blob(&blob, 7));
+            link_blob(&blob, &pointer).unwrap();
+            assert_eq!(std::fs::read(&pointer).unwrap(), b"weights");
+        }
+        assert!(!cached_blob(&blob, 8));
     }
 
     #[test]
