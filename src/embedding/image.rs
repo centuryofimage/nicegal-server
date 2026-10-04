@@ -12,6 +12,7 @@ use crate::runtime::{self, ExecutionProvider, RuntimeOptions};
 
 use super::fastembed::FastEmbedBackend;
 use super::patches::{self, PatchFeatures, PatchMethod};
+use super::run_log::{RunKind, RunLog, RunShape};
 
 /// An image embedding model supported by this build.
 ///
@@ -147,7 +148,7 @@ impl ImageEmbeddingModel {
                 lowercase_text: false,
                 source: Source::Export(Export {
                     repo: "bep256/metaclip-2-worldwide-b32-ONNX",
-                    revision: "b4ee5fd6043c2b33df398eb0288a6282706c1687",
+                    revision: "4c7dec26ddcf0a4233e975f5d1168f836e418f7d",
                     patch_graph: Some("clearclip-v1"),
                     ..PAIRED_EXPORT
                 }),
@@ -165,7 +166,7 @@ impl ImageEmbeddingModel {
                 lowercase_text: false,
                 source: Source::Export(Export {
                     repo: "bep256/metaclip-2-worldwide-b16-ONNX",
-                    revision: "d96138fa24aa9cc3f46abf34a06f45f35e71bbba",
+                    revision: "bb6c638d25b27390dbe4b6340bdfa310b24970b5",
                     patch_graph: Some("clearclip-v1"),
                     ..PAIRED_EXPORT
                 }),
@@ -183,7 +184,7 @@ impl ImageEmbeddingModel {
                 lowercase_text: false,
                 source: Source::Export(Export {
                     repo: "bep256/metaclip-2-worldwide-l14-ONNX",
-                    revision: "77e0837a2b1d7134c6d5678133a5abadaa933bde",
+                    revision: "102b9bf7f8f66ca125c0e5a93c15607780914c80",
                     files: PAIRED_MODEL_FILES_WITH_TEXT_DATA,
                     patch_graph: Some("clearclip-v1"),
                     ..PAIRED_EXPORT
@@ -258,7 +259,7 @@ impl ImageEmbeddingModel {
                 lowercase_text: false,
                 source: Source::Export(Export {
                     repo: "bep256/PE-Core-L14-336-ONNX",
-                    revision: "068dd79adf87bca2800d51f49185ddad1e2c943d",
+                    revision: "52a24770e2ac7d7fc0695b12e2f34e78962eef2a",
                     patch_graph: Some("pe-attnpool-v1"),
                     ..PAIRED_EXPORT
                 }),
@@ -276,7 +277,7 @@ impl ImageEmbeddingModel {
                 lowercase_text: false,
                 source: Source::Export(Export {
                     repo: "bep256/PE-Core-B16-224-ONNX",
-                    revision: "0eb23bd6615c5d45a0a31259ca4fd6cb3d6b44d0",
+                    revision: "5a5af4c45ba604d970ac3a9e40123b3e3c84ca37",
                     patch_graph: Some("pe-attnpool-v1"),
                     ..PAIRED_EXPORT
                 }),
@@ -675,12 +676,27 @@ pub struct ImageEmbedder {
     execution_provider: ExecutionProvider,
     /// Present when the session was built with [`patches::PATCH_OUTPUT`].
     patch_setup: Option<PatchSetup>,
+    runs: RunLog,
 }
 
 enum PatchedGraph {
     Memory(Vec<u8>),
     /// ONNX external tensor data resolves relative to the graph file, not a memory buffer.
     File(std::path::PathBuf),
+}
+
+impl PatchedGraph {
+    /// Names the graph a session was built from, for logs.
+    fn describe(graph: Option<&Self>) -> String {
+        match graph {
+            None => "original".to_owned(),
+            Some(Self::Memory(bytes)) => format!("patched in memory ({} bytes)", bytes.len()),
+            Some(Self::File(path)) => format!(
+                "patched file {}",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -867,6 +883,8 @@ impl ImageEmbedder {
                 .filter(|_| provider == ExecutionProvider::Directml)
                 .map(|batch| batch.min(options.max_batch_size))
         };
+        let graph = PatchedGraph::describe(patched_graph.as_ref());
+        let load_started = std::time::Instant::now();
         let (backend, execution_provider) = runtime::with_fallback(options.runtime, |provider| {
             let configured = runtime::configure_provider(provider, options.runtime.intra_threads)?;
             let init = fastembed::ImageInitOptionsUserDefined::new()
@@ -929,11 +947,16 @@ impl ImageEmbedder {
             fixed_batch: fixed_batch(execution_provider).is_some(),
             execution_provider,
             patch_setup,
+            runs: RunLog::new(format!("{} on {execution_provider}", options.model)),
         };
         info!(
             dimensions = embedder.dimensions(),
             max_batch = embedder.max_batch_size,
+            fixed_batch = embedder.fixed_batch,
             execution_provider = %embedder.execution_provider,
+            graph = %graph,
+            patch_features = embedder.patch_setup.is_some(),
+            load_ms = load_started.elapsed().as_millis() as u64,
             cache = %cache_dir.display(),
             "loaded the image embedding model"
         );
@@ -1136,12 +1159,17 @@ impl ImageEmbedder {
                 .with(embedding_output)
                 .with(patches::PATCH_OUTPUT),
         );
-        let outputs = session
-            .run_with_options(
-                ort::inputs![input => ort::value::Tensor::from_array(pixels)?],
-                &options,
-            )
-            .context("running image patch inference")?;
+        let inputs = ort::inputs![input => ort::value::Tensor::from_array(pixels)?];
+        let shape = RunShape {
+            kind: RunKind::Patches,
+            images: expected,
+            submitted,
+        };
+        let outputs = self.runs.record(shape, || {
+            session
+                .run_with_options(inputs, &options)
+                .context("running image patch inference")
+        })?;
         let (embedding_shape, embedding) = outputs[embedding_output].try_extract_tensor::<f32>()?;
         let (shape, data) = outputs[patches::PATCH_OUTPUT].try_extract_tensor::<f32>()?;
         let shape: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
@@ -1211,9 +1239,16 @@ impl ImageEmbedder {
             .backend
             .lock()
             .map_err(|_| anyhow::anyhow!("image embedding model lock was poisoned"))?;
-        let mut vectors = backend
-            .embed_preprocessed(images)
-            .context("running FastEmbed image inference")?;
+        let shape = RunShape {
+            kind: RunKind::Embedding,
+            images: expected,
+            submitted,
+        };
+        let mut vectors = self.runs.record(shape, || {
+            backend
+                .embed_preprocessed(images)
+                .context("running FastEmbed image inference")
+        })?;
         if vectors.len() != submitted {
             bail!(
                 "{} returned {} vectors for {submitted} submitted images",

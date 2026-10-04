@@ -115,8 +115,6 @@ fn clearclip_fragment(model: &[u8]) -> Result<Vec<u8>> {
         .context("image graph has no encoder layers")?;
     let block = format!("/vision_model/encoder/layers.{last}/self_attn");
 
-    // q and k are each pre-scaled by the square root of the attention scale, so the scaled query
-    // times its own transpose carries the full scale.
     let query_projection = output(find(&format!("{block}/q_proj/Add"), "Add")?)?;
     let query_reshape = find(&format!("{block}/Reshape"), "Reshape")?;
     let query_heads = find(&format!("{block}/Transpose"), "Transpose")?;
@@ -166,14 +164,31 @@ fn clearclip_fragment(model: &[u8]) -> Result<Vec<u8>> {
         }
         put_bytes(&mut graph, 1, &encoded);
     };
-    let scaled_query = output(scaled_query)?;
+    // The branch reads the query heads, not the scaled query: the scale Mul belongs to the
+    // attention MatMul, and a second consumer would keep ORT from folding it into that MatMul's
+    // alpha. q and k are each pre-scaled by the square root of the attention scale, so q-q logits
+    // carry the square of the query's scale.
+    let query_heads = output(query_heads)?;
+    let scale = input(scaled_query, 1)?;
+    node("Mul", &[scale, scale], &t("logit_scale"), &[]);
     node(
         "Transpose",
-        &[scaled_query],
+        &[query_heads],
         &t("query_t"),
         &[ints_attribute("perm", &[0, 1, 3, 2])],
     );
-    node("MatMul", &[scaled_query, &t("query_t")], &t("logits"), &[]);
+    node(
+        "MatMul",
+        &[query_heads, &t("query_t")],
+        &t("query_logits"),
+        &[],
+    );
+    node(
+        "Mul",
+        &[&t("query_logits"), &t("logit_scale")],
+        &t("logits"),
+        &[],
+    );
     node(
         "Softmax",
         &[&t("logits")],
@@ -621,19 +636,26 @@ mod tests {
             .iter()
             .filter(|n| n.name.starts_with(PREFIX))
             .collect();
-        assert_eq!(added.len(), 10);
+        assert_eq!(added.len(), 12);
         let block = "/vision_model/encoder/layers.2/self_attn";
-        assert_eq!(added[0].inputs, [format!("{block}/qs").as_str()]);
-        assert_eq!(added[3].inputs[1], format!("{block}/vt"));
-        assert_eq!(added[6].inputs[1], "Wo");
-        assert_eq!(added[7].inputs[1], "bo");
+        // The branch reads the unscaled query heads and leaves the scale Mul to the original path.
+        assert_eq!(added[0].inputs, ["c", "c"]);
+        assert_eq!(added[1].inputs, [format!("{block}/qt").as_str()]);
+        assert!(
+            nodes
+                .iter()
+                .all(|n| !n.inputs.contains(&format!("{block}/qs").as_str()))
+        );
+        assert_eq!(added[5].inputs[1], format!("{block}/vt"));
+        assert_eq!(added[8].inputs[1], "Wo");
+        assert_eq!(added[9].inputs[1], "bo");
         assert_eq!(
-            added[8].inputs,
+            added[10].inputs,
             [&format!("{PREFIX}biased") as &str, "g", "b"]
         );
-        assert_eq!(added[8].attributes, [int_attribute("axis", -1).as_slice()]);
-        assert_eq!(added[9].inputs[1], "P");
-        assert_eq!(added[9].outputs, [PATCH_OUTPUT]);
+        assert_eq!(added[10].attributes, [int_attribute("axis", -1).as_slice()]);
+        assert_eq!(added[11].inputs[1], "P");
+        assert_eq!(added[11].outputs, [PATCH_OUTPUT]);
     }
 
     #[test]

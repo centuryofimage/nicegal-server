@@ -4,6 +4,7 @@ mod fastembed;
 mod image;
 mod model;
 mod patches;
+mod run_log;
 
 use anyhow::{Context, Result, bail};
 use tracing::{info, instrument};
