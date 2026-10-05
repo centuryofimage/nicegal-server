@@ -92,6 +92,15 @@ impl RunLog {
 
     /// Time `run`, record it, and log a failure with the session's recent history.
     pub fn record<T>(&self, shape: RunShape, run: impl FnOnce() -> Result<T>) -> Result<T> {
+        // The first call can hang before any completion-based history exists. Subsequent
+        // breadcrumbs share the existing summary cadence, without a timer or another thread.
+        if let Ok(state) = self.state.lock()
+            && (state.runs == 0 || state.window_start.elapsed() >= SUMMARY_INTERVAL)
+        {
+            info!(session = %self.session, kind = %shape.kind,
+                run = state.runs + 1, images = shape.images, submitted = shape.submitted,
+                "inference run starting");
+        }
         let started = Instant::now();
         let result = run();
         let elapsed = started.elapsed();
@@ -116,7 +125,10 @@ impl RunLog {
             state.recent.pop_front();
         }
         state.recent.push_back(run);
-        if state.slowest.is_none_or(|slowest| run.elapsed > slowest.elapsed) {
+        if state
+            .slowest
+            .is_none_or(|slowest| run.elapsed > slowest.elapsed)
+        {
             state.slowest = Some(run);
         }
         state.window_runs += 1;

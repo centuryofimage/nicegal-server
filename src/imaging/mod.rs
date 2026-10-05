@@ -40,14 +40,16 @@ impl Format {
 
 /// Decode a still image to raw pixels. For an animated GIF this is its first composited frame.
 pub fn decode(data: &[u8]) -> Result<Raster> {
-    let format = Format::detect(data)?;
+    let format = Format::detect(data)
+        .with_context(|| format!("identifying image format ({} encoded bytes)", data.len()))?;
     let raster = match format {
         Format::Jpeg => jpeg::decode(data),
         Format::Png => png::decode(data),
         Format::Gif => gif::decode_first_frame(data),
         Format::Webp => webp::decode(data),
         Format::Bmp => legacy::decode_bmp(data),
-    }?;
+    }
+    .with_context(|| format!("{format:?} decoder failed ({} encoded bytes)", data.len()))?;
     let orientation = match format {
         Format::Jpeg => orientation_from_jpeg(data),
         _ => ExifOrientation::Identity,
@@ -58,7 +60,14 @@ pub fn decode(data: &[u8]) -> Result<Raster> {
 /// Decode with accurate JPEG IDCT/chroma upsampling for model preprocessing parity.
 pub fn decode_accurate(data: &[u8]) -> Result<Raster> {
     if Format::detect(data)? == Format::Jpeg {
-        Ok(jpeg::decode_accurate(data)?.orient(orientation_from_jpeg(data)))
+        Ok(jpeg::decode_accurate(data)
+            .with_context(|| {
+                format!(
+                    "accurate JPEG decoder failed ({} encoded bytes)",
+                    data.len()
+                )
+            })?
+            .orient(orientation_from_jpeg(data)))
     } else {
         decode(data)
     }

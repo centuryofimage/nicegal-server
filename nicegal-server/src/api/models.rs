@@ -1,6 +1,8 @@
-//! Opening a library never loads sessions. Indexing may download; search loads cached files only.
-use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::{Arc, OnceLock};
+//! Indexing ensures required sessions, including downloads; search ensures cached sessions only.
+use std::sync::Arc;
+use std::time::Instant;
+
+use super::model_slot::{ModelSlot, ModelState, ModelStatus};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -13,27 +15,9 @@ use nicegal_core::embedding::{
     TextEmbedder, TextEmbedderOptions,
 };
 use nicegal_core::runtime::ExecutionProvider;
-use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use super::{AppState, RuntimeSettings, error::ApiError};
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(super) struct ModelStatus {
-    state: ModelState,
-    error: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-enum ModelState {
-    NotLoaded,
-    Preparing,
-    Ready,
-    Failed,
-    Unsupported,
-}
 
 type CachedLoader<T, O> = fn(&O) -> Result<Option<T>>;
 struct ProviderTracker<T, O> {
@@ -44,36 +28,37 @@ struct ProviderTracker<T, O> {
 
 pub(crate) struct LazyModel<T, O> {
     pub(crate) options: O,
-    session: OnceLock<Arc<T>>,
-    preparation: Mutex<()>,
-    status: Mutex<ModelStatus>,
+    slot: ModelSlot<T>,
+    name: &'static str,
     #[cfg(test)]
     loader: Option<fn(&O) -> Result<T>>,
     cached_loader: Option<CachedLoader<T, O>>,
     provider_tracker: Option<ProviderTracker<T, O>>,
-    name: &'static str,
 }
 
 impl<T, O> LazyModel<T, O> {
     fn new(options: O, name: &'static str) -> Self {
         Self {
             options,
-            session: OnceLock::new(),
-            preparation: Mutex::new(()),
-            status: Mutex::new(ModelStatus {
-                state: ModelState::NotLoaded,
-                error: None,
-            }),
+            slot: ModelSlot::new(name),
+            name,
             #[cfg(test)]
             loader: None,
             cached_loader: None,
             provider_tracker: None,
-            name,
         }
     }
 
     pub(super) fn status(&self) -> ModelStatus {
-        self.status.lock().clone()
+        self.slot.status()
+    }
+
+    fn acquire(&self) -> Option<Arc<T>> {
+        self.slot.acquire(&())
+    }
+
+    pub(super) fn unload_idle(&self, now: Instant) {
+        self.slot.unload_idle(now);
     }
 
     fn load_options(&self) -> Option<O> {
@@ -97,30 +82,16 @@ impl<T, O> LazyModel<T, O> {
     }
 
     fn prepare_with(&self, loader: impl FnOnce() -> Result<Option<T>>) -> Result<Option<Arc<T>>> {
-        let _guard = self.preparation.lock();
-        if let Some(session) = self.session.get() {
-            return Ok(Some(Arc::clone(session)));
-        }
-        *self.status.lock() = ModelStatus {
-            state: ModelState::Preparing,
-            error: None,
-        };
-        // No session is published until the loader has returned successfully. Catching a
-        // loader panic here keeps status truthful and lets the user retry with fresh sessions.
-        // AssertUnwindSafe applies only to the loader boundary; options are read-only.
-        let loaded = catch_unwind(AssertUnwindSafe(loader))
-            .unwrap_or_else(|panic| {
-                let message = panic.downcast_ref::<String>().map(String::as_str)
-                    .or_else(|| panic.downcast_ref::<&str>().copied())
-                    .unwrap_or("unknown model loader failure");
-                Err(anyhow::anyhow!("Model loader panicked: {message}"))
-            }).with_context(|| {
-            format!(
-                "Preparing {} failed. Check your connection and available disk space, then retry preparing search in Libraries",
-                self.name
-            )
-        })
-        .and_then(|loaded| {
+        self.prepare_observed(&(), loader)
+    }
+
+    fn prepare_observed(
+        &self,
+        progress: &dyn nicegal_core::hub::DownloadObserver,
+        loader: impl FnOnce() -> Result<Option<T>>,
+    ) -> Result<Option<Arc<T>>> {
+        self.slot.prepare((), progress, || {
+            let loaded = loader()?;
             if let Some(model) = loaded.as_ref()
                 && let Some(tracker) = &self.provider_tracker
             {
@@ -129,45 +100,22 @@ impl<T, O> LazyModel<T, O> {
                     .accept_loaded_provider((tracker.provider)(model))?;
             }
             Ok(loaded)
-        });
-        match loaded {
-            Ok(Some(session)) => {
-                let session = Arc::new(session);
-                let _ = self.session.set(Arc::clone(&session));
-                *self.status.lock() = ModelStatus {
-                    state: ModelState::Ready,
-                    error: None,
-                };
-                Ok(Some(session))
-            }
-            Ok(None) => {
-                *self.status.lock() = ModelStatus {
-                    state: ModelState::NotLoaded,
-                    error: None,
-                };
-                Ok(None)
-            }
-            Err(error) => {
-                *self.status.lock() = if super::jobs::is_cancelled(&error) {
-                    ModelStatus {
-                        state: ModelState::NotLoaded,
-                        error: None,
-                    }
-                } else {
-                    ModelStatus {
-                        state: ModelState::Failed,
-                        error: Some(format!("{error:#}")),
-                    }
-                };
-                Err(error)
-            }
-        }
+        })
+    }
+
+    fn prepare_with_observer(
+        &self,
+        progress: &dyn nicegal_core::hub::DownloadObserver,
+        loader: impl FnOnce() -> Result<T>,
+    ) -> Result<Arc<T>> {
+        self.prepare_observed(progress, || loader().map(Some))?
+            .context("download-capable loader returned no model")
     }
 
     /// Compile a cached session when present, without invoking the download-capable loader.
     fn cached_if_available(&self) -> Result<Option<Arc<T>>, ApiError> {
-        if let Some(session) = self.session.get() {
-            return Ok(Some(Arc::clone(session)));
+        if let Some(session) = self.acquire() {
+            return Ok(Some(session));
         }
         if let Some(loader) = self.cached_loader {
             let configured = self.load_options();
@@ -194,12 +142,24 @@ impl<T, O> LazyModel<T, O> {
     }
 
     pub(super) fn ready(&self) -> Result<Arc<T>, ApiError> {
-        self.session.get().map(Arc::clone).ok_or_else(|| {
+        self.acquire().ok_or_else(|| {
             ApiError::models_not_ready(format!(
-                "{} is not ready. Open Libraries and choose Prepare search to continue.",
+                "{} is not ready. Search preparation runs automatically for enabled libraries; reopen or rescan the library to retry.",
                 self.name
             ))
         })
+    }
+}
+
+impl ImageQueryModel {
+    /// Indexing owns preparation of the paired query encoder, even when vectors are current.
+    pub(super) fn prepare_text_queries(&self, job: &super::jobs::Job) -> Result<()> {
+        if self.model().supports_text_queries() {
+            job.preparing_models(1);
+            self.prepare_with_progress(job)?;
+            job.models_loaded(1);
+        }
+        Ok(())
     }
 }
 
@@ -216,8 +176,9 @@ macro_rules! model {
             ) -> Result<Arc<$session>> {
                 let configured = self.load_options();
                 let options = configured.as_ref().unwrap_or(&self.options);
-                self.prepare_with(|| $session::load_with_progress(options, progress).map(Some))?
-                    .context("download-capable loader returned no model")
+                self.prepare_with_observer(progress, || {
+                    $session::load_with_progress(options, progress)
+                })
             }
             pub(crate) fn deferred(options: $options) -> Self {
                 let mut model = Self::new(options, $name);
@@ -363,6 +324,62 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    #[test]
+    fn idle_eviction_preserves_active_handles_and_reloads_from_cache() {
+        let mut model =
+            LazyModel::new_with_loader((), "test model", |_| panic!("search must not download"));
+        model.cached_loader = Some(|_| Ok(Some(42)));
+        let active = model.ready_or_cached().unwrap();
+        let weak = Arc::downgrade(&active);
+        let now = Instant::now();
+        let timeout = std::time::Duration::from_secs(300);
+        model.unload_idle(now);
+        model.unload_idle(now + timeout);
+        assert_eq!(model.status().state, ModelState::Ready);
+        drop(active);
+        model.unload_idle(now + timeout);
+        // Status polling must not reset the countdown.
+        assert_eq!(model.status().state, ModelState::Ready);
+        model.unload_idle(now + timeout * 2);
+        assert_eq!(model.status().state, ModelState::NotLoaded);
+        assert!(
+            weak.upgrade().is_none(),
+            "eviction must destroy the session"
+        );
+        assert_eq!(*model.ready_or_cached().unwrap(), 42);
+        assert_eq!(model.status().state, ModelState::Ready);
+    }
+
+    #[test]
+    fn cancellation_during_successful_compilation_retains_the_session() {
+        use std::sync::atomic::AtomicBool;
+        struct Observer(AtomicBool);
+        impl nicegal_core::hub::DownloadObserver for Observer {
+            fn progress(&self, _: &nicegal_core::hub::ModelSource, _: usize, _: usize) {}
+            fn download_cancelled(&self) -> bool {
+                self.0.load(Ordering::Acquire)
+            }
+        }
+        let observer = Observer(AtomicBool::new(false));
+        let model = LazyModel::new_with_loader((), "test model", |_| Ok(42));
+        let error = model
+            .prepare_with_observer(&observer, || {
+                observer.0.store(true, Ordering::Release);
+                Ok(42)
+            })
+            .unwrap_err();
+        assert!(super::super::jobs::is_cancelled(&error));
+        assert_eq!(model.status().state, ModelState::Ready);
+        assert_eq!(*model.ready().unwrap(), 42);
+        observer.0.store(false, Ordering::Release);
+        assert_eq!(
+            *model
+                .prepare_with_observer(&observer, || panic!("session must be reused"))
+                .unwrap(),
+            42
+        );
+    }
 
     #[test]
     fn cancelled_preparation_returns_to_not_loaded_and_can_retry() {

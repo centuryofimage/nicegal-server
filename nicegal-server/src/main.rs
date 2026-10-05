@@ -216,6 +216,7 @@ async fn main() -> Result<()> {
         runtime,
         tags: Default::default(),
     };
+    let model_cleanup = state.start_model_cleanup();
     let app = api::router(state, authorization);
 
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
@@ -230,10 +231,12 @@ async fn main() -> Result<()> {
     io::stdout().flush()?;
     tracing::info!(endpoint = %ready.endpoint, "listening");
 
-    axum::serve(listener, app)
+    let served = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal(jobs))
         .await
-        .context("serving local HTTP requests")?;
+        .context("serving local HTTP requests");
+    model_cleanup.abort();
+    served?;
     Ok(())
 }
 

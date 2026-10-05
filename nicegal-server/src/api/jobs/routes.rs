@@ -28,7 +28,7 @@ pub(super) const MAX_REQUEST_ID_LEN: usize = 160;
 /// The job a client request ID already started, kept to answer retries of the same request.
 pub(super) struct RetainedRequest {
     pub(super) fingerprint: String,
-    pub(super) job_id: u64,
+    pub(super) job_id: Option<u64>,
     pub(super) created: Instant,
 }
 
@@ -41,6 +41,7 @@ impl Retained for RetainedRequest {
 pub(in crate::api) fn routes() -> Router<AppState> {
     Router::new()
         .route("/v1/jobs", post(create_job).get(list_jobs))
+        .route("/v1/jobs/cancel", post(cancel_jobs))
         .route("/v1/jobs/{job_id}/events", get(job_events))
         .route("/v1/jobs/{job_id}", get(get_job).delete(cancel_job))
 }
@@ -114,15 +115,13 @@ pub(super) async fn create_job(
     let mut requests = state.jobs.requests.lock().await;
     requests.sweep();
     if let Some(previous) = key.as_ref().and_then(|key| requests.get(key)) {
+        let job_id = previous.job_id.ok_or_else(ApiError::job_cancelled)?;
         if previous.fingerprint != fingerprint {
             return Err(ApiError::bad_request(
                 "request ID was already used for another job",
             ));
         }
-        let job = state
-            .jobs
-            .get(previous.job_id)
-            .ok_or_else(ApiError::job_not_found)?;
+        let job = state.jobs.get(job_id).ok_or_else(ApiError::job_not_found)?;
         return Ok((StatusCode::ACCEPTED, Json(job.response())));
     }
     if key.as_ref().is_some_and(|key| !requests.has_room_for(key)) {
@@ -134,7 +133,7 @@ pub(super) async fn create_job(
             key,
             RetainedRequest {
                 fingerprint,
-                job_id: job.id,
+                job_id: Some(job.id),
                 created: Instant::now(),
             },
         );
@@ -170,6 +169,45 @@ pub(super) async fn get_job(
         .get(parse_job_id(&job_id)?)
         .ok_or_else(ApiError::job_not_found)?;
     Ok(Json(job.response()))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct CancelJobsRequest {
+    request_ids: Vec<String>,
+}
+
+pub(super) async fn cancel_jobs(
+    State(state): State<AppState>,
+    ApiJson(request): ApiJson<CancelJobsRequest>,
+) -> Result<Json<JobListResponse>, ApiError> {
+    for id in &request.request_ids {
+        validate_identifier(id, MAX_REQUEST_ID_LEN, "invalid request ID")?;
+    }
+    // Job acceptance holds this mutex through validation and admission. Stop either
+    // cancels that admitted job or leaves a tombstone for a request still in transit.
+    let mut requests = state.jobs.requests.lock().await;
+    requests.sweep();
+    let missing: std::collections::BTreeSet<_> = request
+        .request_ids
+        .iter()
+        .filter(|id| requests.get(id).is_none())
+        .cloned()
+        .collect();
+    if requests.iter().count() + missing.len() > crate::api::ttl_map::MAX_ENTRIES {
+        return Err(ApiError::bad_request("too many retained job requests"));
+    }
+    for id in missing {
+        requests.insert(
+            id,
+            RetainedRequest {
+                fingerprint: String::new(),
+                job_id: None,
+                created: Instant::now(),
+            },
+        );
+    }
+    Ok(Json(state.jobs.stop()))
 }
 
 pub(super) async fn cancel_job(

@@ -1,5 +1,5 @@
 //! One job's state, progress, and published snapshots.
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -84,7 +84,7 @@ pub(super) struct JobProgress {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) download: Option<ModelDownload>,
     pub(super) models_loaded: usize,
-    /// Work per second since the current phase began, in the unit [`phase_work`] counts.
+    /// Work per second over the last five seconds, in the unit [`phase_work`] counts.
     pub(super) items_per_second: Option<f64>,
 }
 
@@ -176,6 +176,8 @@ pub(super) struct JobData {
     pub(super) phase_started_at: Option<Instant>,
     /// Work done in the current phase, as [`phase_work`] counts it.
     pub(super) phase_work: u64,
+    /// Cumulative work samples, spaced at least 100 ms apart, plus a window boundary anchor.
+    pub(super) throughput_samples: VecDeque<(Instant, u64)>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -245,6 +247,7 @@ impl Job {
             active_asset_paths: BTreeSet::new(),
             phase_started_at: None,
             phase_work: 0,
+            throughput_samples: VecDeque::new(),
         };
         let (updates, _) = watch::channel(Self::response_from_data(id, kind, library_id, &data));
         Self {
@@ -347,6 +350,7 @@ impl Job {
 
     pub(super) fn complete(&self, cancelled: bool) {
         let mut data = self.data();
+        let cancelled = cancelled || self.cancel_requested.load(Ordering::Acquire);
         refresh_phase_throughput(&mut data);
         data.status = if cancelled {
             JobStatus::Cancelled

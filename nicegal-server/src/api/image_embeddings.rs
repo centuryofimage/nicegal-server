@@ -162,6 +162,16 @@ pub(crate) fn run(
     .and_then(cancel_if)
 }
 
+/// Empty libraries do not trigger model downloads, including explicit backfills.
+pub(crate) fn has_sources(spec: &Spec, databases: &Databases) -> anyhow::Result<bool> {
+    Ok(AssetCatalog::new_read_only(&databases.assets)?
+        .in_scope(&spec.scope)?
+        .iter()
+        .any(|asset| {
+            asset.media_kind == nicegal_core::assets::MediaKind::Image || spec.index_videos
+        }))
+}
+
 /// Use the same candidate selection as the embedding pass before preparing its model.
 pub(crate) fn has_pending(
     spec: &Spec,

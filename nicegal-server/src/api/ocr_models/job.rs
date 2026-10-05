@@ -1,15 +1,13 @@
-use crate::api::jobs::cancel_if;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use hf_hub::api::tokio::Progress;
 use nicegal_core::hub::{self, DownloadObserver, ModelSource};
-use nicegal_core::index::IndexObserver;
 use nicegal_core::ocr::{OcrModelFiles, PaddleOcrPool};
 use nicegal_core::runtime::RuntimeOptions;
 use serde::Deserialize;
 
-use super::ModelStore;
+use super::{LoadedModels, ModelStore};
 use crate::api::RuntimeSettings;
 use crate::api::error::ApiError;
 use crate::api::jobs::Job;
@@ -35,7 +33,7 @@ struct ModelRequest {
     config_filename: String,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Spec {
     detection: ModelSource,
     detection_config: ModelSource,
@@ -57,10 +55,6 @@ impl Spec {
             detection: model(&self.detection, &self.detection_config),
             recognition: model(&self.recognition, &self.recognition_config),
         }
-    }
-    /// Whether this exact pair is the one already loaded, so a scan can skip reloading it.
-    pub(crate) fn is_loaded_in(&self, store: &ModelStore) -> bool {
-        store.is_loaded_with(&self.detection, &self.recognition)
     }
 }
 
@@ -127,77 +121,73 @@ pub(crate) async fn run(
     store: &ModelStore,
     runtime: &Arc<RuntimeSettings>,
     job: Arc<Job>,
-) -> anyhow::Result<()> {
-    let cache = hub::cache();
-    let api = hub::api()?;
+) -> anyhow::Result<Arc<LoadedModels>> {
+    let observer = Arc::clone(&job);
+    let models = store
+        .slot
+        .prepare_async(spec.clone(), observer.as_ref(), |preparation| async move {
+            let cache = hub::cache();
+            let api = hub::api()?;
+            job.downloading_models();
 
-    job.downloading_models();
-    let detection_path = spec
-        .detection
-        .get_with_progress(
-            &api,
-            &cache,
-            ModelDownloadProgress::new(Arc::clone(&job), spec.detection.clone()),
-        )
-        .await?;
-    job.model_download_complete();
-    cancel_if(job.is_cancelled())?;
-    let detection_config_path = spec
-        .detection_config
-        .get_with_progress(
-            &api,
-            &cache,
-            ModelDownloadProgress::new(Arc::clone(&job), spec.detection_config.clone()),
-        )
-        .await?;
-    cancel_if(job.is_cancelled())?;
+            let detection_path = preparation
+                .resolve(spec.detection.get_with_progress(
+                    &api,
+                    &cache,
+                    ModelDownloadProgress::new(Arc::clone(&job), spec.detection.clone()),
+                ))
+                .await?;
+            job.model_download_complete();
+            let detection_config_path = preparation
+                .resolve(spec.detection_config.get_with_progress(
+                    &api,
+                    &cache,
+                    ModelDownloadProgress::new(Arc::clone(&job), spec.detection_config.clone()),
+                ))
+                .await?;
+            let recognition_path = preparation
+                .resolve(spec.recognition.get_with_progress(
+                    &api,
+                    &cache,
+                    ModelDownloadProgress::new(Arc::clone(&job), spec.recognition.clone()),
+                ))
+                .await?;
+            job.model_download_complete();
+            let recognition_config_path = preparation
+                .resolve(spec.recognition_config.get_with_progress(
+                    &api,
+                    &cache,
+                    ModelDownloadProgress::new(Arc::clone(&job), spec.recognition_config.clone()),
+                ))
+                .await?;
 
-    let recognition_path = spec
-        .recognition
-        .get_with_progress(
-            &api,
-            &cache,
-            ModelDownloadProgress::new(Arc::clone(&job), spec.recognition.clone()),
-        )
-        .await?;
-    job.model_download_complete();
-    cancel_if(job.is_cancelled())?;
-    let recognition_config_path = spec
-        .recognition_config
-        .get_with_progress(
-            &api,
-            &cache,
-            ModelDownloadProgress::new(Arc::clone(&job), spec.recognition_config.clone()),
-        )
-        .await?;
-    cancel_if(job.is_cancelled())?;
-
-    job.loading_models();
-    let detection = spec.detection;
-    let recognition = spec.recognition;
-    let runtime_options = runtime_options(store, runtime);
-    let models = tokio::task::spawn_blocking(move || {
-        PaddleOcrPool::load_files(
-            OcrModelFiles {
-                source: &detection,
-                model_path: &detection_path,
-                config_path: &detection_config_path,
-            },
-            OcrModelFiles {
-                source: &recognition,
-                model_path: &recognition_path,
-                config_path: &recognition_config_path,
-            },
-            runtime_options,
-        )
-    })
-    .await
-    .map_err(|error| anyhow::anyhow!("model loader worker failed: {error}"))??;
-    job.models_loaded(2);
-    let actual = models.execution_provider();
-    runtime.accept_loaded_provider(actual)?;
-    store.replace(models);
-    Ok(())
+            job.loading_models();
+            let options = runtime_options(store, runtime);
+            let models = preparation
+                .compile_blocking(move || {
+                    PaddleOcrPool::load_files(
+                        OcrModelFiles {
+                            source: &spec.detection,
+                            model_path: &detection_path,
+                            config_path: &detection_config_path,
+                        },
+                        OcrModelFiles {
+                            source: &spec.recognition,
+                            model_path: &recognition_path,
+                            config_path: &recognition_config_path,
+                        },
+                        options,
+                    )
+                })
+                .await?;
+            runtime.accept_loaded_provider(models.execution_provider())?;
+            Ok(Some(LoadedModels::new(models)))
+        })
+        .await?
+        .expect("OCR loader always returns a model pair");
+    observer.loading_models();
+    observer.models_loaded(2);
+    Ok(models)
 }
 
 fn runtime_options(store: &ModelStore, runtime: &RuntimeSettings) -> RuntimeOptions {

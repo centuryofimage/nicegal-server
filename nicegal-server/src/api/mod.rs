@@ -9,6 +9,8 @@ mod image_patches;
 mod jobs;
 mod libraries;
 mod library_scan;
+mod model_idle;
+mod model_slot;
 pub(crate) mod models;
 mod ocr_models;
 mod patch_cache;
@@ -182,9 +184,20 @@ pub(crate) fn router(state: AppState, authorization: HeaderValue) -> Router {
             TraceLayer::new_for_http()
                 .make_span_with(|request: &Request| {
                     let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+                    let trace_id = request
+                        .headers()
+                        .get("x-nicegal-trace-id")
+                        .and_then(|value| value.to_str().ok())
+                        .filter(|value| {
+                            value.len() <= 64
+                                && value
+                                    .bytes()
+                                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                        });
                     info_span!(
                         "http",
                         request_id,
+                        trace_id,
                         method = %request.method(),
                         path = %request.uri().path(),
                         status = field::Empty,
@@ -378,7 +391,14 @@ mod tests {
             let model = Arc::new(TextEmbedder::deferred(
                 nicegal_core::embedding::TextEmbedderOptions::default(),
             ));
-            model.prepare().unwrap();
+            let worker_model = Arc::clone(&model);
+            std::thread::spawn(move || {
+                worker_model
+                    .ready_or_cached()
+                    .expect("BGE model cached by explicit setup")
+            })
+            .join()
+            .unwrap();
             model
         }))
     }
@@ -522,6 +542,35 @@ mod tests {
             })
         };
         (status, body)
+    }
+
+    #[tokio::test]
+    async fn stop_tombstones_inflight_request_ids_and_late_requests_cannot_restart_work() {
+        let temp = TempDir::new().unwrap();
+        let router = test_router_with_preparation(&temp, false);
+        let (status, _) = send_json(
+            &router,
+            Method::POST,
+            "/v1/jobs/cancel",
+            r#"{"requestIds":["late-start"]}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/jobs")
+            .header(header::AUTHORIZATION, TOKEN)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-nicegal-request-id", "late-start")
+            .body(Body::from(
+                r#"{"type":"libraryScan","params":{"libraryId":1}}"#,
+            ))
+            .unwrap();
+        let (status, body) = response_parts(&router, request).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["code"], "job_cancelled");
+        let (_, jobs) = send(&router, Method::GET, "/v1/jobs").await;
+        assert_eq!(jobs["jobs"].as_array().unwrap().len(), 0);
     }
 
     /// Every test router has one library, over its temp directory.
@@ -994,6 +1043,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires the BGE model cached by explicit setup"]
     async fn vector_is_the_default_search_mode_and_is_empty_until_something_is_embedded() {
         let temp = TempDir::new().unwrap();
         let router = test_router_with_preparation(&temp, true);
@@ -1051,6 +1101,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires the BGE model cached by explicit setup"]
     async fn a_combined_search_answers_every_mode_and_fuses_them() {
         let temp = TempDir::new().unwrap();
         let router = test_router_with_preparation(&temp, true);
@@ -1187,7 +1238,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn embedding_status_separates_an_unembedded_root_from_an_empty_one() {
+    async fn embedding_status_reports_pending_text_without_loading_models() {
         let temp = TempDir::new().unwrap();
         let router = test_router(&temp);
         let uri = format!("/v1/text-embeddings?libraryId={FIXTURE_LIBRARY}");
@@ -1208,7 +1259,14 @@ mod tests {
         assert_eq!(body["pending"], 1);
         // The fixture's one OCR row is stamped `modified_ns: 1`, well under a second.
         assert_eq!(body["lastIndexedAt"], 0, "{body}");
+    }
 
+    #[tokio::test]
+    #[ignore = "requires the BGE model cached by explicit setup"]
+    async fn embedding_status_reports_completed_vectors() {
+        let temp = TempDir::new().unwrap();
+        let router = test_router(&temp);
+        let uri = format!("/v1/text-embeddings?libraryId={FIXTURE_LIBRARY}");
         embed_everything(&temp);
         let (status, body) = send(&router, Method::GET, &uri).await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -1221,6 +1279,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires the BGE model cached by explicit setup"]
     async fn an_embed_backfill_starts_a_job_and_an_unknown_library_does_not() {
         let temp = TempDir::new().unwrap();
         let router = test_router_with_preparation(&temp, true);
@@ -1284,22 +1343,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn time_bounds_narrow_every_search_mode() {
+    #[ignore = "requires the BGE model cached by explicit setup"]
+    async fn time_bounds_narrow_vector_search() {
         let temp = TempDir::new().unwrap();
         let router = test_router_with_preparation(&temp, true);
         embed_everything(&temp);
+        assert_search_time_bounds(&router, &["vector"]).await;
+    }
+
+    #[tokio::test]
+    async fn time_bounds_narrow_literal_search_without_models() {
+        let temp = TempDir::new().unwrap();
+        let router = test_router(&temp);
+        assert_search_time_bounds(&router, &["ocrSimple", "ocrGlob"]).await;
+    }
+
+    async fn assert_search_time_bounds(router: &Router, kinds: &[&str]) {
         // The fixture row has source_modified_ns = 1 and no EXIF capture time.
         let inside = "after=0&before=2&timeline=modified";
         let outside = "after=2&before=9&timeline=modified";
 
-        for kind in ["ocrSimple", "ocrGlob", "vector"] {
+        for &kind in kinds {
             let query = if kind == "ocrGlob" {
                 "*hello*"
             } else {
                 "hello"
             };
             let (status, body) = send(
-                &router,
+                router,
                 Method::GET,
                 &format!(
                     "/v1/search?q={}&type={kind}&libraryId={FIXTURE_LIBRARY}&{inside}",
@@ -1311,7 +1382,7 @@ mod tests {
             assert_eq!(body["total"], 1, "{kind}: {body}");
 
             let (status, body) = send(
-                &router,
+                router,
                 Method::GET,
                 &format!(
                     "/v1/search?q={}&type={kind}&libraryId={FIXTURE_LIBRARY}&{outside}",
@@ -1377,6 +1448,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires the BGE model cached by explicit setup"]
     async fn a_combined_search_applies_the_request_range_and_lets_one_query_override_it() {
         let temp = TempDir::new().unwrap();
         let router = test_router_with_preparation(&temp, true);

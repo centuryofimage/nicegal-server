@@ -200,7 +200,9 @@ impl JobManager {
         }
         let spec = match spec {
             JobSpec::OcrModelLoad(spec) => {
-                return ocr_models::job::run(spec, &self.ocr_models, &self.runtime, job).await;
+                return ocr_models::job::run(spec, &self.ocr_models, &self.runtime, job)
+                    .await
+                    .map(|_| ());
             }
             spec => spec,
         };
@@ -223,6 +225,7 @@ impl JobManager {
                         thumbnails: &thumbnails,
                         text_embedder: &embedder,
                         image_embedder: &image_embedder,
+                        image_query_embedder: &manager.image_query_embedder,
                         ocr_store: &manager.ocr_models,
                         runtime: &manager.runtime,
                         handle,
@@ -249,6 +252,10 @@ impl JobManager {
                 }
                 JobSpec::ImageEmbed(spec) => {
                     let spec = spec.resolve(&databases)?;
+                    if !image_embeddings::has_sources(&spec, &databases)? {
+                        return Ok(());
+                    }
+                    manager.image_query_embedder.prepare_text_queries(&job)?;
                     if !image_embeddings::has_pending(
                         &spec,
                         &databases,
@@ -260,6 +267,7 @@ impl JobManager {
                     job.preparing_models(1);
                     let model = image_embedder.prepare_with_progress(job.as_ref())?;
                     job.models_loaded(1);
+                    job.check_cancelled()?;
                     image_embeddings::run(
                         spec,
                         &databases,
@@ -300,7 +308,7 @@ impl JobManager {
 
     /// Jobs are already globally serialized, making their common epilogue the safe place to
     /// reconcile independently stored derived rows and perform bounded SQLite maintenance.
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "info", skip(self))]
     pub(super) fn maintain_databases(&self) {
         let result = (|| -> anyhow::Result<(usize, usize, usize)> {
             let assets = nicegal_core::assets::AssetCatalog::new(&self.databases.assets)?;
@@ -423,6 +431,37 @@ impl JobManager {
                 .map(|job| job.response())
                 .collect(),
         }
+    }
+
+    /// Stop is one registry transaction: the worker cannot advance a queued job
+    /// between cancelling the active job and cancelling the rest of the queue.
+    pub(super) fn stop(&self) -> JobListResponse {
+        let (queued, clear_resume) = {
+            let mut registry = self.registry();
+            let queued: Vec<_> = registry
+                .queued
+                .iter()
+                .filter_map(|(id, _)| registry.jobs.get(id).cloned())
+                .collect();
+            let mut clear_resume = false;
+            for job in registry
+                .jobs
+                .values()
+                .filter(|job| !job.response().status.is_terminal())
+            {
+                clear_resume |= job.kind == JobKind::ThumbnailGenerate;
+                job.request_cancel();
+            }
+            registry.queued.clear();
+            (queued, clear_resume)
+        };
+        if clear_resume {
+            self.clear_resume();
+        }
+        for job in queued {
+            self.record_stopped_scan(&job, ScanOutcome::Cancelled, "cancelled");
+        }
+        self.list()
     }
 
     /// Hold job admission while a runtime configuration write checks and updates its state.

@@ -650,7 +650,11 @@ impl ThumbnailService {
                     variants.extend(decoded);
                     persisted.push(work);
                 }
-                Err(error) => Self::fail_all(work.variants, format!("{error:#}").into()),
+                Err(error) => {
+                    tracing::warn!(asset_id = work.asset.asset_id, path = %work.asset.path,
+                        error = %format_args!("{error:#}"), "thumbnail decode failed");
+                    Self::fail_all(work.variants, format!("{error:#}").into());
+                }
             }
         }
         let stored: Result<(), Arc<str>> = if variants.is_empty() {

@@ -17,6 +17,35 @@ use super::manager::*;
 use super::request::*;
 use super::routes::*;
 
+#[tokio::test]
+async fn cancelled_ocr_load_stops_before_cache_or_network_access() {
+    let temporary = tempfile::TempDir::new().unwrap();
+    let manager = test_manager(&temporary);
+    let spec = ocr_models::job::prepare(
+        serde_json::from_value(serde_json::json!({
+            "detection": {"modelId": "nonexistent/cancelled-test"},
+            "recognition": {"modelId": "nonexistent/cancelled-test"}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let job = Arc::new(Job::new(1, JobKind::OcrModelLoad));
+    job.begin();
+    job.request_cancel();
+    let result = ocr_models::job::run(
+        spec,
+        &manager.ocr_models,
+        &manager.runtime,
+        Arc::clone(&job),
+    )
+    .await;
+    assert!(super::is_cancelled(
+        &result.err().expect("cancelled before loading")
+    ));
+    assert!(!manager.ocr_models.is_loaded());
+    assert_eq!(job.response().progress.models_loaded, 0);
+}
+
 #[test]
 fn library_job_snapshots_identify_their_library() {
     let job = Job::new_for(42, JobKind::LibraryScan, Some(7));
@@ -190,6 +219,60 @@ fn throughput_resets_when_indexing_phase_changes() {
         }));
         let rate = job.response().progress.items_per_second.unwrap();
         assert!((1.9..=2.0).contains(&rate), "unexpected rate: {rate}");
+    }
+}
+
+#[test]
+fn throughput_tracks_recent_speed_and_idle_time_with_bounded_storage() {
+    use super::progress::refresh_phase_throughput_at;
+
+    let job = Job::new(9, JobKind::LibraryScan);
+    job.on_event(IndexEvent::PhaseChanged(IndexPhase::Cataloging));
+    let mut data = job.data();
+    let start = Instant::now();
+    data.phase_started_at = Some(start);
+
+    // Ten items/s for a full minute, followed by two items/s for five seconds.
+    // Thousands of updates each second must not grow the history without bound.
+    for tick in 1..=65_000_u64 {
+        data.phase_work = if tick <= 60_000 {
+            tick / 100
+        } else {
+            600 + (tick - 60_000) / 500
+        };
+        refresh_phase_throughput_at(&mut data, start + Duration::from_millis(tick));
+        assert!(data.throughput_samples.len() <= 52);
+        if tick == 60_000 {
+            assert!((data.progress.items_per_second.unwrap() - 10.0).abs() < 0.01);
+        }
+    }
+    assert!((data.progress.items_per_second.unwrap() - 2.0).abs() < 0.01);
+
+    // Idle time lowers the rate to zero; speeding up replaces the old window too.
+    for second in 66..=70 {
+        refresh_phase_throughput_at(&mut data, start + Duration::from_secs(second));
+    }
+    assert_eq!(data.progress.items_per_second, Some(0.0));
+    for second in 71..=75 {
+        data.phase_work += 20;
+        refresh_phase_throughput_at(&mut data, start + Duration::from_secs(second));
+    }
+    assert_eq!(data.progress.items_per_second, Some(20.0));
+}
+
+#[test]
+fn throughput_interpolates_irregular_window_boundaries() {
+    use super::progress::refresh_phase_throughput_at;
+
+    let job = Job::new(9, JobKind::LibraryScan);
+    job.on_event(IndexEvent::PhaseChanged(IndexPhase::Cataloging));
+    let mut data = job.data();
+    let start = Instant::now();
+    data.phase_started_at = Some(start);
+    for second in [2, 4, 7, 9] {
+        data.phase_work = second * 10;
+        refresh_phase_throughput_at(&mut data, start + Duration::from_secs(second));
+        assert_eq!(data.progress.items_per_second, Some(10.0));
     }
 }
 
@@ -661,5 +744,36 @@ async fn manager_rejects_concurrent_jobs_and_cancels_queued_work() {
     })
     .await
     .expect("cancelled job should reach a terminal state");
+    assert_eq!(job.response().status, JobStatus::Cancelled);
+}
+
+#[test]
+fn stop_cancels_the_active_job_and_all_queued_jobs_atomically() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let manager = test_manager(&temp);
+    let active = hold_active_job(&manager, JobKind::ModelPrepare);
+    manager.schedule_scan(7, false).unwrap();
+    manager.schedule_scan(8, false).unwrap();
+    let response = manager.stop();
+    assert_eq!(active.response().status, JobStatus::Cancelling);
+    assert!(manager.registry().queued.is_empty());
+    assert_eq!(response.jobs.len(), 3);
+    assert!(
+        response
+            .jobs
+            .iter()
+            .filter(|job| job.kind == JobKind::LibraryScan)
+            .all(|job| job.status == JobStatus::Cancelled)
+    );
+    manager.finish(active.id);
+    assert!(manager.registry().active.is_none());
+}
+
+#[test]
+fn cancellation_at_worker_completion_is_reported_as_cancelled() {
+    let job = Job::new(55, JobKind::ModelPrepare);
+    assert!(job.begin());
+    job.request_cancel();
+    job.complete(false);
     assert_eq!(job.response().status, JobStatus::Cancelled);
 }

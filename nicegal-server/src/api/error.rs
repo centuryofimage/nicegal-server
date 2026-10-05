@@ -18,6 +18,7 @@ pub(crate) enum ErrorCode {
     ThumbnailNotFound,
     JobNotFound,
     JobBusy,
+    JobCancelled,
     SearchSuperseded,
     LibraryNotFound,
     ModelsNotReady,
@@ -40,6 +41,7 @@ impl ErrorCode {
             Self::ThumbnailNotFound => "thumbnail_not_found",
             Self::JobNotFound => "job_not_found",
             Self::JobBusy => "job_busy",
+            Self::JobCancelled => "job_cancelled",
             Self::SearchSuperseded => "search_superseded",
             Self::LibraryNotFound => "library_not_found",
             Self::ModelsNotReady => "models_not_ready",
@@ -82,6 +84,13 @@ pub(crate) struct ApiError {
 }
 
 impl ApiError {
+    pub(crate) fn job_cancelled() -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            ErrorCode::JobCancelled,
+            "Job request was cancelled",
+        )
+    }
     pub(crate) fn search_superseded() -> Self {
         Self::new(
             StatusCode::CONFLICT,

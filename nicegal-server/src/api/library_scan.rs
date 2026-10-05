@@ -3,6 +3,7 @@
 //! The library's stored options decide which indexes run, so a client saves OCR and image choices
 //! with `PUT /v1/libraries/<id>` before scanning. Each model is prepared only when the scan finds
 //! work for it, including the OCR pair, which the request names and the job loads itself.
+//! Image search also prepares its paired query encoder for already indexed libraries.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -24,7 +25,7 @@ use walkdir::WalkDir;
 
 use super::error::ApiError;
 use super::jobs::{FolderState, IndexStages, Job, JobCancelled};
-use super::models::{ImageModel, TextModel};
+use super::models::{ImageModel, ImageQueryModel, TextModel};
 use super::prune_jobs::{self, ReconcileInput, ReconcileScope};
 use super::{Databases, RuntimeSettings, image_embeddings, ocr_models, text_embeddings};
 
@@ -186,6 +187,7 @@ pub(super) struct Services<'a> {
     pub(super) thumbnails: &'a ThumbnailService,
     pub(super) text_embedder: &'a TextModel,
     pub(super) image_embedder: &'a ImageModel,
+    pub(super) image_query_embedder: &'a ImageQueryModel,
     pub(super) ocr_store: &'a ocr_models::ModelStore,
     pub(super) runtime: &'a Arc<RuntimeSettings>,
     /// Drives the async OCR model download from this blocking worker.
@@ -922,6 +924,14 @@ fn embed_images(
         spec.debug_limit,
         index_videos,
     );
+    if !assets
+        .iter()
+        .any(|asset| asset.media_kind == nicegal_core::assets::MediaKind::Image || index_videos)
+    {
+        return Ok(());
+    }
+    // Index coverage does not imply the paired query encoder was prepared successfully.
+    services.image_query_embedder.prepare_text_queries(job)?;
     if !image_embeddings::has_pending(
         &image_spec,
         services.databases,
@@ -961,7 +971,10 @@ fn recognize_text(
         return Ok(());
     }
     let models = ocr_models(ocr_request, services, job)?;
-    let mut models = models.lock().unwrap_or_else(|error| error.into_inner());
+    let mut models = models
+        .sessions
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     index::recognize_selection(
         catalog,
         &mut ocr,
@@ -979,16 +992,14 @@ fn ocr_models(
     ocr_request: &mut Option<ocr_models::job::Spec>,
     services: &Services<'_>,
     job: &Arc<Job>,
-) -> anyhow::Result<Arc<std::sync::Mutex<nicegal_core::ocr::PaddleOcrPool>>> {
-    if let Some(requested) = ocr_request.take()
-        && !requested.is_loaded_in(services.ocr_store)
-    {
-        services.handle.block_on(ocr_models::job::run(
+) -> anyhow::Result<Arc<ocr_models::LoadedModels>> {
+    if let Some(requested) = ocr_request.take() {
+        return services.handle.block_on(ocr_models::job::run(
             requested,
             services.ocr_store,
             services.runtime,
             Arc::clone(job),
-        ))?;
+        ));
     }
     services.ocr_store.snapshot().context(
         "this library recognizes text but no OCR models are loaded; include ocrModels in the scan",

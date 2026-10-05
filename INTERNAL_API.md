@@ -65,15 +65,16 @@ wait for download or compilation. OCR continues to use `GET /v1/ocr/models` and 
 `POST /v1/models/load-cached` with `{"model":"clipText"}` loads only the cached paired CLIP
 text-query encoder and returns `{"loaded":true}`. A missing cache or image-only model returns
 `{"loaded":false}` without downloading; a corrupt cached model returns `models_not_ready` and
-records the failure in model status. On a normal start, the desktop requests this when the
-selected library already has indexed CLIP content. After a runtime change, it also requests the
-new model from cache before the first scan has produced vectors. This endpoint does not load OCR
-models.
+records the failure in model status. This optional endpoint does not load OCR models. The desktop
+leaves encoder preparation to backend scans and search requests.
 
 `POST /v1/jobs` with `{"type":"modelPrepare","params":{}}` prepares the text, CLIP image,
-and paired CLIP text sessions without indexing a root. It is the Settings prepare/retry action.
-An `imageEmbed` job prepares the CLIP pair; `textEmbed` prepares the text session; an
-`libraryScan` prepares whichever of them its pending work needs. Already prepared sessions are reused.
+and paired CLIP text sessions without indexing a root. It is also available to API clients for explicit preparation.
+An `imageEmbed` job prepares the CLIP pair; `textEmbed` prepares the text session; a
+`libraryScan` ensures whichever sessions its enabled search needs. For image-enabled libraries
+with cataloged sources, it ensures the paired text-query encoder even when no images need
+reindexing. The image encoder is loaded only when indexing has pending work. Model ensure
+operations reuse completed downloads and sessions and retry interrupted preparation.
 Failed jobs can be retried by starting the same request again. Preparation uses the usual
 single-active-job scheduling and reports failures through both the job error and model status.
 
@@ -85,7 +86,27 @@ There are no per-byte FastEmbed download percentages. Cancellation is honored be
 an in-flight synchronous model download or compilation must finish first. Successfully prepared
 sessions remain reusable after cancellation; cancellation does not delete cached model files.
 
-Vector and CLIP searches lazily reload their text-query encoder from disk after a restart.
+Model sessions unload after approximately five minutes without use, checked every 15 seconds.
+Active searches and indexing retain strong session references and prevent idle unloading.
+Status polling does not count as use. Eviction frees sessions, preserves downloaded files,
+and reports embedding models as `notLoaded`; OCR status no longer includes a loaded pair.
+Indexing reloads its selected models as needed.
+
+OCR reuse compares the complete detector and recognizer specification, including both YAML
+config filenames. An explicit `ocrModelLoad` for the already loaded specification reuses its
+sessions. Cancellation during compilation retains a successfully compiled pair for later use,
+but the cancelled scan does not continue into recognition.
+
+OCR, BGE, and image/query encoders use the same keyed model slot for session ownership,
+serialized preparation, status, cancellation, and idle eviction. Model-specific loaders
+resolve files and construct/validate their sessions; only the slot publishes a successful
+result. Both synchronous FastEmbed loaders and asynchronous OCR preparation follow that
+lifecycle. OCR file-resolution stages check cancellation through the shared preparation
+context; compilation finishes before a successful session is published and cancellation
+is returned to its caller. Dropped asynchronous preparations release their slot and clear
+the preparing state, and failed replacements preserve the previous usable session.
+
+Vector and CLIP searches lazily reload their text-query encoder from disk after a restart or idle unloading.
 An already set-up library can be searched immediately without reindexing or visiting Settings. `/v1/models` reports `preparing` while the search request waits for compilation, then
 `ready`. The CLIP image encoder and OCR recognition sessions are not needed to search existing
 vectors and remain unloaded until indexing/setup requests them.
@@ -684,6 +705,7 @@ Version 1 routes:
   `pruneMissing`, and `libraryPurge`. Every type except `modelPrepare` and `ocrModelLoad` takes a
   `libraryId`; an unknown library is `404 library_not_found` and no job is created. A job reads its
   library's folders when it runs. `imageEmbed` accepts `{libraryId, force:false, debugLimit?}`
+- `POST /v1/jobs/cancel` takes `{ "requestIds": ["pending-request-id"] }` and returns the same job list as `GET /v1/jobs`. It atomically cancels active and queued work, and retains cancellation tombstones for supplied request IDs that have not been admitted. A late `POST /v1/jobs` using one of these IDs returns `409 job_cancelled`; retrying an already admitted ID returns its retained job snapshot. Request IDs share the existing bounded 24-hour retention.
 - `GET /v1/jobs` lists the active and retained recent jobs
 - `GET /v1/jobs/<job-id>` returns one job's current state and progress
 - `GET /v1/jobs/<job-id>/events` streams `snapshot` server-sent events whenever job state changes
@@ -1213,8 +1235,11 @@ show these updates.
 | `libraryPurge` | `pruning` | `phaseCompleted`, `processed`, `deleted`, `failed` | Library assets no other library covers | `phaseCompleted / total`; `deleted` and `failed` are cumulative per-asset outcomes. |
 | `libraryPurge` | `finished` | None | Last value is retained until the terminal snapshot | Terminal state, no progress bar. |
 
-`itemsPerSecond` is the work done since the current phase began divided by its elapsed time, and
-is `null` until that work is nonzero. Work is `phaseCompleted`, except that OCR leaves out skipped
+`itemsPerSecond` is a rolling five-second average: recent work divided by elapsed time in that
+window (or time since the phase began during the first five seconds). Samples are spaced at least
+100 ms apart, with interpolation at the window boundary. It updates when progress is published,
+resets when the phase changes, and is `null` until that phase has completed any work.
+Work is `phaseCompleted`, except that OCR leaves out skipped
 files and `imageEmbedding` counts images run through the model, one per still or sampled video
 frame, so its rate is images per second while `phaseCompleted` and `total` count files.
 

@@ -214,6 +214,9 @@ impl ModelSource {
     }
 
     pub fn get_sync_with_progress(&self, observer: &dyn DownloadObserver) -> Result<PathBuf> {
+        if observer.download_cancelled() {
+            return Err(DownloadCancelled.into());
+        }
         if let Some(path) = self.cached() {
             return Ok(path);
         }

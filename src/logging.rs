@@ -7,6 +7,7 @@
 //! Both writers use background I/O. Keep [`LoggingGuards`] alive to flush buffered lines.
 
 use std::fs::{self, OpenOptions};
+use std::io::Write;
 
 use anyhow::{Context, Result};
 use camino::Utf8Path as Path;
@@ -65,14 +66,16 @@ pub fn init(log_directory: &Path, override_directives: Option<&str>) -> Result<L
     };
     let file_layer = tracing_subscriber::fmt::layer()
         .json()
+        .with_thread_ids(true)
+        .with_thread_names(true)
         .with_writer(file_writer)
-        .with_span_events(FmtSpan::CLOSE)
+        .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
         .with_filter(file_filter);
 
     let console_layer = tracing_subscriber::fmt::layer()
         .compact()
         .with_writer(console_writer)
-        .with_ansi(true)
+        .with_ansi(false)
         .with_filter(EnvFilter::new(DEFAULT_DIRECTIVES));
 
     let (shutdown_filter, shutdown_handle) =
@@ -83,6 +86,34 @@ pub fn init(log_directory: &Path, override_directives: Option<&str>) -> Result<L
         .with(shutdown_filter)
         .try_init()
         .map_err(|error| anyhow::anyhow!("installing the log writer: {error}"))?;
+
+    let panic_path = log_directory.join("nicegal-panic.log");
+    rotate(&panic_path).context("rotating the previous panic report")?;
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic| {
+        // Write synchronously before the default hook. Even a caught worker panic deserves a
+        // backtrace, and an abort must not strand its only report in the logging queue.
+        let thread = std::thread::current();
+        let report = serde_json::json!({
+            "timestampUnixMs": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis(),
+            "event": "rust-panic",
+            "pid": std::process::id(),
+            "thread": thread.name(),
+            "threadId": format!("{:?}", thread.id()),
+            "message": panic.to_string(),
+            "backtrace": std::backtrace::Backtrace::force_capture().to_string(),
+        });
+        if let Ok(mut file) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&panic_path)
+        {
+            let _ = writeln!(file, "{report}");
+            let _ = file.sync_data();
+        }
+        previous(panic);
+    }));
 
     Ok(LoggingGuards {
         shutdown: Box::new(move || {
