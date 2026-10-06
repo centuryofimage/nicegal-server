@@ -26,7 +26,12 @@ fn resolve(
     for ancestor in path.ancestors() {
         // This is a Linux path even when portable resolver tests run on Windows.
         if let Some(host) = read(ancestor).filter(|host| host.as_str().starts_with('/')) {
-            return Some(host.join(path.strip_prefix(ancestor).ok()?));
+            let suffix = path.strip_prefix(ancestor).ok()?;
+            return Some(if suffix.as_str().is_empty() {
+                host
+            } else {
+                host.join(suffix)
+            });
         }
     }
     None
