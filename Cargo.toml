@@ -39,7 +39,7 @@ itertools = "0.15.0"
 libc = "0.2"
 memmap2 = "0.9.11"
 kdam = { version = "0.6.4", features = ["rayon"] }
-mozjpeg = "0.10.13"
+turbojpeg = { version = "1.5.1", default-features = false, features = ["cmake", "require-simd"] }
 ndarray = { version = "0.17.2", default-features = false }
 nom-exif = "3.7.0"
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "tracing", "load-dynamic", "api-23"] }

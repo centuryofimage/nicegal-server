@@ -304,9 +304,9 @@ impl ImageEmbeddingModel {
         Self::MetaClip2B16,
         Self::SigLip2Base256,
         Self::MetaClip2L14,
+        Self::PeCoreL14,
         Self::SigLipBetaSwinV2Frozen,
         Self::DinoV3B16,
-        Self::PeCoreL14,
         Self::PeCoreB16,
     ];
 

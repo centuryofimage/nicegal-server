@@ -86,6 +86,10 @@ class LicenseGenerationTests(unittest.TestCase):
             ffmpeg = root / "third-party-notices" / "ffmpeg-9.0.1"
             ffmpeg.mkdir(parents=True)
             (ffmpeg / "LICENSE").write_text("FFmpeg notice", encoding="utf-8")
+            jpeg = root / "third-party-notices" / "libjpeg-turbo-3.2.0"
+            jpeg.mkdir(parents=True)
+            (jpeg / "LICENSE.md").write_text("libjpeg-turbo notice", encoding="utf-8")
+            (jpeg / "README.ijg").write_text("IJG notice", encoding="utf-8")
             with patch.object(collector, "ROOT", root):
                 packages = collector.runtime_packages()
             runtime = next(package for package in packages if package["name"] == "onnxruntime")
@@ -94,6 +98,10 @@ class LicenseGenerationTests(unittest.TestCase):
             self.assertTrue(runtime["url"].startswith("https://"))
             ffmpeg_entry = next(package for package in packages if package["name"] == "FFmpeg")
             self.assertEqual(ffmpeg_entry["notices"][0]["text"], "FFmpeg notice")
+            jpeg_entry = next(package for package in packages if package["name"] == "libjpeg-turbo")
+            self.assertEqual(
+                {notice["file"] for notice in jpeg_entry["notices"]}, {"LICENSE.md", "README.ijg"}
+            )
 
 
 if __name__ == "__main__":
