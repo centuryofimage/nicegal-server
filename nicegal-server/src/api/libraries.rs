@@ -326,12 +326,11 @@ fn resolve_folders(
             // The chooser may return a document-portal path even for a folder that the
             // Flatpak can already read directly (for example, Pictures). Use the host
             // spelling only when it is actually accessible inside this sandbox.
-            if path.as_str().starts_with("/run/flatpak/doc/") {
-                if let Some(host) = nicegal_core::portal_paths::host_path(&path) {
-                    if std::fs::metadata(&host).is_ok_and(|metadata| metadata.is_dir()) {
-                        return roots::resolve_root("library folder", &host);
-                    }
-                }
+            if path.as_str().starts_with("/run/flatpak/doc/")
+                && let Some(host) = nicegal_core::portal_paths::host_path(&path)
+                && std::fs::metadata(&host).is_ok_and(|metadata| metadata.is_dir())
+            {
+                return roots::resolve_root("library folder", &host);
             }
             roots::resolve_root("library folder", &path)
         })
