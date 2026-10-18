@@ -86,7 +86,7 @@ class LicenseGenerationTests(unittest.TestCase):
             ffmpeg = root / "third-party-notices" / "ffmpeg-9.0.1"
             ffmpeg.mkdir(parents=True)
             (ffmpeg / "LICENSE").write_text("FFmpeg notice", encoding="utf-8")
-            jpeg = root / "third-party-notices" / "libjpeg-turbo-3.2.0"
+            jpeg = root / "third-party-notices" / "libjpeg-turbo-3.1.0"
             jpeg.mkdir(parents=True)
             (jpeg / "LICENSE.md").write_text("libjpeg-turbo notice", encoding="utf-8")
             (jpeg / "README.ijg").write_text("IJG notice", encoding="utf-8")

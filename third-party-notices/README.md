@@ -13,10 +13,8 @@ packages on September 13, 2026, matching the pinned requirements:
   `ThirdPartyNotices.txt` from the native WebGPU test environment.
 - `onnxruntime-ep-webgpu-0.3.0`: `LICENSE` and `ThirdPartyNotices.txt` from
   the Linux plugin wheel's `.dist-info/licenses` directory.
-- `libjpeg-turbo-3.2.0`: `LICENSE.md` (the vcpkg port's `share/libjpeg-turbo/copyright`) and
-  `README.ijg` (the IJG README, from the `turbojpeg-sys` crate's bundled 3.1.0 source).
-  Windows links the vcpkg 3.2.0 static library; macOS and Linux build the 3.1.0 source
-  bundled in `turbojpeg-sys`; both are covered by the IJG and BSD licenses reproduced here.
+- `libjpeg-turbo-3.1.0`: `LICENSE.md` and `README.ijg` from the libjpeg-turbo 3.1.0 source
+  that `turbojpeg-sys` builds on every platform (`vendor/turbojpeg/turbojpeg-sys/libjpeg-turbo`).
 
 The collector reads these snapshots so building the notices document does not need
 runtime installations. On runtime upgrades, copy the corresponding upstream text

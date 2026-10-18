@@ -101,8 +101,7 @@ impl RuntimeOptions {
 /// DirectML sessions in one process share ONNX Runtime's command recorder and queue, and the
 /// recorder is not thread-safe: two sessions building or running at once can corrupt the D3D12
 /// driver's state and crash the process. The GPU work goes through that one queue in order anyway,
-/// so holding this lock loses no device concurrency. parking_lot hands a contended lock to its
-/// waiter, so a search query is not starved by an indexing loop that relocks after each batch.
+/// so holding this lock loses no device concurrency.
 static DIRECTML_SESSIONS: parking_lot::Mutex<()> = parking_lot::const_mutex(());
 
 /// Run `work`, which builds or runs `execution_provider` sessions, exclusively with every other

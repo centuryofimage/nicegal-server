@@ -5,3 +5,6 @@
 [submodule "vendor/ffmpeg-the-third"]
 	path = vendor/ffmpeg-the-third
 	url = https://github.com/centuryofimage/ffmpeg-the-third.git
+[submodule "vendor/turbojpeg"]
+	path = vendor/turbojpeg
+	url = https://github.com/centuryofimage/rust-turbojpeg.git

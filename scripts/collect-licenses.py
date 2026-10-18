@@ -115,11 +115,11 @@ def runtime_packages() -> list[dict]:
         "notices": collect_notices(ROOT / "third-party-notices" / "ffmpeg-9.0.1"),
     }, {
         "name": "libjpeg-turbo",
-        "version": "3.2.0 (Windows, vcpkg); 3.1.0 built from the turbojpeg-sys crate elsewhere",
+        "version": "3.1.0",
         "license": "IJG AND BSD-3-Clause AND Zlib",
         "url": "https://libjpeg-turbo.org/",
         "notices": collect_notices(
-            ROOT / "third-party-notices" / "libjpeg-turbo-3.2.0", "README.ijg"
+            ROOT / "third-party-notices" / "libjpeg-turbo-3.1.0", "README.ijg"
         ),
     }])
     return packages

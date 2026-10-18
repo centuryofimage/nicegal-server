@@ -10,14 +10,6 @@ if defined NICEGAL_FFMPEG_DIR (
     set "FFMPEG_DIR=%USERPROFILE%\vcpkg\packages\ffmpeg_%VCPKGRS_TRIPLET%"
 )
 REM if not defined RUSTFLAGS set "RUSTFLAGS=-C target-feature=+crt-static"
-REM turbojpeg-sys must link a static libjpeg-turbo built with the dynamic CRT; its bundled CMake
-REM build uses the static CRT and clashes with the rest of the process (LNK4098). Use the vcpkg
-REM package: vcpkg install libjpeg-turbo:%VCPKGRS_TRIPLET%
-if not defined TURBOJPEG_SOURCE if exist "%USERPROFILE%\vcpkg\installed\%VCPKGRS_TRIPLET%\lib\turbojpeg.lib" (
-    set "TURBOJPEG_SOURCE=explicit"
-    set "TURBOJPEG_LIB_DIR=%USERPROFILE%\vcpkg\installed\%VCPKGRS_TRIPLET%\lib"
-    set "TURBOJPEG_INCLUDE_DIR=%USERPROFILE%\vcpkg\installed\%VCPKGRS_TRIPLET%\include"
-)
 REM build.rs reads the provider venvs by default (see build-server.cmd). Set
 REM NICEGAL_DIRECTML_ORT_LIB_PATH, NICEGAL_OPENVINO_ORT_LIB_PATH,
 REM NICEGAL_OPENVINO_LIB_PATH, NICEGAL_CUDA_ORT_LIB_PATH, or
