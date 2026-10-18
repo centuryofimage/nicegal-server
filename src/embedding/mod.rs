@@ -13,7 +13,7 @@ use crate::runtime::{ExecutionProvider, RuntimeOptions};
 use fastembed::{FastEmbedBackend, ocr_model_to_fastembed};
 pub use image::{
     ImageEmbedder, ImageEmbedderOptions, ImageEmbeddingModel, ImageQueryEmbedder,
-    ImageQueryEmbedderOptions,
+    ImageQueryEmbedderOptions, PreparedImage,
 };
 pub use model::{ParseTextEmbeddingModelError, TextEmbeddingModel};
 pub use patches::PatchFeatures;
@@ -198,10 +198,10 @@ impl TextEmbedder {
     }
 
     fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        let vectors = self
-            .backend
-            .embed(texts, self.max_batch_size)
-            .with_context(|| format!("running the {} embedding model", self.model))?;
+        let vectors = crate::runtime::exclusive_session_work(self.execution_provider, || {
+            self.backend.embed(texts, self.max_batch_size)
+        })
+        .with_context(|| format!("running the {} embedding model", self.model))?;
         if vectors.len() != texts.len() {
             bail!(
                 "{} returned {} vectors for {} inputs",

@@ -97,6 +97,8 @@ fn main() -> Result<()> {
         if let Some(directory) = std::env::var_os("NICEGAL_VALIDATION_PIXELS_DIR") {
             fs::create_dir_all(&directory)?;
             let bytes: Vec<u8> = pixels
+                .pixels()
+                .context("model has no pixel tensor")?
                 .iter()
                 .flat_map(|value| value.to_le_bytes())
                 .collect();

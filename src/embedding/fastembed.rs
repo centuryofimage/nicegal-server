@@ -2,7 +2,10 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
-use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
+use fastembed::{
+    EmbeddingGemma2, EmbeddingGemma2InitOptionsUserDefined, EmbeddingGemma2Sessions,
+    EmbeddingModel, TextEmbedding, TextInitOptions,
+};
 
 use super::image::ImageEmbeddingModel;
 use super::model::TextEmbeddingModel;
@@ -10,7 +13,21 @@ use crate::runtime::{self, ExecutionProvider, RuntimeOptions};
 
 /// FastEmbed's mutable ONNX session, protected for sharing by the facade.
 pub(super) struct FastEmbedBackend {
-    inner: Mutex<TextEmbedding>,
+    inner: Inner,
+}
+
+enum Inner {
+    Text(Box<Mutex<TextEmbedding>>),
+    /// EmbeddingGemma 2's text backbone alone, without its encoders.
+    Gemma(Box<Mutex<EmbeddingGemma2>>),
+}
+
+impl FastEmbedBackend {
+    fn text(backend: TextEmbedding) -> Self {
+        Self {
+            inner: Inner::Text(Box::new(Mutex::new(backend))),
+        }
+    }
 }
 
 impl FastEmbedBackend {
@@ -66,13 +83,7 @@ impl FastEmbedBackend {
         let Some(backend) = backend else {
             return Ok(None);
         };
-        Ok(Some((
-            Self {
-                inner: Mutex::new(backend),
-            },
-            cache_dir,
-            execution_provider,
-        )))
+        Ok(Some((Self::text(backend), cache_dir, execution_provider)))
     }
 
     #[tracing::instrument(level = "debug", skip_all, fields(model = %model, cached_only))]
@@ -111,13 +122,7 @@ impl FastEmbedBackend {
             TextEmbedding::try_new_from_path(path.join("text.onnx"), files, init)
                 .context("loading local paired text ONNX encoder")
         })?;
-        Ok(Some((
-            Self {
-                inner: Mutex::new(backend),
-            },
-            path,
-            provider,
-        )))
+        Ok(Some((Self::text(backend), path, provider)))
     }
 
     pub(super) fn load_deepghs_image_query(
@@ -146,22 +151,64 @@ impl FastEmbedBackend {
             .context("loading DeepGHS paired text ONNX encoder")
         })?;
         Ok(Some((
-            Self {
-                inner: Mutex::new(backend),
-            },
+            Self::text(backend),
             crate::hub::cache_dir(),
             provider,
         )))
     }
 
+    /// The EmbeddingGemma 2 text backbone, for queries in its image space.
+    pub(super) fn load_embedding_gemma2_image_query(
+        model: ImageEmbeddingModel,
+        options: RuntimeOptions,
+        cached_only: bool,
+        progress: &dyn crate::hub::DownloadObserver,
+    ) -> Result<Option<(Self, PathBuf, ExecutionProvider)>> {
+        let Some(directory) = model.embedding_gemma2_directory(cached_only, progress)? else {
+            return Ok(None);
+        };
+        let tokenizer = std::fs::read(directory.join("tokenizer.json"))
+            .context("reading the EmbeddingGemma 2 tokenizer")?;
+        let (backend, provider) = runtime::with_fallback(options, |provider| {
+            let configured = runtime::configure_provider(provider, options.intra_threads)?;
+            let init = EmbeddingGemma2InitOptionsUserDefined::new()
+                .with_execution_providers(vec![configured.dispatch])
+                .with_intra_threads(configured.intra_threads.get());
+            let text = EmbeddingGemma2::session_builder(&init)?
+                .commit_from_file(super::image::embedding_gemma2_graph(
+                    &directory, "model", provider,
+                ))
+                .context("loading the EmbeddingGemma 2 text backbone")?;
+            EmbeddingGemma2::try_new_from_sessions(
+                EmbeddingGemma2Sessions::new(text),
+                &tokenizer,
+                init.settings,
+            )
+            .context("preparing EmbeddingGemma 2")
+        })?;
+        Ok(Some((
+            Self {
+                inner: Inner::Gemma(Box::new(Mutex::new(backend))),
+            },
+            directory,
+            provider,
+        )))
+    }
+
     pub(super) fn embed(&self, texts: &[&str], max_batch_size: usize) -> Result<Vec<Vec<f32>>> {
-        let mut backend = self
-            .inner
-            .lock()
-            .map_err(|_| anyhow::anyhow!("embedding model lock was poisoned"))?;
-        backend
-            .embed(texts, Some(max_batch_size))
-            .context("running FastEmbed inference")
+        let poisoned = || anyhow::anyhow!("embedding model lock was poisoned");
+        match &self.inner {
+            Inner::Text(backend) => backend
+                .lock()
+                .map_err(|_| poisoned())?
+                .embed(texts, Some(max_batch_size))
+                .context("running FastEmbed inference"),
+            Inner::Gemma(backend) => backend
+                .lock()
+                .map_err(|_| poisoned())?
+                .embed_text(texts, Some(max_batch_size))
+                .context("running EmbeddingGemma 2 inference"),
+        }
     }
 }
 

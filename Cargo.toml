@@ -14,6 +14,9 @@ categories = ["multimedia::images"]
 default = ["regex"]
 regex = ["dep:regex"]
 logging = ["dep:tracing-subscriber", "dep:tracing-appender"]
+# Mirror tracing spans as NVTX ranges for Nsight Systems. The calls are no-ops unless a profiler
+# injects its NVTX library, so builds without NVIDIA tooling are unaffected.
+nvtx = ["logging", "dep:nvtx"]
 ort-openvino = ["ort/openvino"]
 ort-webgpu = ["ort/webgpu", "fastembed/webgpu"]
 ort-profiling = ["ort/api-25", "fastembed/ort-profiling"]
@@ -42,7 +45,9 @@ kdam = { version = "0.6.4", features = ["rayon"] }
 turbojpeg = { version = "1.5.1", default-features = false, features = ["cmake", "require-simd"] }
 ndarray = { version = "0.17.2", default-features = false }
 nom-exif = "3.7.0"
+nvtx = { version = "2.0.0", default-features = false, features = ["tracing"], optional = true }
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "tracing", "load-dynamic", "api-23"] }
+parking_lot = "0.12.4"
 png = "0.18.1"
 rayon = "1.12.0"
 regex = { version = "1.13.1", optional = true }

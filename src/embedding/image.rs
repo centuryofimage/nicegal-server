@@ -2,7 +2,11 @@ use std::fmt;
 use std::sync::Mutex;
 
 use anyhow::{Context, Result, bail};
-use fastembed::{ImageEmbedding, ImagePreprocessor};
+use fastembed::{
+    EmbeddingGemma2, EmbeddingGemma2InitOptionsUserDefined, EmbeddingGemma2Preprocessor,
+    EmbeddingGemma2Sessions, EmbeddingGemma2Settings, ImageEmbedding, ImagePreprocessor,
+    VisionTokenBudget,
+};
 use image::{DynamicImage, RgbImage};
 use ndarray::Array3;
 use rayon::prelude::*;
@@ -29,6 +33,8 @@ pub enum ImageEmbeddingModel {
     DinoV3B16,
     PeCoreL14,
     PeCoreB16,
+    EmbeddingGemma2T70,
+    EmbeddingGemma2T140,
 }
 
 struct ModelSpec {
@@ -56,6 +62,9 @@ enum Source {
     Export(Export),
     /// One checkpoint folder in DeepGHS's shared, pinned `siglip_beta` repository.
     DeepGhs(&'static str),
+    /// The pinned EmbeddingGemma 2 export, in the onnx-community layout, at one image token
+    /// budget.
+    EmbeddingGemma2(VisionTokenBudget),
 }
 
 #[derive(Clone, Copy)]
@@ -84,6 +93,8 @@ const PAIRED_EXPORT: Export = Export {
 };
 
 const DEEPGHS_REPO: &str = "deepghs/siglip_beta";
+const EMBEDDING_GEMMA2_REPO: &str = "bep256/embeddinggemma-2-ONNX";
+const EMBEDDING_GEMMA2_REVISION: &str = "da7a7f4d5f54842650f32a8a8fda84c8911433b5";
 const DEEPGHS_REVISION: &str = "03aa79c8a4a6c41e06ca87aa6e44fee563b2491d";
 const EXTERNAL_WEIGHTS: &str = "external-weights-v1";
 const PREBUILT_PATCH_GRAPH: &str = "image_patched.onnx";
@@ -115,6 +126,45 @@ const IMAGE_ONLY_MODEL_FILES: &[&str] = &[
     "manifest.json",
     "preprocessor_config.json",
 ];
+/// The EmbeddingGemma 2 files the image and query embedders read, including the DirectML graph
+/// copies from model-exports' `patch_embeddinggemma2_dml.py`.
+const EMBEDDING_GEMMA2_FILES: &[&str] = &[
+    "tokenizer.json",
+    "onnx/model.onnx",
+    "onnx/model.dml.onnx",
+    "onnx/model.onnx_data",
+    "onnx/vision_encoder.onnx",
+    "onnx/vision_encoder.dml.onnx",
+    "onnx/vision_encoder.onnx_data",
+];
+
+/// Model ID to export directory, from the JSON file `NICEGAL_LOCAL_MODELS` names. Entries take
+/// precedence over `NICEGAL_LOCAL_MODELS_DIR`. Read once per process.
+fn local_model_overrides() -> &'static std::collections::HashMap<String, std::path::PathBuf> {
+    static OVERRIDES: std::sync::LazyLock<std::collections::HashMap<String, std::path::PathBuf>> =
+        std::sync::LazyLock::new(|| {
+            let Some(path) = std::env::var_os("NICEGAL_LOCAL_MODELS") else {
+                return Default::default();
+            };
+            let parsed = std::fs::read(&path)
+                .context("reading the local model list")
+                .and_then(|bytes| {
+                    serde_json::from_slice(&bytes).context("parsing the local model list")
+                });
+            match parsed {
+                Ok(overrides) => overrides,
+                Err(error) => {
+                    warn!(
+                        path = %std::path::Path::new(&path).display(),
+                        error = format!("{error:#}"),
+                        "ignoring NICEGAL_LOCAL_MODELS"
+                    );
+                    Default::default()
+                }
+            }
+        });
+    &OVERRIDES
+}
 
 /// The `manifest.json` fields an export is checked against. Other fields are ignored.
 #[derive(serde::Deserialize)]
@@ -286,6 +336,37 @@ impl ImageEmbeddingModel {
                 fixed_batch: Some(8),
                 published_tags: true,
             },
+            Self::EmbeddingGemma2T70 => Self::embedding_gemma2_spec(
+                "google/embeddinggemma-2@70",
+                "EmbeddingGemma 2 70 tokens (experimental)",
+                VisionTokenBudget::T70,
+            ),
+            Self::EmbeddingGemma2T140 => Self::embedding_gemma2_spec(
+                "google/embeddinggemma-2@140",
+                "EmbeddingGemma 2 140 tokens (experimental)",
+                VisionTokenBudget::T140,
+            ),
+        }
+    }
+
+    /// Each image token budget is its own embedding space, so each is its own model.
+    const fn embedding_gemma2_spec(
+        id: &'static str,
+        name: &'static str,
+        budget: VisionTokenBudget,
+    ) -> ModelSpec {
+        ModelSpec {
+            id,
+            name,
+            dimensions: 768,
+            license: "Apache-2.0",
+            context_length: 8192,
+            lowercase_text: false,
+            source: Source::EmbeddingGemma2(budget),
+            embedding_output: "sentence_embedding",
+            patch_method: None,
+            fixed_batch: Some(8),
+            published_tags: false,
         }
     }
 
@@ -299,15 +380,17 @@ impl ImageEmbeddingModel {
         self.spec().dimensions
     }
 
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 10] = [
         Self::MetaClip2B32,
         Self::MetaClip2B16,
         Self::SigLip2Base256,
         Self::MetaClip2L14,
+        Self::EmbeddingGemma2T70,
         Self::PeCoreL14,
         Self::SigLipBetaSwinV2Frozen,
         Self::DinoV3B16,
         Self::PeCoreB16,
+        Self::EmbeddingGemma2T140,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -327,12 +410,30 @@ impl ImageEmbeddingModel {
 
     /// The text a paired query encoder tokenizes for `text`. SigLIP2 was trained on lowercased
     /// text and its published `tokenizer.json` does not lowercase, so its queries are lowercased
-    /// here. Other models see the text unchanged.
+    /// here. EmbeddingGemma 2 queries take its search task prefix. Other models see the text
+    /// unchanged.
     pub(super) fn prepare_query_text(self, text: &str) -> std::borrow::Cow<'_, str> {
-        if self.spec().lowercase_text {
+        if self.is_embedding_gemma2() {
+            std::borrow::Cow::Owned(format!(
+                "{}{text}",
+                fastembed::EMBEDDING_GEMMA2_QUERY_PROMPT
+            ))
+        } else if self.spec().lowercase_text {
             std::borrow::Cow::Owned(text.to_lowercase())
         } else {
             std::borrow::Cow::Borrowed(text)
+        }
+    }
+
+    /// EmbeddingGemma 2 runs a vision encoder and a text backbone instead of one image graph.
+    pub const fn is_embedding_gemma2(self) -> bool {
+        matches!(self.spec().source, Source::EmbeddingGemma2(_))
+    }
+
+    const fn embedding_gemma2_budget(self) -> Option<VisionTokenBudget> {
+        match self.spec().source {
+            Source::EmbeddingGemma2(budget) => Some(budget),
+            _ => None,
         }
     }
 
@@ -370,6 +471,7 @@ impl ImageEmbeddingModel {
                 format!("https://huggingface.co/{DEEPGHS_REPO}/tree/main/{folder}")
             }
             Source::Export(_) => format!("https://huggingface.co/{}", self.id()),
+            Source::EmbeddingGemma2(_) => "https://huggingface.co/google/embeddinggemma-2".into(),
         }
     }
 
@@ -420,7 +522,7 @@ impl ImageEmbeddingModel {
     const fn export(self) -> Option<Export> {
         match self.spec().source {
             Source::Export(export) => Some(export),
-            Source::DeepGhs(_) => None,
+            Source::DeepGhs(_) | Source::EmbeddingGemma2(_) => None,
         }
     }
 
@@ -441,19 +543,75 @@ impl ImageEmbeddingModel {
         ))
     }
 
-    /// Local export override for development and validation.
+    /// Local export override for development and validation: an entry in the
+    /// `NICEGAL_LOCAL_MODELS` list, otherwise the model's slug under `NICEGAL_LOCAL_MODELS_DIR`.
     pub fn local_directory(self) -> Option<std::path::PathBuf> {
-        self.export()?;
+        if self.is_deepghs() {
+            return None;
+        }
+        if let Some(path) = local_model_overrides().get(self.id()) {
+            return Some(path.clone());
+        }
         std::env::var_os("NICEGAL_LOCAL_MODELS_DIR").map(|root| {
             std::path::PathBuf::from(root).join(self.database_file_name().trim_end_matches(".db"))
         })
     }
 
     pub fn available(self) -> bool {
-        match (self.export(), self.local_directory()) {
-            (Some(export), Some(path)) => export.files.iter().all(|file| path.join(file).is_file()),
-            _ => true,
+        let local = self.local_directory();
+        let complete = |files: &[&str]| {
+            local
+                .as_ref()
+                .is_some_and(|path| files.iter().all(|file| path.join(file).is_file()))
+        };
+        match self.spec().source {
+            Source::Export(export) => local.is_none() || complete(export.files),
+            Source::DeepGhs(_) => true,
+            Source::EmbeddingGemma2(_) => local.is_none() || complete(EMBEDDING_GEMMA2_FILES),
         }
+    }
+
+    /// The EmbeddingGemma 2 export: a local override, otherwise the pinned snapshot. Cached-only
+    /// loading never accesses the network.
+    pub(super) fn embedding_gemma2_directory(
+        self,
+        cached_only: bool,
+        progress: &dyn crate::hub::DownloadObserver,
+    ) -> Result<Option<std::path::PathBuf>> {
+        if let Some(path) = self.local_directory() {
+            if self.available() {
+                return Ok(Some(path));
+            }
+            if cached_only {
+                return Ok(None);
+            }
+            bail!("local export is missing EmbeddingGemma 2 files");
+        }
+        let mut root: Option<std::path::PathBuf> = None;
+        for filename in EMBEDDING_GEMMA2_FILES {
+            let source = crate::hub::ModelSource::pinned(
+                EMBEDDING_GEMMA2_REPO,
+                EMBEDDING_GEMMA2_REVISION,
+                filename,
+            );
+            let Some(file) = source.resolve(cached_only, progress)? else {
+                return Ok(None);
+            };
+            // `filename` may sit in a subfolder; its snapshot root is the same for every file.
+            let snapshot = file
+                .ancestors()
+                .nth(std::path::Path::new(filename).components().count())
+                .context("model cache file has no snapshot directory")?;
+            match &root {
+                Some(current) if current != snapshot => {
+                    bail!("model files for {self} were cached in different directories")
+                }
+                Some(_) => {}
+                None => root = Some(snapshot.to_path_buf()),
+            }
+        }
+        let root = root.context("model has no required files")?;
+        local_external_weights_directory(&root, EMBEDDING_GEMMA2_FILES).map(Some)
     }
 
     /// Resolve one complete pinned snapshot. Cached-only loading never accesses the network.
@@ -581,6 +739,21 @@ impl ImageEmbeddingModel {
     }
 }
 
+/// `onnx/{stem}.onnx`, or its patched copy on DirectML, which rejects Reshape `allowzero` and
+/// runs FP32 Gelu on the CPU.
+pub(super) fn embedding_gemma2_graph(
+    directory: &std::path::Path,
+    stem: &str,
+    provider: ExecutionProvider,
+) -> std::path::PathBuf {
+    let variant = if provider == ExecutionProvider::Directml {
+        ".dml"
+    } else {
+        ""
+    };
+    directory.join("onnx").join(format!("{stem}{variant}.onnx"))
+}
+
 /// ONNX Runtime rejects external tensor files that resolve outside the graph directory.
 /// Python's HF cache uses symlinks into `blobs`; keep that shared cache intact and expose
 /// the validated export through hard links instead. This also covers the text encoder.
@@ -616,6 +789,9 @@ fn local_external_weights_directory(
     std::fs::create_dir_all(&directory).context("creating local ONNX model view")?;
     for (name, path) in resolved {
         let target = directory.join(name);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).context("creating local ONNX model view")?;
+        }
         match std::fs::hard_link(&path, &target) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && target.is_file() => {
@@ -665,10 +841,50 @@ impl Default for ImageEmbedderOptions {
     }
 }
 
+/// One image's model input, from [`ImageEmbedder::preprocess_image`].
+#[derive(Debug, Clone)]
+pub struct PreparedImage(Prepared);
+
+impl PreparedImage {
+    /// The normalized pixel tensor of a single-graph model, for comparison with reference
+    /// preprocessing.
+    pub fn pixels(&self) -> Option<&Array3<f32>> {
+        match &self.0 {
+            Prepared::Pixels(pixels) => Some(pixels),
+            Prepared::Gemma(_) => None,
+        }
+    }
+
+    /// The single-graph pixel tensor.
+    fn into_pixels(self) -> Result<Array3<f32>> {
+        match self.0 {
+            Prepared::Pixels(pixels) => Ok(pixels),
+            Prepared::Gemma(_) => bail!("EmbeddingGemma 2 input has no pixel tensor"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum Prepared {
+    Pixels(Array3<f32>),
+    Gemma(fastembed::EmbeddingGemma2Image),
+}
+
+enum Backend {
+    Image(Mutex<ImageEmbedding>),
+    Gemma(Box<Mutex<EmbeddingGemma2>>),
+}
+
+#[derive(Clone)]
+enum Preprocessor {
+    Image(ImagePreprocessor),
+    Gemma(EmbeddingGemma2Preprocessor),
+}
+
 /// A loaded image embedding model.
 pub struct ImageEmbedder {
-    backend: Mutex<ImageEmbedding>,
-    preprocessor: ImagePreprocessor,
+    backend: Backend,
+    preprocessor: Preprocessor,
     model: ImageEmbeddingModel,
     max_batch_size: usize,
     /// Whether the session only accepts full batches of `max_batch_size`.
@@ -852,8 +1068,11 @@ impl ImageEmbedder {
         if options.max_batch_size == 0 {
             bail!("image embedding batch size must be greater than zero");
         }
-        let cache_dir = crate::hub::cache_dir();
         let model = options.model;
+        if let Some(budget) = model.embedding_gemma2_budget() {
+            return Self::load_embedding_gemma2(options, budget, cached_only, progress);
+        }
+        let cache_dir = crate::hub::cache_dir();
         // Resolve and validate files once; only session construction belongs in provider retries.
         let (image, preprocessor_config, prebuilt_patch_graph) = if model.is_deepghs() {
             let Some((image, config)) = model.deepghs_image_files(cached_only, progress)? else {
@@ -940,8 +1159,8 @@ impl ImageEmbedder {
                     .map_err(|error| fastembed::Error::ImageTransform(format!("{error:#}")))
             });
         let embedder = Self {
-            backend: Mutex::new(backend),
-            preprocessor,
+            backend: Backend::Image(Mutex::new(backend)),
+            preprocessor: Preprocessor::Image(preprocessor),
             model: options.model,
             max_batch_size: fixed_batch(execution_provider).unwrap_or(options.max_batch_size),
             fixed_batch: fixed_batch(execution_provider).is_some(),
@@ -963,6 +1182,94 @@ impl ImageEmbedder {
         Ok(Some(embedder))
     }
 
+    /// The EmbeddingGemma 2 vision encoder and text backbone. DirectML uses the patched
+    /// `*.dml.onnx` graphs and a fixed vision batch.
+    fn load_embedding_gemma2(
+        options: &ImageEmbedderOptions,
+        budget: VisionTokenBudget,
+        cached_only: bool,
+        progress: &dyn crate::hub::DownloadObserver,
+    ) -> Result<Option<Self>> {
+        let model = options.model;
+        let Some(directory) = model.embedding_gemma2_directory(cached_only, progress)? else {
+            return Ok(None);
+        };
+        let tokenizer = std::fs::read(directory.join("tokenizer.json"))
+            .context("reading the EmbeddingGemma 2 tokenizer")?;
+        let settings = EmbeddingGemma2Settings::new().with_image_budget(budget);
+        let fixed_batch = |provider| {
+            model
+                .fixed_batch()
+                .filter(|_| provider == ExecutionProvider::Directml)
+                .map(|batch| batch.min(options.max_batch_size))
+        };
+        let load_started = std::time::Instant::now();
+        let (backend, execution_provider) = runtime::with_fallback(options.runtime, |provider| {
+            let configured = runtime::configure_provider(provider, options.runtime.intra_threads)?;
+            let init = EmbeddingGemma2InitOptionsUserDefined::new()
+                .with_execution_providers(vec![configured.dispatch])
+                .with_intra_threads(configured.intra_threads.get())
+                .with_settings(settings);
+            let graph = |stem: &str| embedding_gemma2_graph(&directory, stem, provider);
+            let mut vision = EmbeddingGemma2::session_builder(&init)
+                .context("configuring the EmbeddingGemma 2 vision session")?;
+            if let Some(batch) = fixed_batch(provider) {
+                // The text backbone keeps dynamic dimensions: fixing them miscompiles under
+                // DirectML graph fusion.
+                for (name, size) in [("batch_size", batch), ("num_patches", budget.patches())] {
+                    vision = vision
+                        .with_dimension_override(name, i64::try_from(size)?)
+                        .map_err(|error| anyhow::anyhow!("fixing {name}: {error}"))?;
+                }
+            }
+            let vision = vision
+                .commit_from_file(graph("vision_encoder"))
+                .context("loading the EmbeddingGemma 2 vision encoder")?;
+            let text = EmbeddingGemma2::session_builder(&init)?
+                .commit_from_file(graph("model"))
+                .context("loading the EmbeddingGemma 2 text backbone")?;
+            EmbeddingGemma2::try_new_from_sessions(
+                EmbeddingGemma2Sessions::new(text).with_vision(vision),
+                &tokenizer,
+                settings,
+            )
+            .context("preparing EmbeddingGemma 2")
+        })?;
+        // Pillow filters horizontally into RGB8 before its vertical pass; single-axis passes keep
+        // that intermediate rounding.
+        let preprocessor = backend
+            .preprocessor()
+            .with_resize(|image, width, height, filter| {
+                let image = image.into_rgb8();
+                let source_height = image.height();
+                crate::imaging::resize_rgb(image, width, source_height, filter)
+                    .and_then(|image| crate::imaging::resize_rgb(image, width, height, filter))
+                    .map(DynamicImage::ImageRgb8)
+                    .map_err(|error| fastembed::Error::ImageTransform(format!("{error:#}")))
+            });
+        let embedder = Self {
+            backend: Backend::Gemma(Box::new(Mutex::new(backend))),
+            preprocessor: Preprocessor::Gemma(preprocessor),
+            model,
+            max_batch_size: fixed_batch(execution_provider).unwrap_or(options.max_batch_size),
+            fixed_batch: fixed_batch(execution_provider).is_some(),
+            execution_provider,
+            patch_setup: None,
+            runs: RunLog::new(format!("{model} on {execution_provider}")),
+        };
+        info!(
+            dimensions = embedder.dimensions(),
+            max_batch = embedder.max_batch_size,
+            fixed_batch = embedder.fixed_batch,
+            execution_provider = %embedder.execution_provider,
+            image_tokens = budget.tokens(),
+            load_ms = load_started.elapsed().as_millis() as u64,
+            directory = %directory.display(),
+            "loaded the image embedding model"
+        );
+        Ok(Some(embedder))
+    }
+
     pub fn model(&self) -> ImageEmbeddingModel {
         self.model
     }
@@ -975,6 +1282,16 @@ impl ImageEmbedder {
         self.max_batch_size
     }
 
+    /// The single-graph backend that serves patch features and raw session runs.
+    fn image_backend(&self) -> Result<std::sync::MutexGuard<'_, ImageEmbedding>> {
+        match &self.backend {
+            Backend::Image(backend) => backend
+                .lock()
+                .map_err(|_| anyhow::anyhow!("image embedding model lock was poisoned")),
+            Backend::Gemma(_) => bail!("{} has no single image graph", self.model),
+        }
+    }
+
     pub fn execution_provider(&self) -> ExecutionProvider {
         self.execution_provider
     }
@@ -985,9 +1302,18 @@ impl ImageEmbedder {
         skip_all,
         fields(width = image.width(), height = image.height())
     )]
-    pub fn preprocess_image(&self, image: RgbImage) -> Result<Array3<f32>> {
-        self.preprocessor
-            .preprocess(DynamicImage::ImageRgb8(image))
+    pub fn preprocess_image(&self, image: RgbImage) -> Result<PreparedImage> {
+        let image = DynamicImage::ImageRgb8(image);
+        let prepared = match &self.preprocessor {
+            Preprocessor::Image(preprocessor) => {
+                preprocessor.preprocess(image).map(Prepared::Pixels)
+            }
+            Preprocessor::Gemma(preprocessor) => {
+                preprocessor.preprocess_image(image).map(Prepared::Gemma)
+            }
+        };
+        prepared
+            .map(PreparedImage)
             .context("preprocessing image for FastEmbed")
     }
 
@@ -1003,7 +1329,7 @@ impl ImageEmbedder {
             .context("missing image vector")
     }
 
-    fn preprocess_raster(&self, raster: crate::imaging::Raster) -> Result<Array3<f32>> {
+    fn preprocess_raster(&self, raster: crate::imaging::Raster) -> Result<PreparedImage> {
         let (width, height) = (raster.width(), raster.height());
         // DeepGHS composites transparency onto white, as its training pipeline did.
         let pixels = if self.model.is_deepghs() {
@@ -1134,7 +1460,7 @@ impl ImageEmbedder {
         let expected = rasters.len();
         let mut pixels: Vec<_> = rasters
             .into_par_iter()
-            .map(|raster| self.preprocess_raster(raster))
+            .map(|raster| self.preprocess_raster(raster)?.into_pixels())
             .collect::<Result<_>>()?;
         // Images never attend to each other, so padding repeats of the last one is discarded.
         if self.fixed_batch {
@@ -1148,10 +1474,7 @@ impl ImageEmbedder {
                 .map(|pixels| pixels.view())
                 .collect::<Vec<_>>(),
         )?;
-        let mut backend = self
-            .backend
-            .lock()
-            .map_err(|_| anyhow::anyhow!("image embedding model lock was poisoned"))?;
+        let mut backend = self.image_backend()?;
         let session = backend.session_mut();
         let input = session.inputs()[0].name().to_owned();
         let options = ort::session::RunOptions::new()?.with_outputs(
@@ -1166,9 +1489,10 @@ impl ImageEmbedder {
             submitted,
         };
         let outputs = self.runs.record(shape, || {
-            session
-                .run_with_options(inputs, &options)
-                .context("running image patch inference")
+            runtime::exclusive_session_work(self.execution_provider, || {
+                session.run_with_options(inputs, &options)
+            })
+            .context("running image patch inference")
         })?;
         let (embedding_shape, embedding) = outputs[embedding_output].try_extract_tensor::<f32>()?;
         let (shape, data) = outputs[patches::PATCH_OUTPUT].try_extract_tensor::<f32>()?;
@@ -1217,7 +1541,10 @@ impl ImageEmbedder {
         skip_all,
         fields(batch = images.len())
     )]
-    pub fn embed_preprocessed_images(&self, mut images: Vec<Array3<f32>>) -> Result<Vec<Vec<f32>>> {
+    pub fn embed_preprocessed_images(
+        &self,
+        mut images: Vec<PreparedImage>,
+    ) -> Result<Vec<Vec<f32>>> {
         if images.len() > self.max_batch_size {
             bail!(
                 "image batch of {} exceeds the {} the {} backend accepts",
@@ -1235,20 +1562,44 @@ impl ImageEmbedder {
             images.resize(self.max_batch_size, images[expected - 1].clone());
         }
         let submitted = images.len();
-        let mut backend = self
-            .backend
-            .lock()
-            .map_err(|_| anyhow::anyhow!("image embedding model lock was poisoned"))?;
         let shape = RunShape {
             kind: RunKind::Embedding,
             images: expected,
             submitted,
         };
-        let mut vectors = self.runs.record(shape, || {
-            backend
-                .embed_preprocessed(images)
-                .context("running FastEmbed image inference")
-        })?;
+        let mut vectors = match &self.backend {
+            Backend::Image(_) => {
+                let pixels = images
+                    .into_iter()
+                    .map(PreparedImage::into_pixels)
+                    .collect::<Result<Vec<_>>>()?;
+                let mut backend = self.image_backend()?;
+                self.runs.record(shape, || {
+                    runtime::exclusive_session_work(self.execution_provider, || {
+                        backend.embed_preprocessed(pixels)
+                    })
+                    .context("running FastEmbed image inference")
+                })?
+            }
+            Backend::Gemma(backend) => {
+                let prepared = images
+                    .into_iter()
+                    .map(|image| match image.0 {
+                        Prepared::Gemma(prepared) => Ok(prepared),
+                        Prepared::Pixels(_) => bail!("{} needs EmbeddingGemma 2 input", self.model),
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let mut backend = backend
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("image embedding model lock was poisoned"))?;
+                self.runs.record(shape, || {
+                    runtime::exclusive_session_work(self.execution_provider, || {
+                        backend.embed_preprocessed_images(prepared)
+                    })
+                    .context("running EmbeddingGemma 2 image inference")
+                })?
+            }
+        };
         if vectors.len() != submitted {
             bail!(
                 "{} returned {} vectors for {submitted} submitted images",
@@ -1341,7 +1692,14 @@ impl ImageQueryEmbedder {
                 options.model
             );
         }
-        let loaded = if options.model.is_deepghs() {
+        let loaded = if options.model.is_embedding_gemma2() {
+            FastEmbedBackend::load_embedding_gemma2_image_query(
+                options.model,
+                options.runtime,
+                cached_only,
+                progress,
+            )?
+        } else if options.model.is_deepghs() {
             FastEmbedBackend::load_deepghs_image_query(
                 options.model,
                 options.runtime,
@@ -1399,10 +1757,10 @@ impl ImageQueryEmbedder {
         }
         let text = super::truncate_on_boundary(text, self.max_input_bytes);
         let text = self.model.prepare_query_text(text);
-        let mut vectors = self
-            .backend
-            .embed(&[text.as_ref()], 1)
-            .with_context(|| format!("running the {} image query model", self.model))?;
+        let mut vectors = runtime::exclusive_session_work(self.execution_provider, || {
+            self.backend.embed(&[text.as_ref()], 1)
+        })
+        .with_context(|| format!("running the {} image query model", self.model))?;
         if vectors.len() != 1 {
             bail!(
                 "{} returned {} vectors for one query",
@@ -1541,7 +1899,9 @@ mod tests {
                 match model {
                     ImageEmbeddingModel::MetaClip2L14
                     | ImageEmbeddingModel::SigLip2Base256
-                    | ImageEmbeddingModel::DinoV3B16 => 768,
+                    | ImageEmbeddingModel::DinoV3B16
+                    | ImageEmbeddingModel::EmbeddingGemma2T70
+                    | ImageEmbeddingModel::EmbeddingGemma2T140 => 768,
                     ImageEmbeddingModel::SigLipBetaSwinV2Frozen
                     | ImageEmbeddingModel::PeCoreL14
                     | ImageEmbeddingModel::PeCoreB16 => 1024,
@@ -1550,7 +1910,7 @@ mod tests {
             );
         }
         assert!("../unknown".parse::<ImageEmbeddingModel>().is_err());
-        assert_eq!(ImageEmbeddingModel::ALL.len(), 8);
+        assert_eq!(ImageEmbeddingModel::ALL.len(), 10);
     }
 
     #[test]
@@ -1713,7 +2073,13 @@ mod tests {
         }
 
         let expected = plain
-            .embed_preprocessed(vec![embedder.preprocess_raster(raster.clone()).unwrap()])
+            .embed_preprocessed(vec![
+                embedder
+                    .preprocess_raster(raster.clone())
+                    .unwrap()
+                    .into_pixels()
+                    .unwrap(),
+            ])
             .unwrap()
             .remove(0);
         for actual in [&features.embedding, &embedder.embed_raster(raster).unwrap()] {

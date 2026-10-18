@@ -3,6 +3,8 @@
 //! - A **console** layer on stderr: compact human text filtered by [`DEFAULT_DIRECTIVES`].
 //! - A **file** layer, JSON, in the caller's log directory: filtered by `RUST_LOG` or `--log`,
 //!   with the default directives used when neither is set.
+//! - With the `nvtx` feature, an **NVTX** layer that mirrors the file layer's spans as ranges in
+//!   Nsight Systems.
 //!
 //! Both writers use background I/O. Keep [`LoggingGuards`] alive to flush buffered lines.
 
@@ -55,15 +57,14 @@ pub fn init(log_directory: &Path, override_directives: Option<&str>) -> Result<L
     let (file_writer, file_guard) = tracing_appender::non_blocking(file);
     let (console_writer, console_guard) = tracing_appender::non_blocking(std::io::stderr());
 
-    let file_filter = match (std::env::var("RUST_LOG"), override_directives) {
-        (Ok(directives), _) => {
-            EnvFilter::try_new(directives).context("RUST_LOG is not a valid tracing filter")?
-        }
-        (Err(_), Some(directives)) => {
-            EnvFilter::try_new(directives).context("log level is not a valid tracing filter")?
-        }
-        (Err(_), None) => EnvFilter::new(DEFAULT_DIRECTIVES),
-    };
+    let (file_directives, directives_source) =
+        match (std::env::var("RUST_LOG"), override_directives) {
+            (Ok(directives), _) => (directives, "RUST_LOG"),
+            (Err(_), Some(directives)) => (directives.to_owned(), "log level"),
+            (Err(_), None) => (DEFAULT_DIRECTIVES.to_owned(), "the default log filter"),
+        };
+    let file_filter = EnvFilter::try_new(&file_directives)
+        .with_context(|| format!("{directives_source} is not a valid tracing filter"))?;
     let file_layer = tracing_subscriber::fmt::layer()
         .json()
         .with_thread_ids(true)
@@ -80,9 +81,17 @@ pub fn init(log_directory: &Path, override_directives: Option<&str>) -> Result<L
 
     let (shutdown_filter, shutdown_handle) =
         tracing_subscriber::reload::Layer::new(tracing_subscriber::filter::LevelFilter::TRACE);
+    // NVTX ranges follow the file filter, so `RUST_LOG` picks the spans Nsight shows.
+    #[cfg(feature = "nvtx")]
+    let nvtx_layer =
+        nvtx::tracing::NvtxLayer::default().with_filter(EnvFilter::new(&file_directives));
+    #[cfg(not(feature = "nvtx"))]
+    let nvtx_layer = tracing_subscriber::layer::Identity::new();
+
     tracing_subscriber::registry()
         .with(file_layer)
         .with(console_layer)
+        .with(nvtx_layer)
         .with(shutdown_filter)
         .try_init()
         .map_err(|error| anyhow::anyhow!("installing the log writer: {error}"))?;

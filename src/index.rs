@@ -11,7 +11,7 @@ use camino::{Utf8Path as Path, Utf8PathBuf as PathBuf};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded, select};
 use glob::Pattern;
 use image::RgbImage;
-use tracing::{Span, debug, error, field, info, instrument};
+use tracing::{Span, debug, debug_span, error, field, info, instrument};
 use walkdir::WalkDir;
 
 use crate::assets::{
@@ -1155,29 +1155,39 @@ impl BoundedOcrPipeline<'_> {
             let mut abort_sender = Some(abort_sender);
             let mut workers = Vec::with_capacity(decode_workers + inference_workers);
 
-            for _ in 0..decode_workers {
+            for worker in 0..decode_workers {
                 let decoded = decoded_sender.clone();
                 let outcomes = outcome_sender.clone();
                 let abort = abort_receiver.clone();
                 let sources = &sources;
                 let next = &next;
-                workers.push(scope.spawn(move || {
-                    guard_worker("decode", &outcomes, &abort, || {
-                        decode_assets(sources, next, observer, &decoded, &outcomes, &abort);
-                    });
-                }));
+                workers.push(spawn_named(
+                    scope,
+                    format!("ocr-decode-{worker}"),
+                    move || {
+                        guard_worker("decode", &outcomes, &abort, || {
+                            decode_assets(sources, next, observer, &decoded, &outcomes, &abort);
+                        });
+                    },
+                ));
             }
             drop(decoded_sender);
 
-            for replica in replicas.iter_mut().take(inference_workers) {
+            for (worker, replica) in replicas.iter_mut().take(inference_workers).enumerate() {
                 let decoded = decoded_receiver.clone();
                 let outcomes = outcome_sender.clone();
                 let abort = abort_receiver.clone();
-                workers.push(scope.spawn(move || {
-                    guard_worker("inference", &outcomes, &abort, || {
-                        recognize_assets(replica, options, observer, &decoded, &outcomes, &abort);
-                    });
-                }));
+                workers.push(spawn_named(
+                    scope,
+                    format!("ocr-inference-{worker}"),
+                    move || {
+                        guard_worker("inference", &outcomes, &abort, || {
+                            recognize_assets(
+                                replica, options, observer, &decoded, &outcomes, &abort,
+                            );
+                        });
+                    },
+                ));
             }
             drop(decoded_receiver);
             drop(outcome_sender);
@@ -1302,10 +1312,23 @@ fn guard_worker(
 /// would leave this worker parked while `thread::scope` waits to join it. Racing the abort channel
 /// makes every blocking send cancellable instead.
 pub(crate) fn send_unless_aborted<T>(sender: &Sender<T>, item: T, abort: &Receiver<()>) -> bool {
+    let _span = debug_span!("wait_for_consumer").entered();
     select! {
         send(sender, item) -> sent => sent.is_ok(),
         recv(abort) -> _ => false,
     }
+}
+
+/// Spawn a scoped worker with a thread name, so profilers and debuggers can tell the pools apart.
+pub(crate) fn spawn_named<'scope, T: Send + 'scope>(
+    scope: &'scope std::thread::Scope<'scope, '_>,
+    name: String,
+    work: impl FnOnce() -> T + Send + 'scope,
+) -> std::thread::ScopedJoinHandle<'scope, T> {
+    std::thread::Builder::new()
+        .name(name)
+        .spawn_scoped(scope, work)
+        .expect("spawning a worker thread")
 }
 
 /// Whether the coordinator has dropped its abort sender.
@@ -1324,6 +1347,7 @@ fn recognize_assets(
     abort: &Receiver<()>,
 ) {
     loop {
+        let wait = debug_span!("wait_for_decode").entered();
         let work = select! {
             recv(decoded) -> work => match work {
                 Ok(work) => work,
@@ -1331,6 +1355,7 @@ fn recognize_assets(
             },
             recv(abort) -> _ => break,
         };
+        drop(wait);
         // Keep draining after cancellation so decoders are never left parked on a full queue,
         // but start no further inference.
         if observer.is_cancelled() {

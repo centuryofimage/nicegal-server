@@ -162,9 +162,11 @@ impl PaddleOcrModels {
             recognition,
             config,
             scratch,
+            execution_provider,
             ..
         } = self;
-        PaddleOcrEngine::new(detection, recognition, config, scratch).scan(image, options)
+        PaddleOcrEngine::new(detection, recognition, config, scratch, *execution_provider)
+            .scan(image, options)
     }
 }
 

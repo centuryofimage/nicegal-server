@@ -13,6 +13,8 @@ use ort::value::TensorRef;
 use serde::Deserialize;
 use tracing::{Span, debug, field, instrument};
 
+use crate::runtime::{ExecutionProvider, exclusive_session_work};
+
 const OCR_RESIZE_ALGORITHM: ResizeAlg = ResizeAlg::Convolution(FilterType::Bilinear);
 const DETECTION_TARGET_SIDE: u32 = 736;
 /// Default longest detector input side. Lower values reduce work but may miss small text.
@@ -212,6 +214,7 @@ pub(super) struct PaddleOcrEngine<'a> {
     recognition: &'a mut Session,
     config: &'a PaddleOcrConfig,
     scratch: &'a mut PaddleOcrScratch,
+    execution_provider: ExecutionProvider,
 }
 
 #[derive(Default)]
@@ -226,12 +229,14 @@ impl<'a> PaddleOcrEngine<'a> {
         recognition: &'a mut Session,
         config: &'a PaddleOcrConfig,
         scratch: &'a mut PaddleOcrScratch,
+        execution_provider: ExecutionProvider,
     ) -> Self {
         Self {
             detection,
             recognition,
             config,
             scratch,
+            execution_provider,
         }
     }
 
@@ -320,10 +325,11 @@ impl<'a> PaddleOcrEngine<'a> {
             "PaddleOCR stage timing"
         );
         let inference_started = Instant::now();
-        let outputs = self
-            .detection
-            .run(ort::inputs![input])
-            .context("running PaddleOCR detection model")?;
+        let detection = &mut *self.detection;
+        let outputs = exclusive_session_work(self.execution_provider, || {
+            detection.run(ort::inputs![input])
+        })
+        .context("running PaddleOCR detection model")?;
         debug!(
             stage = "detection_inference",
             elapsed_ms = inference_started.elapsed().as_secs_f64() * 1_000.0,
@@ -423,10 +429,11 @@ impl<'a> PaddleOcrEngine<'a> {
                 "PaddleOCR stage timing"
             );
             let inference_started = Instant::now();
-            let outputs = self
-                .recognition
-                .run(ort::inputs![tensor])
-                .context("running PaddleOCR recognition model")?;
+            let recognition = &mut *self.recognition;
+            let outputs = exclusive_session_work(self.execution_provider, || {
+                recognition.run(ort::inputs![tensor])
+            })
+            .context("running PaddleOCR recognition model")?;
             debug!(
                 stage = "recognition_inference",
                 elapsed_ms = inference_started.elapsed().as_secs_f64() * 1_000.0,

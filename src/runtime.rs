@@ -98,11 +98,33 @@ impl RuntimeOptions {
     }
 }
 
+/// DirectML sessions in one process share ONNX Runtime's command recorder and queue, and the
+/// recorder is not thread-safe: two sessions building or running at once can corrupt the D3D12
+/// driver's state and crash the process. The GPU work goes through that one queue in order anyway,
+/// so holding this lock loses no device concurrency. parking_lot hands a contended lock to its
+/// waiter, so a search query is not starved by an indexing loop that relocks after each batch.
+static DIRECTML_SESSIONS: parking_lot::Mutex<()> = parking_lot::const_mutex(());
+
+/// Run `work`, which builds or runs `execution_provider` sessions, exclusively with every other
+/// DirectML session in the process. Other providers run without the lock. `work` must not call
+/// this again.
+pub(crate) fn exclusive_session_work<T>(
+    execution_provider: ExecutionProvider,
+    work: impl FnOnce() -> T,
+) -> T {
+    let _guard =
+        (execution_provider == ExecutionProvider::Directml).then(|| DIRECTML_SESSIONS.lock());
+    work()
+}
+
 /// Try the requested provider and its allowed fallbacks, returning the provider that succeeded.
+/// Each attempt holds [`exclusive_session_work`] for its provider.
 pub(crate) fn with_fallback<T>(
     options: RuntimeOptions,
     mut attempt: impl FnMut(ExecutionProvider) -> Result<T>,
 ) -> Result<(T, ExecutionProvider)> {
+    let mut attempt =
+        |provider: ExecutionProvider| exclusive_session_work(provider, || attempt(provider));
     let mut requested = options.execution_provider;
     let mut last_error = match attempt(requested) {
         Ok(value) => return Ok((value, requested)),
@@ -579,8 +601,41 @@ fn builder_error<R>(error: ort::Error<R>) -> anyhow::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{ExecutionProvider, RuntimeOptions, fallback_chain};
+    use super::{
+        DIRECTML_SESSIONS, ExecutionProvider, RuntimeOptions, exclusive_session_work,
+        fallback_chain,
+    };
+    use std::sync::mpsc;
+    use std::time::Duration;
     use std::{num::NonZeroUsize, str::FromStr};
+
+    #[test]
+    fn only_directml_session_work_waits_for_other_directml_work() {
+        let held = DIRECTML_SESSIONS.lock();
+        let (sender, receiver) = mpsc::channel();
+        let workers: Vec<_> = [ExecutionProvider::Cpu, ExecutionProvider::Directml]
+            .into_iter()
+            .map(|provider| {
+                let sender = sender.clone();
+                std::thread::spawn(move || {
+                    exclusive_session_work(provider, || sender.send(provider).unwrap());
+                })
+            })
+            .collect();
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(5)),
+            Ok(ExecutionProvider::Cpu)
+        );
+        assert!(receiver.recv_timeout(Duration::from_millis(100)).is_err());
+        drop(held);
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(5)),
+            Ok(ExecutionProvider::Directml)
+        );
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    }
 
     #[test]
     fn providers_use_their_declared_fallback_chains() {

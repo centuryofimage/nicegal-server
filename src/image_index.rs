@@ -23,9 +23,10 @@ use crate::assets::SourceFingerprint;
 use crate::assets::{Asset, AssetCatalog, MediaKind};
 #[cfg(test)]
 use crate::db::SearchFilters;
-use crate::embedding::ImageEmbedder;
+use crate::embedding::{ImageEmbedder, PreparedImage};
 use crate::index::{
     IndexEvent, IndexObserver, IndexPhase, IndexProgressDelta, aborted, send_unless_aborted,
+    spawn_named,
 };
 use crate::scope::PathScope;
 
@@ -293,31 +294,39 @@ impl BoundedImagePipeline<'_> {
             let (outcome_receiver, workers) = {
                 let (outcome_sender, outcome_receiver) = bounded::<DecodeOutcome>(batch_size);
                 let mut workers = Vec::with_capacity(decode_workers);
-                for _ in 0..decode_workers {
+                for worker in 0..decode_workers {
                     let outcomes = outcome_sender.clone();
                     let abort = abort_receiver.clone();
                     let abort_flag = Arc::clone(&abort_flag);
                     let sources = &sources;
                     let next = &next;
-                    workers.push(scope.spawn(move || {
-                        guard_decode_worker(&outcomes, &abort, || {
-                            decode_sources(
-                                sources,
-                                next,
-                                self.embedder,
-                                self.observer,
-                                &outcomes,
-                                &abort,
-                                &abort_flag,
-                            );
-                        });
-                    }));
+                    workers.push(spawn_named(
+                        scope,
+                        format!("image-decode-{worker}"),
+                        move || {
+                            guard_decode_worker(&outcomes, &abort, || {
+                                decode_sources(
+                                    sources,
+                                    next,
+                                    self.embedder,
+                                    self.observer,
+                                    &outcomes,
+                                    &abort,
+                                    &abort_flag,
+                                );
+                            });
+                        },
+                    ));
                 }
                 (outcome_receiver, workers)
             };
             let mut abort_sender = Some(abort_sender);
 
-            while let Ok(outcome) = outcome_receiver.recv() {
+            let wait_for_decode = || {
+                let _span = debug_span!("wait_for_decode").entered();
+                outcome_receiver.recv()
+            };
+            while let Ok(outcome) = wait_for_decode() {
                 if !cancelled && self.observer.is_cancelled() {
                     cancelled = true;
                     pending.clear();
@@ -409,7 +418,7 @@ impl BoundedImagePipeline<'_> {
 
 struct DecodedImage {
     asset: Asset,
-    pixels: Vec<ndarray::Array3<f32>>,
+    pixels: Vec<PreparedImage>,
     sample_timestamps: Vec<i64>,
     encoded_samples: Option<crate::thumbs::EncodedVideoSamples>,
 }
@@ -511,7 +520,9 @@ fn decode_sources(
     fields(path = %path)
 )]
 fn decode_image(path: &Path, white_background: bool) -> Result<RgbImage> {
-    let data = std::fs::read(path).with_context(|| format!("opening image: {path}"))?;
+    let data = debug_span!("read_image_file")
+        .in_scope(|| std::fs::read(path))
+        .with_context(|| format!("opening image: {path}"))?;
     let raster = crate::imaging::decode_accurate(&data)
         .with_context(|| format!("decoding image: {path}"))?;
     let (width, height) = (raster.width(), raster.height());
@@ -531,8 +542,8 @@ enum PreparationError {
 fn prepare_image(
     path: &Path,
     white_background: bool,
-    preprocess: impl FnOnce(RgbImage) -> Result<ndarray::Array3<f32>>,
-) -> Result<ndarray::Array3<f32>, PreparationError> {
+    preprocess: impl FnOnce(RgbImage) -> Result<PreparedImage>,
+) -> Result<PreparedImage, PreparationError> {
     let image = decode_image(path, white_background).map_err(PreparationError::Decode)?;
     // A model-specific transform failure says nothing about whether OCR can decode the file.
     preprocess(image).map_err(PreparationError::Preprocess)
@@ -582,6 +593,7 @@ fn prepare_video(
     })
 }
 
+#[instrument(name = "flush_batch", level = "debug", skip_all, fields(assets = pending.len()))]
 fn flush_batch(
     db: &mut ImageIndexDb,
     thumbnails: Option<&crate::thumbs::ThumbnailService>,
@@ -721,7 +733,7 @@ pub(crate) fn cosine(a: &[f32], b: &[f32]) -> f32 {
 fn embed_sample_batches(
     embedder: &ImageEmbedder,
     observer: &dyn IndexObserver,
-    pixels: Vec<ndarray::Array3<f32>>,
+    pixels: Vec<PreparedImage>,
 ) -> Result<Vec<Vec<f32>>> {
     let mut pixels = pixels.into_iter();
     let mut vectors = Vec::new();
