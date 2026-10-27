@@ -1,56 +1,46 @@
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use nicegal_core::assets::SourceFingerprint;
 use nicegal_core::embedding::PatchFeatures;
 use parking_lot::Mutex;
 
 const BYTE_BUDGET: usize = 256 * 1024 * 1024;
-type Key = (String, i64, Option<i64>, SourceFingerprint);
+type Key = (i64, Option<i64>, SourceFingerprint);
+
+/// Patch features of recently inspected assets, for the process's one image model.
+#[derive(Default)]
+pub(crate) struct PatchCache(Mutex<Cache>);
 
 #[derive(Default)]
 struct Cache {
-    model: String,
     entries: HashMap<Key, (Arc<PatchFeatures>, usize, u64)>,
     bytes: usize,
     tick: u64,
 }
 
 impl Cache {
-    fn select_model(&mut self, model: &str) {
-        if self.model != model {
-            self.model = model.to_owned();
-            self.entries.clear();
-            self.bytes = 0;
-            self.tick = 0;
-        }
-    }
-
     fn get(
         &mut self,
-        model: &str,
         asset_id: i64,
         timestamp_ms: Option<i64>,
         fingerprint: SourceFingerprint,
     ) -> Option<Arc<PatchFeatures>> {
-        self.select_model(model);
         self.tick += 1;
-        let (features, _, used) =
-            self.entries
-                .get_mut(&(model.to_owned(), asset_id, timestamp_ms, fingerprint))?;
+        let (features, _, used) = self
+            .entries
+            .get_mut(&(asset_id, timestamp_ms, fingerprint))?;
         *used = self.tick;
         Some(Arc::clone(features))
     }
 
     fn insert(
         &mut self,
-        model: &str,
         asset_id: i64,
         timestamp_ms: Option<i64>,
         fingerprint: SourceFingerprint,
         features: PatchFeatures,
     ) -> Arc<PatchFeatures> {
-        self.select_model(model);
         self.tick += 1;
         let bytes = (features.patches.len() + features.embedding.len()) * size_of::<f32>();
         let features = Arc::new(features);
@@ -59,13 +49,13 @@ impl Cache {
         }
         // A changed source must not leave an old version occupying the budget.
         self.entries.retain(|key, (_, size, _)| {
-            let keep = key.1 != asset_id || key.3 == fingerprint;
+            let keep = key.0 != asset_id || key.2 == fingerprint;
             if !keep {
                 self.bytes -= *size;
             }
             keep
         });
-        let key = (model.to_owned(), asset_id, timestamp_ms, fingerprint);
+        let key = (asset_id, timestamp_ms, fingerprint);
         if let Some((_, old_size, _)) = self
             .entries
             .insert(key, (Arc::clone(&features), bytes, self.tick))
@@ -78,7 +68,7 @@ impl Cache {
                 .entries
                 .iter()
                 .min_by_key(|(_, (_, _, used))| used)
-                .map(|(key, _)| key.clone())
+                .map(|(key, _)| *key)
                 .expect("nonempty cache");
             if let Some((_, size, _)) = self.entries.remove(&oldest) {
                 self.bytes -= size;
@@ -88,32 +78,27 @@ impl Cache {
     }
 }
 
-static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
-fn cache() -> &'static Mutex<Cache> {
-    CACHE.get_or_init(|| Mutex::new(Cache::default()))
-}
+impl PatchCache {
+    pub(super) fn get(
+        &self,
+        asset_id: i64,
+        timestamp_ms: Option<i64>,
+        fingerprint: SourceFingerprint,
+    ) -> Option<Arc<PatchFeatures>> {
+        self.0.lock().get(asset_id, timestamp_ms, fingerprint)
+    }
 
-pub(super) fn get(
-    model: &str,
-    asset_id: i64,
-    timestamp_ms: Option<i64>,
-    fingerprint: SourceFingerprint,
-) -> Option<Arc<PatchFeatures>> {
-    cache()
-        .lock()
-        .get(model, asset_id, timestamp_ms, fingerprint)
-}
-
-pub(super) fn insert(
-    model: &str,
-    asset_id: i64,
-    timestamp_ms: Option<i64>,
-    fingerprint: SourceFingerprint,
-    features: PatchFeatures,
-) -> Arc<PatchFeatures> {
-    cache()
-        .lock()
-        .insert(model, asset_id, timestamp_ms, fingerprint, features)
+    pub(super) fn insert(
+        &self,
+        asset_id: i64,
+        timestamp_ms: Option<i64>,
+        fingerprint: SourceFingerprint,
+        features: PatchFeatures,
+    ) -> Arc<PatchFeatures> {
+        self.0
+            .lock()
+            .insert(asset_id, timestamp_ms, fingerprint, features)
+    }
 }
 
 #[cfg(test)]
@@ -136,22 +121,10 @@ mod tests {
             region: [0.0, 0.0, 1.0, 1.0],
             method: "test",
         };
-        cache.insert("model", 7, Some(100), fingerprint, features(0.1));
-        cache.insert("model", 7, Some(200), fingerprint, features(0.9));
-        assert_eq!(
-            cache
-                .get("model", 7, Some(100), fingerprint)
-                .unwrap()
-                .patches,
-            [0.1]
-        );
-        assert_eq!(
-            cache
-                .get("model", 7, Some(200), fingerprint)
-                .unwrap()
-                .patches,
-            [0.9]
-        );
-        assert!(cache.get("model", 7, None, fingerprint).is_none());
+        cache.insert(7, Some(100), fingerprint, features(0.1));
+        cache.insert(7, Some(200), fingerprint, features(0.9));
+        assert_eq!(cache.get(7, Some(100), fingerprint).unwrap().patches, [0.1]);
+        assert_eq!(cache.get(7, Some(200), fingerprint).unwrap().patches, [0.9]);
+        assert!(cache.get(7, None, fingerprint).is_none());
     }
 }

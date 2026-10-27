@@ -1,10 +1,4 @@
 [submodule "vendor/fastembed"]
 	path = vendor/fastembed
 	url = https://github.com/centuryofimage/fastembed-rs.git
-	branch = 6.0.0
-[submodule "vendor/ffmpeg-the-third"]
-	path = vendor/ffmpeg-the-third
-	url = https://github.com/centuryofimage/ffmpeg-the-third.git
-[submodule "vendor/turbojpeg"]
-	path = vendor/turbojpeg
-	url = https://github.com/centuryofimage/rust-turbojpeg.git
+	branch = nicegal/7.5.0-integration

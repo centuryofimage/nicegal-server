@@ -18,7 +18,7 @@
 ## Runtime setup
 
 - Default Linux `ort-webgpu` uses ONNX Runtime 1.30.0 and native WebGPU plugin
-  0.3.0, pinned in `requirements-webgpu.txt`. Build with
+  0.4.0, pinned in `requirements-webgpu.txt`. Build with
   `NICEGAL_LINUX_PROVIDERS=webgpu ./build-server.sh`. Only the native shared
   libraries are packaged; Python is a build tool. Startup registers the plugin
   before sessions are created. Both the core and vendored FastEmbed register its
@@ -26,8 +26,8 @@
   WebGPU registration API does not select plugin devices. CPU fallback uses the
   same ORT distribution. These runtime versions do not affect Windows providers.
   PaddleOCR sessions use BASIC graph optimization: ORT 1.30's fused convolution
-  activations fail to initialize with plugin 0.3.0, while separate kernels pass
-  the native parity tests. FastEmbed's embedding sessions retain their existing
+  activations failed to initialize with plugin 0.3.0, while separate kernels pass
+  the native parity tests. Not yet rechecked with plugin 0.4.0. FastEmbed's embedding sessions retain their existing
   optimization level.
 
 - `build-server.cmd` creates the `.venv-directml` and `.venv-openvino` environments when needed

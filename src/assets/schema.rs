@@ -59,7 +59,7 @@ impl AssetCatalog {
         Ok(Self { conn })
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "info", skip(self))]
     pub fn maintain(&self) -> Result<()> {
         maintain(&self.conn).context("maintaining asset catalog")
     }

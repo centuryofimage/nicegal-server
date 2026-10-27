@@ -1,47 +1,27 @@
 use nicegal_core::embedding::ImageEmbeddingModel;
 use serde::Serialize;
-use std::sync::Arc;
 
-use super::RuntimeSettings;
-
-pub(crate) struct ImageModelSettings {
-    active: ImageEmbeddingModel,
-    runtime: Arc<RuntimeSettings>,
-}
-impl ImageModelSettings {
-    pub(crate) fn new(
-        runtime: Arc<RuntimeSettings>,
-        override_model: Option<ImageEmbeddingModel>,
-    ) -> Self {
-        Self {
-            active: override_model.unwrap_or_else(|| runtime.image_model()),
-            runtime,
-        }
-    }
-    pub(crate) fn active(&self) -> ImageEmbeddingModel {
-        self.active
-    }
-    pub(super) fn status(&self) -> ModelStatus {
-        let selected = self.runtime.image_model();
-        ModelStatus {
-            active_model: self.active.id(),
-            selected_model: selected.id(),
-            supports_text_queries: self.active.supports_text_queries(),
-            restart_required: self.active != selected,
-            models: ImageEmbeddingModel::ALL
-                .into_iter()
-                .map(|model| ModelInfo {
-                    id: model.id(),
-                    name: model.name(),
-                    dimensions: model.dimensions(),
-                    license: model.license(),
-                    url: model.source_url(),
-                    available: model.available(),
-                    supports_text_queries: model.supports_text_queries(),
-                    patch_features: model.supports_patch_features(),
-                })
-                .collect(),
-        }
+/// The image model this process embeds with, which is fixed at startup, against the one saved in
+/// settings for the next start.
+pub(super) fn status(active: ImageEmbeddingModel, selected: ImageEmbeddingModel) -> ModelStatus {
+    ModelStatus {
+        active_model: active.id(),
+        selected_model: selected.id(),
+        supports_text_queries: active.supports_text_queries(),
+        restart_required: active != selected,
+        models: ImageEmbeddingModel::ALL
+            .into_iter()
+            .map(|model| ModelInfo {
+                id: model.id(),
+                name: model.name(),
+                dimensions: model.dimensions(),
+                license: model.license(),
+                url: model.source_url(),
+                available: model.available(),
+                supports_text_queries: model.supports_text_queries(),
+                patch_features: model.supports_patch_features(),
+            })
+            .collect(),
     }
 }
 #[derive(Debug, Serialize)]
@@ -69,33 +49,25 @@ struct ModelInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::Result;
-    use camino::Utf8PathBuf as PathBuf;
+
     #[test]
-    fn selection_persists_without_replacing_active_model() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let path = PathBuf::try_from(temp.path().join("runtime.json"))?;
-        let runtime = Arc::new(RuntimeSettings::load(path.clone(), None)?);
-        let settings = ImageModelSettings::new(Arc::clone(&runtime), None);
-        runtime.update(None, Some(ImageEmbeddingModel::SigLip2Base256))?;
-        let status = settings.status();
-        assert_eq!(status.active_model, ImageEmbeddingModel::MetaClip2B32.id());
-        assert!(status.restart_required);
-        let restarted =
-            ImageModelSettings::new(Arc::new(RuntimeSettings::load(path.clone(), None)?), None);
-        assert_eq!(restarted.active(), ImageEmbeddingModel::SigLip2Base256);
-        assert!(!restarted.status().restart_required);
-        let overridden =
-            ImageModelSettings::new(runtime.clone(), Some(ImageEmbeddingModel::MetaClip2B16));
-        assert_eq!(overridden.active(), ImageEmbeddingModel::MetaClip2B16);
+    fn a_different_selection_requires_a_restart() {
+        let unchanged = status(
+            ImageEmbeddingModel::MetaClip2B32,
+            ImageEmbeddingModel::MetaClip2B32,
+        );
+        assert!(!unchanged.restart_required);
+        assert_eq!(unchanged.models.len(), ImageEmbeddingModel::ALL.len());
+
+        let changed = status(
+            ImageEmbeddingModel::MetaClip2B16,
+            ImageEmbeddingModel::SigLip2Base256,
+        );
+        assert!(changed.restart_required);
+        assert_eq!(changed.active_model, ImageEmbeddingModel::MetaClip2B16.id());
         assert_eq!(
-            overridden.status().selected_model,
+            changed.selected_model,
             ImageEmbeddingModel::SigLip2Base256.id()
         );
-        assert_eq!(
-            overridden.status().models.len(),
-            ImageEmbeddingModel::ALL.len()
-        );
-        Ok(())
     }
 }

@@ -14,11 +14,11 @@ use tracing::{error, info};
 use super::cancel_if;
 use super::progress::{refresh_phase_throughput, set_phase};
 use super::routes::wire_job_id;
+use crate::api::model_slot::PrepareObserver;
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(super) enum JobKind {
-    OcrModelLoad,
     ModelPrepare,
     LibraryScan,
     ThumbnailGenerate,
@@ -49,7 +49,6 @@ impl JobStatus {
 #[serde(rename_all = "camelCase")]
 pub(super) enum JobPhase {
     Queued,
-    DownloadingModels,
     LoadingModels,
     Scanning,
     Cataloging,
@@ -78,14 +77,22 @@ pub(super) struct JobProgress {
     pub(super) skipped: usize,
     pub(super) failed: usize,
     pub(super) deleted: usize,
-    pub(super) downloaded_bytes: usize,
-    pub(super) download_total_bytes: usize,
     /// Current file only; absent while loading sessions or using cached files.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) download: Option<ModelDownload>,
+    /// The model whose session is being built; absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) loading_model: Option<LoadingModel>,
     pub(super) models_loaded: usize,
     /// Work per second over the last five seconds, in the unit [`phase_work`] counts.
     pub(super) items_per_second: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct LoadingModel {
+    pub(super) name: &'static str,
+    pub(super) model_id: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -117,6 +124,28 @@ impl DownloadObserver for Job {
 
     fn download_cancelled(&self) -> bool {
         self.cancel_requested.load(Ordering::Acquire)
+    }
+}
+
+/// The `loadingModels` phase covers exactly the time spent building sessions; a model already in
+/// memory never enters it.
+impl PrepareObserver for Job {
+    fn loading_model(&self, name: &'static str, model_id: &'static str) {
+        let mut data = self.data();
+        set_phase(&mut data, JobPhase::LoadingModels);
+        data.progress.loading_model = Some(LoadingModel { name, model_id });
+        let next = data.progress.phase_completed + 1;
+        data.progress.total = Some(data.progress.total.map_or(next, |total| total.max(next)));
+        self.publish(&mut data);
+    }
+
+    fn model_loaded(&self) {
+        let mut data = self.data();
+        data.progress.loading_model = None;
+        data.progress.models_loaded += 1;
+        data.progress.phase_completed += 1;
+        data.phase_work += 1;
+        self.publish(&mut data);
     }
 }
 
@@ -360,48 +389,9 @@ impl Job {
         data.active_asset_paths.clear();
         data.phase = JobPhase::Finished;
         data.progress.download = None;
+        data.progress.loading_model = None;
         self.publish(&mut data);
         info!(progress = ?data.progress, cancelled, "job finished");
-    }
-
-    pub(in crate::api) fn ocr_download_progress(
-        &self,
-        source: &ModelSource,
-        downloaded: usize,
-        total: usize,
-        previous: usize,
-        previous_total: usize,
-    ) {
-        let mut data = self.data();
-        data.progress.downloaded_bytes = data
-            .progress
-            .downloaded_bytes
-            .saturating_sub(previous)
-            .saturating_add(downloaded);
-        data.progress.download_total_bytes = data
-            .progress
-            .download_total_bytes
-            .saturating_sub(previous_total)
-            .saturating_add(total);
-        data.progress.download = Some(ModelDownload {
-            model_id: source.model_id.clone(),
-            filename: source.filename.clone(),
-            downloaded_bytes: downloaded,
-            total_bytes: total,
-        });
-        self.publish(&mut data);
-    }
-
-    pub(in crate::api) fn downloading_models(&self) {
-        let mut data = self.data();
-        set_phase(&mut data, JobPhase::DownloadingModels);
-        self.publish(&mut data);
-    }
-
-    pub(in crate::api) fn model_download_complete(&self) {
-        let mut data = self.data();
-        data.progress.processed += 1;
-        self.publish(&mut data);
     }
 
     pub(in crate::api) fn set_index_stages(&self, stages: IndexStages) {
@@ -481,25 +471,12 @@ impl Job {
         self.publish(&mut data);
     }
 
-    pub(in crate::api) fn preparing_models(&self, count: u64) {
+    /// Announce how many models a job prepares, when it knows in advance, so their loads count
+    /// towards one total.
+    pub(in crate::api) fn expect_models(&self, count: u64) {
         let mut data = self.data();
         set_phase(&mut data, JobPhase::LoadingModels);
         data.progress.total = Some(count);
-        self.publish(&mut data);
-    }
-
-    pub(in crate::api) fn loading_models(&self) {
-        let mut data = self.data();
-        set_phase(&mut data, JobPhase::LoadingModels);
-        data.progress.total = Some(2);
-        self.publish(&mut data);
-    }
-
-    pub(in crate::api) fn models_loaded(&self, count: usize) {
-        let mut data = self.data();
-        data.progress.models_loaded += count;
-        data.progress.phase_completed += count as u64;
-        data.phase_work += count as u64;
         self.publish(&mut data);
     }
 
@@ -507,10 +484,10 @@ impl Job {
         let mut data = self.data();
         refresh_phase_throughput(&mut data);
         data.status = JobStatus::Failed;
-        data.progress.download = None;
         data.active_asset_paths.clear();
         data.phase = JobPhase::Finished;
         data.progress.download = None;
+        data.progress.loading_model = None;
         let message = message.into();
         data.error = Some(message.clone());
         self.publish(&mut data);

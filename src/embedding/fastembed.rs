@@ -8,7 +8,6 @@ use fastembed::{
 };
 
 use super::image::ImageEmbeddingModel;
-use super::model::TextEmbeddingModel;
 use crate::runtime::{self, ExecutionProvider, RuntimeOptions};
 
 /// FastEmbed's mutable ONNX session, protected for sharing by the facade.
@@ -34,48 +33,29 @@ impl FastEmbedBackend {
     /// Load onto `runtime_options.execution_provider`, falling back through
     /// [`runtime::with_fallback`] exactly like the OCR model families so a GPU that cannot
     /// actually compile a session doesn't take embedding down with it.
-    pub(super) fn load_with_cache_policy(
-        model: EmbeddingModel,
-        model_label: &str,
+    pub(super) fn load_bge(
         runtime_options: RuntimeOptions,
         cached_only: bool,
         progress: &dyn crate::hub::DownloadObserver,
     ) -> Result<Option<(Self, PathBuf, ExecutionProvider)>> {
         let cache_dir = crate::hub::cache_dir();
         if !cached_only {
-            let info = TextEmbedding::get_model_info(&model)?;
-            for filename in [
-                info.model_file.as_str(),
-                "tokenizer.json",
-                "config.json",
-                "special_tokens_map.json",
-                "tokenizer_config.json",
-            ]
-            .into_iter()
-            .chain(info.additional_files.iter().map(String::as_str))
-            {
-                crate::hub::ModelSource {
-                    model_id: info.model_code.clone(),
-                    revision: None,
-                    filename: filename.to_owned(),
-                }
-                .get_sync_with_progress(progress)?;
-            }
+            fetch_bge_files(false, progress)?;
         }
         let intra_threads = runtime_options.intra_threads;
         let (backend, execution_provider) = runtime::with_fallback(runtime_options, |provider| {
             let configured = runtime::configure_provider(provider, intra_threads)?;
-            // `EmbeddingModel` is not `Copy` and the fallback chain may build the session more
-            // than once, so each attempt takes its own clone.
-            let init = TextInitOptions::new(model.clone())
+            let init = TextInitOptions::new(BGE)
                 .with_cache_dir(cache_dir.clone())
                 .with_show_download_progress(true)
+                .with_environment(runtime::environment()?)
                 .with_execution_providers(vec![configured.dispatch])
                 .with_intra_threads(configured.intra_threads.get());
             let loaded = TextEmbedding::try_new_cached(init);
             loaded.with_context(|| {
                 format!(
-                    "loading {model_label} from {} on the {provider} execution provider",
+                    "loading {} from {} on the {provider} execution provider",
+                    super::TextEmbedder::MODEL_ID,
                     cache_dir.display()
                 )
             })
@@ -114,6 +94,7 @@ impl FastEmbedBackend {
             };
             let mut init = fastembed::InitOptionsUserDefined::new()
                 .with_max_length(model.context_length())
+                .with_environment(runtime::environment()?)
                 .with_execution_providers(vec![configured.dispatch])
                 .with_intra_threads(configured.intra_threads.get());
             if model.fixed_batch().is_some() {
@@ -131,13 +112,9 @@ impl FastEmbedBackend {
         cached_only: bool,
         progress: &dyn crate::hub::DownloadObserver,
     ) -> Result<Option<(Self, PathBuf, ExecutionProvider)>> {
-        let text = model.deepghs_file("text_encode.onnx", cached_only, progress)?;
-        let tokenizer = model.deepghs_file("tokenizer.json", cached_only, progress)?;
-        let meta = model.deepghs_file("meta.json", cached_only, progress)?;
-        let (Some(text), Some(tokenizer), Some(meta)) = (text, tokenizer, meta) else {
+        let Some((text, tokenizer)) = model.deepghs_query_files(cached_only, progress)? else {
             return Ok(None);
         };
-        model.validate_deepghs_meta(&meta)?;
         let (backend, provider) = runtime::with_fallback(options, |provider| {
             let configured = runtime::configure_provider(provider, options.intra_threads)?;
             TextEmbedding::try_new_from_deepghs_path(
@@ -145,6 +122,7 @@ impl FastEmbedBackend {
                 &tokenizer,
                 fastembed::InitOptionsUserDefined::new()
                     .with_max_length(model.context_length())
+                    .with_environment(runtime::environment()?)
                     .with_execution_providers(vec![configured.dispatch])
                     .with_intra_threads(configured.intra_threads.get()),
             )
@@ -172,6 +150,7 @@ impl FastEmbedBackend {
         let (backend, provider) = runtime::with_fallback(options, |provider| {
             let configured = runtime::configure_provider(provider, options.intra_threads)?;
             let init = EmbeddingGemma2InitOptionsUserDefined::new()
+                .with_environment(runtime::environment()?)
                 .with_execution_providers(vec![configured.dispatch])
                 .with_intra_threads(configured.intra_threads.get());
             let text = EmbeddingGemma2::session_builder(&init)?
@@ -212,11 +191,34 @@ impl FastEmbedBackend {
     }
 }
 
-// Keep the backend's model enum out of the public model catalogs. Every catalog variant must be
-// deliberately mapped here before it can be loaded by FastEmbed.
-/// The OCR engine's catalog: models whose vectors are stored in the OCR database's spaces.
-pub(super) fn ocr_model_to_fastembed(model: TextEmbeddingModel) -> EmbeddingModel {
-    match model {
-        TextEmbeddingModel::BgeSmallEnV15 => EmbeddingModel::BGESmallENV15,
+/// The text model behind [`super::TextEmbedder`].
+const BGE: EmbeddingModel = EmbeddingModel::BGESmallENV15;
+
+/// Resolve every file FastEmbed reads for BGE without building a session: downloading the
+/// missing ones, or with `cached_only` reporting whether all are already cached.
+pub(super) fn fetch_bge_files(
+    cached_only: bool,
+    progress: &dyn crate::hub::DownloadObserver,
+) -> Result<bool> {
+    let info = TextEmbedding::get_model_info(&BGE)?;
+    for filename in [
+        info.model_file.as_str(),
+        "tokenizer.json",
+        "config.json",
+        "special_tokens_map.json",
+        "tokenizer_config.json",
+    ]
+    .into_iter()
+    .chain(info.additional_files.iter().map(String::as_str))
+    {
+        let source = crate::hub::ModelSource {
+            model_id: info.model_code.clone(),
+            revision: None,
+            filename: filename.to_owned(),
+        };
+        if source.resolve(cached_only, progress)?.is_none() {
+            return Ok(false);
+        }
     }
+    Ok(true)
 }

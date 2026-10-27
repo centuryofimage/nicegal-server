@@ -55,7 +55,7 @@ impl SearchCancellation {
         Ok(())
     }
 
-    pub(crate) fn register(&self, conn: &Connection) -> Result<()> {
+    pub(crate) fn register(&self, conn: &mut Connection) -> Result<()> {
         // sqlite3_interrupt is transient: cancellation between statements must also be
         // observed by future statements. Capture just the flag, not the handle collection.
         let cancelled = Arc::clone(&self.cancelled);
@@ -75,9 +75,9 @@ mod tests {
 
     #[test]
     fn cancellation_between_statements_is_not_lost() -> Result<()> {
-        let conn = Connection::open_in_memory()?;
+        let mut conn = Connection::open_in_memory()?;
         let cancel = SearchCancellation::default();
-        cancel.register(&conn)?;
+        cancel.register(&mut conn)?;
         cancel.cancel();
         let error = conn
             .query_row(LONG_QUERY, [], |row| row.get::<_, i64>(0))
@@ -86,15 +86,15 @@ mod tests {
             error.sqlite_error_code(),
             Some(rusqlite::ErrorCode::OperationInterrupted)
         );
-        assert!(cancel.register(&Connection::open_in_memory()?).is_err());
+        assert!(cancel.register(&mut Connection::open_in_memory()?).is_err());
         Ok(())
     }
 
     #[test]
     fn cancellation_interrupts_running_sql_without_affecting_other_readers() -> Result<()> {
         let cancel = SearchCancellation::default();
-        let conn = Connection::open_in_memory()?;
-        cancel.register(&conn)?;
+        let mut conn = Connection::open_in_memory()?;
+        cancel.register(&mut conn)?;
         let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
         // Signal from inside SQLite, then use only InterruptHandle for this test.
         let mut started = Some(started_tx);

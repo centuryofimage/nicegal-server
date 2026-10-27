@@ -101,6 +101,9 @@ pub(super) fn set_phase(data: &mut JobData, next: JobPhase) {
             completed = data.progress.phase_completed,
             active_assets = data.active_asset_paths.len(), "job phase changed");
         data.phase = next;
+        if next != JobPhase::LoadingModels {
+            data.progress.loading_model = None;
+        }
         data.progress.discovered = 0;
         data.progress.total = None;
         data.progress.phase_completed = 0;

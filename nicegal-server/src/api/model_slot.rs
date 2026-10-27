@@ -1,10 +1,7 @@
 //! Shared model lifecycle. Loaders supply models; this module owns reuse,
 //! serialization, cancellation, publication, status, and idle eviction.
-use std::future::{Future, poll_fn};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::pin::pin;
 use std::sync::Arc;
-use std::task::Poll;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -12,13 +9,18 @@ use nicegal_core::hub::DownloadObserver;
 use parking_lot::Mutex;
 use serde::Serialize;
 
-use super::{jobs, model_idle::CachedSession};
+use super::jobs;
+use super::model_idle::{CachedSession, Residency};
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct ModelStatus {
+    /// Whether the model can be used. `ready` survives idle eviction: an evicted model reloads
+    /// from its cached files on its next use.
     pub(super) state: ModelState,
     pub(super) error: Option<String>,
+    /// Whether a session is in memory right now.
+    pub(super) resident: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -31,252 +33,195 @@ pub(super) enum ModelState {
     Unsupported,
 }
 
-struct SlotState<T, K> {
-    session: Option<(K, CachedSession<T>)>,
-    status: ModelStatus,
+/// Receives a preparation's downloads and, only when a session is actually built, its load.
+/// Acquiring a model that is already in memory reports nothing.
+pub(super) trait PrepareObserver: DownloadObserver {
+    /// `name` is the slot's role, such as "Image model"; `model_id` what it loads.
+    fn loading_model(&self, _name: &'static str, _model_id: &'static str) {}
+    fn model_loaded(&self) {}
 }
 
-pub(super) struct ModelSlot<T, K = ()> {
-    state: Mutex<SlotState<T, K>>,
-    preparation: tokio::sync::Mutex<()>,
+impl PrepareObserver for () {}
+
+struct SlotState<T> {
+    session: Option<CachedSession<T>>,
+    state: ModelState,
+    error: Option<String>,
+}
+
+impl<T> SlotState<T> {
+    fn set(&mut self, state: ModelState, error: Option<String>) {
+        self.state = state;
+        self.error = error;
+    }
+
+    /// Where a preparation that published nothing leaves the slot: as usable as before it, but
+    /// not failed, since nothing failed.
+    fn rest(&mut self, previous: ModelState) {
+        let usable = self.session.is_some() || previous == ModelState::Ready;
+        self.set(
+            if usable {
+                ModelState::Ready
+            } else {
+                ModelState::NotLoaded
+            },
+            None,
+        );
+    }
+}
+
+pub(super) struct ModelSlot<T> {
+    state: Mutex<SlotState<T>>,
+    /// Held while a session is built, so concurrent users wait for that build instead of
+    /// starting their own.
+    preparation: Mutex<()>,
     name: &'static str,
+    /// The loaded model's identifier, such as its Hugging Face repository.
+    model_id: &'static str,
+    residency: Residency,
 }
 
-/// Download/file-resolution stages are cancellable. Compilation deliberately has
-/// no post-check: a successful model must be published before cancellation returns.
-#[derive(Clone, Copy)]
-pub(super) struct Preparation<'a> {
-    observer: &'a dyn DownloadObserver,
-}
-
-impl Preparation<'_> {
-    fn check(&self) -> Result<()> {
-        jobs::cancel_if(self.observer.download_cancelled())
-    }
-
-    pub(super) async fn resolve<T>(&self, work: impl Future<Output = Result<T>>) -> Result<T> {
-        self.check()?;
-        let result = work.await?;
-        self.check()?;
-        Ok(result)
-    }
-
-    /// Await preparation to completion; signal cancellation through the observer.
-    /// Dropping/aborting this future detaches the non-interruptible worker and
-    /// discards its result, allowing another preparation to start before it exits.
-    pub(super) async fn compile_blocking<T: Send + 'static>(
-        &self,
-        compile: impl FnOnce() -> Result<T> + Send + 'static,
-    ) -> Result<T> {
-        self.check()?;
-        tokio::task::spawn_blocking(move || catch_loader(compile))
-            .await
-            .context("model loader worker failed")?
-    }
-}
-
-impl<T, K: PartialEq> ModelSlot<T, K> {
-    pub(super) fn new(name: &'static str) -> Self {
+impl<T> ModelSlot<T> {
+    pub(super) fn new(name: &'static str, residency: Residency) -> Self {
         Self {
             state: Mutex::new(SlotState {
                 session: None,
-                status: ModelStatus {
-                    state: ModelState::NotLoaded,
-                    error: None,
-                },
+                state: ModelState::NotLoaded,
+                error: None,
             }),
-            preparation: tokio::sync::Mutex::new(()),
+            preparation: Mutex::new(()),
             name,
+            model_id: name,
+            residency,
         }
+    }
+
+    pub(super) fn identified_by(mut self, model_id: &'static str) -> Self {
+        self.model_id = model_id;
+        self
+    }
+
+    pub(super) fn name(&self) -> &'static str {
+        self.name
     }
 
     pub(super) fn status(&self) -> ModelStatus {
-        self.state.lock().status.clone()
-    }
-
-    pub(super) fn acquire(&self, key: &K) -> Option<Arc<T>> {
-        self.state
-            .lock()
-            .session
-            .as_mut()
-            .and_then(|(loaded_key, session)| (loaded_key == key).then(|| session.acquire()))
-    }
-
-    pub(super) fn snapshot(&self) -> Option<Arc<T>> {
-        self.state
-            .lock()
-            .session
-            .as_mut()
-            .map(|(_, session)| session.acquire())
-    }
-
-    /// Inspect without marking the model used or waiting for inference.
-    pub(super) fn inspect<R>(&self, inspect: impl FnOnce(Option<&T>) -> R) -> R {
         let state = self.state.lock();
-        inspect(state.session.as_ref().map(|(_, session)| session.get()))
+        ModelStatus {
+            state: state.state,
+            error: state.error.clone(),
+            resident: state.session.is_some(),
+        }
     }
 
-    /// Call from a blocking worker, as compilation and contention can block.
+    /// Record that the model's files are in place without building a session. A failed model
+    /// stays failed: only a successful build clears that.
+    pub(super) fn mark_available(&self) {
+        let mut state = self.state.lock();
+        if state.state == ModelState::NotLoaded {
+            state.set(ModelState::Ready, None);
+        }
+    }
+
+    pub(super) fn acquire(&self) -> Option<Arc<T>> {
+        self.state
+            .lock()
+            .session
+            .as_mut()
+            .map(CachedSession::acquire)
+    }
+
+    /// The session, building it with `loader` unless one is in memory. Downloads are cancellable
+    /// through `observer`. A build that completes is published even if the job was cancelled
+    /// meanwhile, so the work is kept for the next user. Call from a blocking worker, as
+    /// compilation and contention can block.
     pub(super) fn prepare(
         &self,
-        key: K,
-        observer: &dyn DownloadObserver,
+        observer: &dyn PrepareObserver,
         loader: impl FnOnce() -> Result<Option<T>>,
     ) -> Result<Option<Arc<T>>> {
-        let context = Preparation { observer };
-        context.check()?;
-        if let Some(session) = self.acquire(&key) {
+        let check = || jobs::cancel_if(observer.download_cancelled());
+        check()?;
+        if let Some(session) = self.acquire() {
             return Ok(Some(session));
         }
-        let _gate = self.preparation.blocking_lock();
-        context.check()?;
-        if let Some(session) = self.acquire(&key) {
+        let _gate = self.preparation.lock();
+        check()?;
+        if let Some(session) = self.acquire() {
             return Ok(Some(session));
         }
-        let loading = self.begin();
-        let loaded = catch_loader(loader);
-        let result = loading.finish(key, loaded)?;
-        context.check()?;
+        let result = self.build(observer, loader)?;
+        check()?;
         Ok(result)
     }
 
-    pub(super) async fn prepare_async<'a, F: Future<Output = Result<Option<T>>>>(
+    fn build(
         &self,
-        key: K,
-        observer: &'a dyn DownloadObserver,
-        loader: impl FnOnce(Preparation<'a>) -> F,
+        observer: &dyn PrepareObserver,
+        loader: impl FnOnce() -> Result<Option<T>>,
     ) -> Result<Option<Arc<T>>> {
-        let context = Preparation { observer };
-        context.check()?;
-        if let Some(session) = self.acquire(&key) {
-            return Ok(Some(session));
-        }
-        let _gate = self.preparation.lock().await;
-        context.check()?;
-        if let Some(session) = self.acquire(&key) {
-            return Ok(Some(session));
-        }
-        let loading = self.begin();
-        // Catch construction as well as polling; failures must leave the slot retryable.
-        let loaded = match catch_loader(|| Ok(loader(context))) {
-            Ok(future) => {
-                let mut future = pin!(future);
-                poll_fn(|cx| match catch_loader(|| Ok(future.as_mut().poll(cx))) {
-                    Ok(poll) => poll,
-                    Err(error) => Poll::Ready(Err(error)),
-                })
-                .await
-            }
-            Err(error) => Err(error),
-        };
-        let result = loading.finish(key, loaded)?;
-        context.check()?;
-        Ok(result)
-    }
-
-    fn begin(&self) -> Loading<'_, T, K> {
-        self.state.lock().status = ModelStatus {
-            state: ModelState::Preparing,
-            error: None,
+        let previous = {
+            let mut state = self.state.lock();
+            let previous = state.state;
+            state.set(ModelState::Preparing, None);
+            previous
         };
         tracing::info!(model = self.name, "model preparation started");
-        Loading {
-            slot: self,
-            finished: false,
-        }
-    }
-
-    pub(super) fn unload_idle(&self, now: Instant) {
-        let Ok(gate) = self.preparation.try_lock() else {
-            return;
-        };
-        let retired = {
-            let mut state = self.state.lock();
-            if !state
-                .session
-                .as_mut()
-                .is_some_and(|(_, session)| session.expired(now))
-            {
-                return;
-            }
-            let retired = state.session.take();
-            state.status = ModelStatus {
-                state: ModelState::NotLoaded,
-                error: None,
-            };
-            retired
-        };
-        drop(gate);
-        drop(retired);
-        tracing::info!(model = self.name, "unloaded idle model");
-    }
-}
-
-struct Loading<'a, T, K> {
-    slot: &'a ModelSlot<T, K>,
-    finished: bool,
-}
-
-impl<T, K> Loading<'_, T, K> {
-    fn finish(mut self, key: K, loaded: Result<Option<T>>) -> Result<Option<Arc<T>>> {
-        let loaded = loaded.with_context(|| format!("Preparing {} failed. Check your connection and available disk space, then reopen or rescan the library to retry", self.slot.name));
-        let mut state = self.slot.state.lock();
+        observer.loading_model(self.name, self.model_id);
+        let loaded = catch_loader(loader).with_context(|| format!("Preparing {} failed. Check your connection and available disk space, then reopen or rescan the library to retry", self.name));
+        let mut state = self.state.lock();
         let mut retired = None;
         let result = match loaded {
             Ok(Some(model)) => {
                 let model = Arc::new(model);
                 retired = state
                     .session
-                    .replace((key, CachedSession::new(Arc::clone(&model))));
-                state.status = ModelStatus {
-                    state: ModelState::Ready,
-                    error: None,
-                };
-                tracing::info!(model = self.slot.name, "model preparation completed");
+                    .replace(CachedSession::new(Arc::clone(&model)));
+                state.set(ModelState::Ready, None);
+                tracing::info!(model = self.name, "model preparation completed");
                 Ok(Some(model))
             }
             Ok(None) => {
-                state.status = resting_status(state.session.is_some());
+                state.rest(previous);
                 Ok(None)
             }
             Err(error) => {
-                state.status = if jobs::is_cancelled(&error) {
-                    resting_status(state.session.is_some())
+                if jobs::is_cancelled(&error) {
+                    state.rest(previous);
                 } else {
-                    tracing::error!(model = self.slot.name, error = %format_args!("{error:#}"), "model preparation failed");
-                    ModelStatus {
-                        state: ModelState::Failed,
-                        error: Some(format!("{error:#}")),
-                    }
-                };
+                    tracing::error!(model = self.name, error = %format_args!("{error:#}"), "model preparation failed");
+                    state.set(ModelState::Failed, Some(format!("{error:#}")));
+                }
                 Err(error)
             }
         };
-        self.finished = true;
         drop(state);
         drop(retired);
+        if matches!(result, Ok(Some(_))) {
+            observer.model_loaded();
+        }
         result
     }
-}
 
-impl<T, K> Drop for Loading<'_, T, K> {
-    fn drop(&mut self) {
-        if !self.finished {
-            // Dropping an async preparation must not strand the slot in Preparing.
-            let mut state = self.slot.state.lock();
-            state.status = resting_status(state.session.is_some());
-        }
-    }
-}
-
-fn resting_status(loaded: bool) -> ModelStatus {
-    ModelStatus {
-        state: if loaded {
-            ModelState::Ready
-        } else {
-            ModelState::NotLoaded
-        },
-        error: None,
+    pub(super) fn unload_idle(&self, now: Instant) {
+        let Some(gate) = self.preparation.try_lock() else {
+            return;
+        };
+        let timeout = self.residency.idle_timeout();
+        let retired = {
+            let mut state = self.state.lock();
+            if !state
+                .session
+                .as_mut()
+                .is_some_and(|session| session.expired(now, timeout))
+            {
+                return;
+            }
+            state.session.take()
+        };
+        drop(gate);
+        drop(retired);
+        tracing::info!(model = self.name, "unloaded idle model");
     }
 }
 
@@ -295,6 +240,7 @@ fn catch_loader<T>(loader: impl FnOnce() -> Result<T>) -> Result<T> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::mpsc;
     use std::time::Duration;
 
     #[derive(Default)]
@@ -305,166 +251,165 @@ mod tests {
             self.0.load(Ordering::Acquire)
         }
     }
+    impl PrepareObserver for Observer {}
 
-    #[tokio::test]
-    async fn cancellation_during_compilation_publishes_but_does_not_return_the_model() {
-        let slot = ModelSlot::new("fake OCR");
-        let observer = Arc::new(Observer::default());
-        let compile_observer = Arc::clone(&observer);
+    #[derive(Default)]
+    struct LoadCounter {
+        started: AtomicUsize,
+        loaded: AtomicUsize,
+    }
+    impl DownloadObserver for LoadCounter {
+        fn progress(&self, _: &nicegal_core::hub::ModelSource, _: usize, _: usize) {}
+    }
+    impl PrepareObserver for LoadCounter {
+        fn loading_model(&self, _: &'static str, _: &'static str) {
+            self.started.fetch_add(1, Ordering::Relaxed);
+        }
+        fn model_loaded(&self) {
+            self.loaded.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn slot<T>(name: &'static str) -> ModelSlot<T> {
+        ModelSlot::new(name, Residency::Batch)
+    }
+
+    #[test]
+    fn only_an_actual_build_is_reported_as_loading() {
+        let slot = slot("reported model");
+        let observer = LoadCounter::default();
+        let first = slot.prepare(&observer, || Ok(Some(42))).unwrap();
+        let again = slot.prepare(&observer, || panic!("must reuse")).unwrap();
+        assert!(Arc::ptr_eq(&first.unwrap(), &again.unwrap()));
+        assert_eq!(observer.started.load(Ordering::Relaxed), 1);
+        assert_eq!(observer.loaded.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn available_files_make_a_model_ready_without_a_session_but_never_mask_failure() {
+        let available = slot::<i32>("available model");
+        available.mark_available();
+        let status = available.status();
+        assert_eq!(status.state, ModelState::Ready);
+        assert!(!status.resident);
+
+        let failed = slot::<i32>("failed model");
+        assert!(failed.prepare(&(), || anyhow::bail!("bad graph")).is_err());
+        failed.mark_available();
+        assert_eq!(failed.status().state, ModelState::Failed);
+    }
+
+    #[test]
+    fn cancellation_during_compilation_publishes_but_does_not_return_the_model() {
+        let slot = slot("cancelled model");
+        let observer = Observer::default();
         let error = slot
-            .prepare_async((), observer.as_ref(), |preparation| async move {
-                preparation
-                    .compile_blocking(move || {
-                        compile_observer.0.store(true, Ordering::Release);
-                        Ok(Some(42))
-                    })
-                    .await
+            .prepare(&observer, || {
+                observer.0.store(true, Ordering::Release);
+                Ok(Some(42))
             })
-            .await
             .unwrap_err();
         assert!(jobs::is_cancelled(&error));
         assert_eq!(slot.status().state, ModelState::Ready);
-        let retained = slot.acquire(&()).unwrap();
+        let retained = slot.acquire().unwrap();
         observer.0.store(false, Ordering::Release);
         let reused = slot
-            .prepare_async((), observer.as_ref(), |_| async { panic!("must reuse") })
-            .await
+            .prepare(&observer, || panic!("must reuse"))
             .unwrap()
             .unwrap();
         assert!(Arc::ptr_eq(&retained, &reused));
     }
 
-    #[tokio::test]
-    async fn cancelled_download_stage_cannot_proceed_to_compilation() {
-        let slot = ModelSlot::<i32>::new("fake OCR");
+    #[test]
+    fn cancellation_while_waiting_for_preparation_never_invokes_loader() {
+        let slot = slot::<i32>("queued model");
         let observer = Observer::default();
-        let observer = &observer;
-        let error = slot
-            .prepare_async((), observer, |preparation| async move {
-                preparation
-                    .resolve(async {
-                        observer.0.store(true, Ordering::Release);
-                        Ok(())
-                    })
-                    .await?;
-                panic!("cancelled download must not reach compilation");
-            })
-            .await
-            .unwrap_err();
-        assert!(jobs::is_cancelled(&error));
-        assert_eq!(slot.status().state, ModelState::NotLoaded);
-        assert!(slot.snapshot().is_none());
-    }
-
-    #[tokio::test]
-    async fn cancellation_while_waiting_for_preparation_never_invokes_loader() {
-        let slot = ModelSlot::<i32>::new("queued model");
-        let observer = Observer::default();
-        let gate = slot.preparation.lock().await;
-        let mut waiting =
-            pin!(slot.prepare_async((), &observer, |_| async { panic!("must not load") }));
-        tokio::select! {
-            biased;
-            _ = &mut waiting => panic!("must wait for preparation lock"),
-            _ = tokio::task::yield_now() => (),
-        }
-        observer.0.store(true, Ordering::Release);
-        drop(gate);
-        assert!(jobs::is_cancelled(&waiting.await.unwrap_err()));
-        assert_eq!(slot.status().state, ModelState::NotLoaded);
-    }
-
-    #[tokio::test]
-    async fn concurrent_preparations_compile_once_and_share_the_session() {
-        let slot = ModelSlot::new("shared model");
-        let loads = AtomicUsize::new(0);
-        let entered = tokio::sync::Notify::new();
-        let release = tokio::sync::Notify::new();
-        let first = slot.prepare_async((), &(), |_| async {
-            loads.fetch_add(1, Ordering::Relaxed);
-            entered.notify_one();
-            release.notified().await;
-            Ok(Some(42))
+        let gate = slot.preparation.lock();
+        std::thread::scope(|scope| {
+            let waiting = scope.spawn(|| slot.prepare(&observer, || panic!("must not load")));
+            observer.0.store(true, Ordering::Release);
+            drop(gate);
+            assert!(jobs::is_cancelled(&waiting.join().unwrap().unwrap_err()));
         });
-        let second = async {
-            entered.notified().await;
-            release.notify_one();
-            slot.prepare_async((), &(), |_| async {
-                loads.fetch_add(1, Ordering::Relaxed);
-                Ok(Some(43))
-            })
-            .await
-        };
-        let (first, second) = tokio::join!(first, second);
-        assert!(Arc::ptr_eq(
-            &first.unwrap().unwrap(),
-            &second.unwrap().unwrap()
-        ));
-        assert_eq!(loads.load(Ordering::Relaxed), 1);
-    }
-
-    #[tokio::test]
-    async fn failed_replacement_preserves_previous_model_and_can_retry() {
-        let slot = ModelSlot::new("keyed model");
-        let original = slot
-            .prepare_async("old", &(), |_| async { Ok(Some(42)) })
-            .await
-            .unwrap()
-            .unwrap();
-        let error = slot
-            .prepare_async("new", &(), |_| async { panic!("fake compiler panic") })
-            .await
-            .unwrap_err();
-        assert!(format!("{error:#}").contains("fake compiler panic"));
-        assert_eq!(slot.status().state, ModelState::Failed);
-        assert!(Arc::ptr_eq(&original, &slot.acquire(&"old").unwrap()));
-        assert!(slot.acquire(&"new").is_none());
-        let replacement = slot
-            .prepare_async("new", &(), |_| async { Ok(Some(43)) })
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(*replacement, 43);
-        assert_eq!(*original, 42);
-        assert!(slot.acquire(&"old").is_none());
-        assert_eq!(slot.status().state, ModelState::Ready);
-    }
-
-    #[tokio::test]
-    async fn dropped_preparation_restores_state_and_releases_gate() {
-        let slot = ModelSlot::<i32>::new("abandoned model");
-        {
-            let mut loading = pin!(slot.prepare_async((), &(), |_| std::future::pending()));
-            tokio::select! {
-                biased;
-                _ = &mut loading => panic!("must stay pending"),
-                _ = tokio::task::yield_now() => (),
-            }
-            assert_eq!(slot.status().state, ModelState::Preparing);
-            // Cleanup must not block on preparation or change its status.
-            slot.unload_idle(Instant::now());
-            assert_eq!(slot.status().state, ModelState::Preparing);
-        }
         assert_eq!(slot.status().state, ModelState::NotLoaded);
-        assert_eq!(
-            *slot
-                .prepare_async((), &(), |_| async { Ok(Some(42)) })
-                .await
-                .unwrap()
-                .unwrap(),
-            42
-        );
     }
 
     #[test]
-    fn inspection_does_not_keep_an_idle_model_alive() {
-        let slot = ModelSlot::new("inspected model");
-        drop(slot.prepare((), &(), || Ok(Some(42))).unwrap());
+    fn concurrent_preparations_build_once_and_share_the_session() {
+        let slot = slot("shared model");
+        let loads = AtomicUsize::new(0);
+        let (entered, building) = mpsc::channel();
+        let (release, released) = mpsc::channel::<()>();
+        let (slot, loads) = (&slot, &loads);
+        std::thread::scope(|scope| {
+            let first = scope.spawn(move || {
+                slot.prepare(&(), || {
+                    loads.fetch_add(1, Ordering::Relaxed);
+                    entered.send(()).unwrap();
+                    released.recv().unwrap();
+                    Ok(Some(42))
+                })
+            });
+            building.recv().unwrap();
+            let second = scope.spawn(|| {
+                slot.prepare(&(), || {
+                    loads.fetch_add(1, Ordering::Relaxed);
+                    Ok(Some(43))
+                })
+            });
+            release.send(()).unwrap();
+            let first = first.join().unwrap().unwrap().unwrap();
+            let second = second.join().unwrap().unwrap().unwrap();
+            assert!(Arc::ptr_eq(&first, &second));
+        });
+        assert_eq!(loads.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn a_panicking_build_fails_the_model_and_can_be_retried() {
+        let slot = slot("flaky model");
+        let error = slot
+            .prepare(&(), || panic!("fake compiler panic"))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("fake compiler panic"));
+        assert_eq!(slot.status().state, ModelState::Failed);
+        let retried = slot.prepare(&(), || Ok(Some(43))).unwrap().unwrap();
+        assert_eq!(*retried, 43);
+        assert_eq!(slot.status().state, ModelState::Ready);
+    }
+
+    #[test]
+    fn eviction_frees_memory_but_the_model_stays_usable() {
+        let slot = slot("evicted model");
+        drop(slot.prepare(&(), || Ok(Some(42))).unwrap());
         let now = Instant::now();
         slot.unload_idle(now);
-        assert_eq!(slot.inspect(|model| model.copied()), Some(42));
-        slot.unload_idle(now + Duration::from_secs(300));
-        assert_eq!(slot.inspect(|model| model.copied()), None);
-        assert_eq!(slot.status().state, ModelState::NotLoaded);
+        assert!(slot.status().resident);
+        slot.unload_idle(now + Residency::Batch.idle_timeout());
+        let status = slot.status();
+        assert_eq!(status.state, ModelState::Ready);
+        assert!(!status.resident);
+    }
+
+    #[test]
+    fn a_session_in_use_is_never_evicted() {
+        let slot = slot("busy model");
+        let held = slot.prepare(&(), || Ok(Some(42))).unwrap().unwrap();
+        let now = Instant::now();
+        slot.unload_idle(now);
+        slot.unload_idle(now + Residency::Batch.idle_timeout() * 2);
+        assert!(Arc::ptr_eq(&held, &slot.acquire().unwrap()));
+    }
+
+    #[test]
+    fn residency_sets_how_long_an_idle_model_stays() {
+        let interactive = ModelSlot::new("query model", Residency::Interactive);
+        drop(interactive.prepare(&(), || Ok(Some(42))).unwrap());
+        let now = Instant::now();
+        interactive.unload_idle(now);
+        interactive.unload_idle(now + Residency::Batch.idle_timeout() + Duration::from_secs(1));
+        assert!(interactive.status().resident);
+        interactive.unload_idle(now + Residency::Interactive.idle_timeout());
+        assert!(!interactive.status().resident);
     }
 }

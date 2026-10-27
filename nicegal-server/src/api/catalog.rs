@@ -264,7 +264,7 @@ async fn metadata(
                 };
             let image_indexed = state
                 .databases
-                .open_images_read_only(state.image_embedder.dimensions())?
+                .open_images_read_only(state.models.image.dimensions())?
                 .is_asset_indexed(asset.asset_id)?;
             let file = nicegal_core::metadata::inspect(&asset).into();
             Ok(MetadataResponse {

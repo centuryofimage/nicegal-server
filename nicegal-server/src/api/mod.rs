@@ -12,7 +12,6 @@ mod library_scan;
 mod model_idle;
 mod model_slot;
 pub(crate) mod models;
-mod ocr_models;
 mod patch_cache;
 mod prune_jobs;
 mod roots;
@@ -37,7 +36,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use camino::Utf8PathBuf as PathBuf;
-use models::{ImageModel, ImageQueryModel as ImageQueryEmbedder, TextModel as TextEmbedder};
 mod external_image;
 use nicegal_core::assets::AssetCatalog;
 use nicegal_core::db::DB;
@@ -49,9 +47,7 @@ use tracing::{Span, debug_span, field, info, info_span};
 
 use error::ApiError;
 
-pub(crate) use image_model::ImageModelSettings;
 pub(crate) use jobs::JobManager;
-pub(crate) use ocr_models::ModelStore;
 pub(crate) use runtime::RuntimeSettings;
 
 pub(crate) const API_VERSION: u8 = 1;
@@ -97,18 +93,16 @@ pub(crate) struct AppState {
     pub(crate) databases: Arc<Databases>,
     pub(crate) thumbnails: Arc<ThumbnailService>,
     pub(crate) jobs: Arc<JobManager>,
-    /// Prepared on request by indexing or model preparation, then shared by searches.
-    pub(crate) embedder: Arc<TextEmbedder>,
-    /// Text encoder paired with the active image embedding model.
-    pub(crate) image_query_embedder: Arc<ImageQueryEmbedder>,
-    pub(crate) image_embedder: Arc<ImageModel>,
-    pub(crate) ocr_models: Arc<ocr_models::ModelStore>,
+    /// Every model session, shared by searches and jobs.
+    pub(crate) models: Arc<models::Models>,
     /// The process's selected ONNX Runtime distribution and the persisted selection for its next
     /// launch. It is separate from model state because a loaded dynamic library cannot change.
     pub(crate) runtime: Arc<RuntimeSettings>,
-    pub(crate) image_model_settings: Arc<ImageModelSettings>,
     /// The active model's image tags, loaded on first use.
     pub(crate) tags: Arc<tags::TagSets>,
+    pub(crate) search_sessions: search_sessions::SearchSessions,
+    pub(crate) patch_cache: Arc<patch_cache::PatchCache>,
+    pub(crate) external_vectors: Arc<external_image::ExternalVectors>,
 }
 
 #[derive(Clone)]
@@ -129,7 +123,6 @@ struct StatusResponse {
     api_version: u8,
     instance_id: &'static str,
     runtime: runtime::RuntimeStatusResponse,
-    ocr_models_loaded: bool,
 }
 
 pub(crate) fn router(state: AppState, authorization: HeaderValue) -> Router {
@@ -141,7 +134,7 @@ pub(crate) fn router(state: AppState, authorization: HeaderValue) -> Router {
         .route("/v1/health", get(health))
         .route("/v1/status", get(status))
         .route("/v1/models", models::route())
-        .route("/v1/models/load-cached", models::load_cached_route())
+        .route("/v1/models/warm", models::warm_route())
         .route("/v1/runtime", runtime::route())
         .route("/v1/assets", assets::route())
         .merge(catalog::routes())
@@ -166,7 +159,6 @@ pub(crate) fn router(state: AppState, authorization: HeaderValue) -> Router {
             "/v1/text-embeddings/generate",
             text_embeddings::generate_route(),
         )
-        .route("/v1/ocr/models", ocr_models::route())
         .route("/v1/assets/tags", tags::route())
         .merge(jobs::routes())
         .route_layer(middleware::from_fn_with_state(
@@ -243,7 +235,6 @@ async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
         instance_id: instance_id(),
         api_version: API_VERSION,
         runtime: runtime::status_response(&state),
-        ocr_models_loaded: state.ocr_models.is_loaded(),
     })
 }
 
@@ -384,23 +375,17 @@ mod tests {
         test_router_with_preparation(temp, false)
     }
 
-    fn prepared_text_model() -> Arc<TextEmbedder> {
-        static MODEL: std::sync::OnceLock<Arc<TextEmbedder>> = std::sync::OnceLock::new();
-        Arc::clone(MODEL.get_or_init(|| {
+    fn prepared_text_model() -> &'static nicegal_core::embedding::TextEmbedder {
+        static MODEL: std::sync::OnceLock<nicegal_core::embedding::TextEmbedder> =
+            std::sync::OnceLock::new();
+        MODEL.get_or_init(|| {
             initialize_test_runtime();
-            let model = Arc::new(TextEmbedder::deferred(
-                nicegal_core::embedding::TextEmbedderOptions::default(),
-            ));
-            let worker_model = Arc::clone(&model);
-            std::thread::spawn(move || {
-                worker_model
-                    .ready_or_cached()
-                    .expect("BGE model cached by explicit setup")
-            })
-            .join()
-            .unwrap();
-            model
-        }))
+            nicegal_core::embedding::TextEmbedder::load_cached(
+                &nicegal_core::embedding::TextEmbedderOptions::default(),
+            )
+            .unwrap()
+            .expect("BGE model cached by explicit setup")
+        })
     }
 
     fn test_router_with_preparation(temp: &TempDir, prepare_models: bool) -> Router {
@@ -440,27 +425,8 @@ mod tests {
             .unwrap();
         drop(ThumbnailDb::new(&databases.thumbnails).unwrap());
 
-        let embedder = if prepare_models {
-            prepared_text_model()
-        } else {
-            Arc::new(
-                TextEmbedder::deferred(nicegal_core::embedding::TextEmbedderOptions::default())
-                    .without_cached_loading(),
-            )
-        };
-        let image_embedder = Arc::new(ImageModel::deferred(
-            nicegal_core::embedding::ImageEmbedderOptions::default(),
-        ));
-        let image_query_embedder = Arc::new(
-            ImageQueryEmbedder::deferred(
-                nicegal_core::embedding::ImageQueryEmbedderOptions::default(),
-            )
-            .without_cached_loading(),
-        );
-        drop(ImageIndexDb::new(&databases.images, image_query_embedder.dimensions()).unwrap());
-        let ocr_models = Arc::new(ModelStore::new(
-            nicegal_core::runtime::ExecutionProvider::Cpu,
-        ));
+        let models = Arc::new(models::Models::for_tests(prepare_models));
+        drop(ImageIndexDb::new(&databases.images, models.image_query.dimensions()).unwrap());
         let thumbnails = Arc::new(ThumbnailService::new(&databases.thumbnails).unwrap());
         let runtime = Arc::new(
             RuntimeSettings::load(
@@ -470,25 +436,19 @@ mod tests {
             .unwrap(),
         );
         runtime.set_onnx_runtime_build_info("test build".to_owned());
-        let image_model_settings = Arc::new(ImageModelSettings::new(Arc::clone(&runtime), None));
         let state = AppState {
-            image_model_settings,
             tags: Default::default(),
+            search_sessions: Default::default(),
+            patch_cache: Default::default(),
+            external_vectors: Default::default(),
             jobs: Arc::new(JobManager::new(
                 Arc::clone(&databases),
                 Arc::clone(&thumbnails),
-                Arc::clone(&embedder),
-                Arc::clone(&image_embedder),
-                Arc::clone(&image_query_embedder),
-                Arc::clone(&ocr_models),
-                Arc::clone(&runtime),
+                Arc::clone(&models),
             )),
             databases,
             thumbnails,
-            embedder,
-            image_query_embedder,
-            image_embedder,
-            ocr_models,
+            models,
             runtime,
         };
         router(state, HeaderValue::from_static(TOKEN))
@@ -619,6 +579,34 @@ mod tests {
         for key in ["text", "clipImage", "clipText"] {
             assert_eq!(body[key]["state"], "notLoaded");
         }
+    }
+
+    #[tokio::test]
+    async fn warming_reports_every_model_and_treats_missing_files_as_status() {
+        let temp = TempDir::new().unwrap();
+        let router = test_router(&temp);
+        let (status, body) = send(&router, Method::GET, "/v1/models").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        for model in ["text", "textIndex", "clipImage", "clipText", "ocr"] {
+            assert_eq!(body[model]["state"], "notLoaded", "{model}: {body}");
+            assert_eq!(body[model]["resident"], false, "{model}: {body}");
+        }
+        // The test router's query encoders cannot load from the cache, like a fresh install.
+        let (status, body) = post_json(
+            &router,
+            "/v1/models/warm",
+            serde_json::json!({ "models": ["text", "clipText"] }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["text"]["state"], "notLoaded", "{body}");
+        let (status, body) = post_json(
+            &router,
+            "/v1/models/warm",
+            serde_json::json!({ "models": ["ocr"] }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     }
 
     #[tokio::test]
@@ -765,7 +753,6 @@ mod tests {
         );
         assert_eq!(body["runtime"]["restartRequired"], false);
         assert_eq!(body["runtime"]["onnxRuntimeBuildInfo"], "test build");
-        assert_eq!(body["ocrModelsLoaded"], false);
 
         let (status, body) = send_json(
             &router,
@@ -997,11 +984,16 @@ mod tests {
     /// Give the router's OCR database vectors for its rows, the way a completed embed job would.
     fn embed_everything(temp: &TempDir) {
         let ocr_path = PathBuf::try_from(temp.path().join("ocr.db")).unwrap();
-        let embedder = prepared_text_model().ready().unwrap();
+        let embedder = prepared_text_model();
         let mut ocr = DB::new(&ocr_path).unwrap();
         let space = nicegal_core::db::TextEmbeddingSpace::OcrText;
-        ocr.set_text_embedding_model(space, embedder.model().id(), embedder.dimensions(), true)
-            .unwrap();
+        ocr.set_text_embedding_model(
+            space,
+            nicegal_core::embedding::TextEmbedder::MODEL_ID,
+            nicegal_core::embedding::TextEmbedder::DIMENSIONS,
+            true,
+        )
+        .unwrap();
         let root = PathBuf::try_from(temp.path().to_path_buf()).unwrap();
         let filters = nicegal_core::db::SearchFilters::under(&root);
         let pending = ocr
@@ -1014,8 +1006,12 @@ mod tests {
                 vector: embedder.embed_query(&row.content).unwrap(),
             })
             .collect();
-        ocr.save_text_embeddings(space, embedder.model().id(), items)
-            .unwrap();
+        ocr.save_text_embeddings(
+            space,
+            nicegal_core::embedding::TextEmbedder::MODEL_ID,
+            items,
+        )
+        .unwrap();
     }
 
     async fn post_json(
@@ -1155,7 +1151,7 @@ mod tests {
         );
         assert_eq!(
             body["model"]["dimensions"],
-            nicegal_core::embedding::TextEmbeddingModel::default().dimensions()
+            nicegal_core::embedding::TextEmbedder::DIMENSIONS
         );
     }
 
@@ -1247,11 +1243,11 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(
             body["embedder"]["model"],
-            nicegal_core::embedding::TextEmbeddingModel::default().id()
+            nicegal_core::embedding::TextEmbedder::MODEL_ID
         );
         assert_eq!(
             body["embedder"]["dimensions"],
-            nicegal_core::embedding::TextEmbeddingModel::default().dimensions()
+            nicegal_core::embedding::TextEmbedder::DIMENSIONS
         );
         assert!(body["stored"].is_null(), "nothing has been embedded yet");
         assert_eq!(body["indexed"], 1);
@@ -1272,7 +1268,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(
             body["stored"]["model"],
-            nicegal_core::embedding::TextEmbeddingModel::default().id()
+            nicegal_core::embedding::TextEmbedder::MODEL_ID
         );
         assert_eq!(body["embedded"], 1);
         assert_eq!(body["pending"], 0);

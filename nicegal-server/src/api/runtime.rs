@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use super::error::ApiError;
 use super::extract::ApiJson;
-use super::ocr_models;
+use super::image_model;
 use super::{AppState, RESTART_EXIT_CODE};
 
 /// The runtime selection read at server startup and the persisted selection for its next launch.
@@ -83,7 +83,6 @@ impl RuntimeSettings {
                 .expect("runtime settings mutex poisoned")
                 .clone(),
             configured_execution_provider: configured.execution_provider.to_string(),
-            ocr_models: configured.ocr_models.clone(),
             restart_required: self.active_execution_provider != configured.execution_provider,
             image_model: None,
             available_execution_providers: available_execution_providers()
@@ -170,7 +169,7 @@ impl RuntimeSettings {
         Ok(())
     }
 
-    pub(super) fn image_model(&self) -> ImageEmbeddingModel {
+    pub(crate) fn image_model(&self) -> ImageEmbeddingModel {
         self.configured
             .lock()
             .expect("runtime settings mutex poisoned")
@@ -201,35 +200,11 @@ impl RuntimeSettings {
         Ok(())
     }
 
-    pub(super) fn ocr_models(&self) -> Result<ocr_models::job::Spec> {
-        let request = self
-            .configured
-            .lock()
-            .expect("runtime settings mutex poisoned")
-            .ocr_models
-            .clone();
-        ocr_models::job::prepare(request)
-            .map_err(|error| anyhow!("invalid saved OCR models: {error:?}"))
-    }
-
-    pub(super) fn save_ocr_models(&self, ocr: &ocr_models::job::Spec) -> Result<()> {
-        self.update_all(None, None, Some(ocr))
-    }
-
     /// Publish both selections only after their shared record has been atomically replaced.
     pub(super) fn update(
         &self,
         provider: Option<ExecutionProvider>,
         model: Option<ImageEmbeddingModel>,
-    ) -> Result<()> {
-        self.update_all(provider, model, None)
-    }
-
-    fn update_all(
-        &self,
-        provider: Option<ExecutionProvider>,
-        model: Option<ImageEmbeddingModel>,
-        ocr: Option<&ocr_models::job::Spec>,
     ) -> Result<()> {
         if let Some(provider) = provider {
             anyhow::ensure!(
@@ -251,9 +226,6 @@ impl RuntimeSettings {
         if let Some(model) = model {
             next.image_model = model;
         }
-        if let Some(ocr) = ocr {
-            next.ocr_models = ocr.request();
-        }
         write_settings(&self.path, &RuntimeSettingsFile::from(&next))?;
         *configured = next;
         Ok(())
@@ -268,10 +240,9 @@ pub(super) struct RuntimeStatusResponse {
     active_runtime_distribution: String,
     onnx_runtime_build_info: String,
     configured_execution_provider: String,
-    ocr_models: ocr_models::job::Request,
     restart_required: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    image_model: Option<super::image_model::ModelStatus>,
+    image_model: Option<image_model::ModelStatus>,
     available_execution_providers: Vec<String>,
 }
 
@@ -355,7 +326,6 @@ fn default_provider() -> ExecutionProvider {
 struct RuntimeUpdateRequest {
     execution_provider: Option<String>,
     image_model: Option<String>,
-    ocr_models: Option<ocr_models::job::Request>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -369,16 +339,10 @@ struct RuntimeSettingsFile {
     /// Retired: video indexing is a library option now. Read once to carry an older choice over.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     index_videos: Option<bool>,
-    #[serde(default = "default_ocr_models")]
-    ocr_models: ocr_models::job::Request,
-}
-
-fn default_ocr_models() -> ocr_models::job::Request {
-    serde_json::from_value(serde_json::json!({
-        "detection": { "modelId": "PaddlePaddle/PP-OCRv6_small_det_onnx", "revision": "main" },
-        "recognition": { "modelId": "PaddlePaddle/PP-OCRv6_small_rec_onnx", "revision": "main" }
-    }))
-    .expect("built-in OCR model pair is valid")
+    /// Retired: there is one OCR model pair. Accepted so older files still parse, and dropped on
+    /// the next write.
+    #[serde(default, rename = "ocrModels", skip_serializing)]
+    _retired_ocr_models: Option<serde::de::IgnoredAny>,
 }
 
 pub(super) fn route() -> MethodRouter<AppState> {
@@ -387,7 +351,7 @@ pub(super) fn route() -> MethodRouter<AppState> {
 
 pub(super) fn status_response(state: &AppState) -> RuntimeStatusResponse {
     let mut status = state.runtime.status();
-    let model = state.image_model_settings.status();
+    let model = image_model::status(state.models.image.model(), state.runtime.image_model());
     status.restart_required |= model.restart_required;
     status.image_model = Some(model);
     status
@@ -401,16 +365,9 @@ async fn update(
     State(state): State<AppState>,
     ApiJson(request): ApiJson<RuntimeUpdateRequest>,
 ) -> Result<(StatusCode, Json<RuntimeStatusResponse>), ApiError> {
-    if request.execution_provider.is_none()
-        && request.image_model.is_none()
-        && request.ocr_models.is_none()
-    {
+    if request.execution_provider.is_none() && request.image_model.is_none() {
         return Err(ApiError::bad_request("Provide a runtime setting"));
     }
-    let ocr_models = request
-        .ocr_models
-        .map(ocr_models::job::prepare)
-        .transpose()?;
     let execution_provider = request
         .execution_provider
         .as_deref()
@@ -439,7 +396,7 @@ async fn update(
     let jobs = Arc::clone(&state.jobs);
     tokio::task::spawn_blocking(move || {
         jobs.update_runtime(execution_provider.is_some() || model.is_some(), || {
-            runtime.update_all(execution_provider, model, ocr_models.as_ref())
+            runtime.update(execution_provider, model)
         })
     })
     .await
@@ -453,7 +410,6 @@ struct ConfiguredSettings {
     working_execution_providers: Vec<String>,
     image_model: ImageEmbeddingModel,
     legacy_index_videos: Option<bool>,
-    ocr_models: ocr_models::job::Request,
 }
 
 impl From<&ConfiguredSettings> for RuntimeSettingsFile {
@@ -463,7 +419,7 @@ impl From<&ConfiguredSettings> for RuntimeSettingsFile {
             working_execution_providers: settings.working_execution_providers.clone(),
             image_model: Some(settings.image_model.id().to_owned()),
             index_videos: settings.legacy_index_videos,
-            ocr_models: settings.ocr_models.clone(),
+            _retired_ocr_models: None,
         }
     }
 }
@@ -498,9 +454,6 @@ fn read_settings(path: &PathBuf) -> Result<ConfiguredSettings> {
             None => read_legacy_image_model(path)?,
         },
         legacy_index_videos: file.as_ref().and_then(|file| file.index_videos),
-        ocr_models: file
-            .as_ref()
-            .map_or_else(default_ocr_models, |file| file.ocr_models.clone()),
     };
     if saved.is_some() && provider.is_none() {
         write_settings(path, &RuntimeSettingsFile::from(&settings))?;
@@ -606,19 +559,16 @@ mod tests {
     }
 
     #[test]
-    fn scan_options_survive_restart() -> Result<()> {
+    fn retired_ocr_models_still_parse_and_are_dropped_on_write() -> Result<()> {
         let temp = TempDir::new()?;
         let path = PathBuf::try_from(temp.path().join("runtime.json"))?;
+        fs::write(
+            &path,
+            r#"{"executionProvider":"cpu","ocrModels":{"detection":{"modelId":"a/b"}}}"#,
+        )?;
         let settings = RuntimeSettings::load(path.clone(), None)?;
-        let request: ocr_models::job::Request = serde_json::from_value(serde_json::json!({
-            "detection": {"modelId": "example/detector"},
-            "recognition": {"modelId": "example/recognizer"}
-        }))?;
-        let models = ocr_models::job::prepare(request).map_err(|error| anyhow!("{error:?}"))?;
-        settings.save_ocr_models(&models)?;
-        let restarted = RuntimeSettings::load(path, None)?;
-        let saved = serde_json::to_value(restarted.ocr_models()?.request())?;
-        assert_eq!(saved["detection"]["modelId"], "example/detector");
+        settings.update(Some(ExecutionProvider::Cpu), None)?;
+        assert!(!fs::read_to_string(&path)?.contains("ocrModels"));
         Ok(())
     }
 

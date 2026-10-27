@@ -84,10 +84,10 @@ pub(super) struct StoredImageEmbedding {
 impl ImageIndexDb {
     /// Attach cancellation to a reader owned exclusively by one search request.
     pub fn set_search_cancellation(
-        &self,
+        &mut self,
         cancellation: &crate::cancellation::SearchCancellation,
     ) -> Result<()> {
-        cancellation.register(&self.conn)
+        cancellation.register(&mut self.conn)
     }
 
     /// Open the database belonging to one model and ensure its fixed-width vector table exists.
@@ -369,7 +369,7 @@ impl ImageIndexDb {
 
     /// Remove vector state whose owning catalog asset no longer exists, plus any vector that has
     /// lost its local state row after an interrupted write.
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "info", skip(self))]
     pub fn prune_orphans(&mut self, catalog: &Path) -> Result<usize> {
         self.conn
             .execute(
@@ -422,7 +422,7 @@ impl ImageIndexDb {
         result
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "info", skip(self))]
     pub fn maintain(&self) -> Result<()> {
         maintain(&self.conn).context("maintaining image embedding database")
     }

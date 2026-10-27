@@ -38,9 +38,7 @@ production Electron does not fetch thumbnail bytes over HTTP.
 
 Vector search is the primary search mode; glob, FTS, and regex remain available and are reached by
 naming them explicitly. OCR-text vectors live in the OCR store and are produced by the server
-itself. Select the **OCR** text model with `--embed-model`/`NICEGAL_EMBED_MODEL`; BGE small
-English v1.5 is the default and currently the only supported OCR model. That selection does not
-affect image search. CLIP image vectors live in `qdrant-clip-vit-b-32.db`, derived from the full
+itself with BGE small English v1.5, the only OCR text model. CLIP image vectors live in `qdrant-clip-vit-b-32.db`, derived from the full
 publisher/model slug. The server creates no model sessions and downloads no models before
 readiness. Models are prepared when indexing is requested. Browsing, catalog sync, thumbnails, and literal OCR search remain available
 without models. Schema validation and bundled runtime initialization still occur before readiness.

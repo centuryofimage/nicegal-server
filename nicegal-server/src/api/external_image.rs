@@ -1,9 +1,9 @@
 //! Request snapshots are never persisted. Only small model-specific vectors survive requests.
 use std::collections::VecDeque;
-use std::sync::{Mutex, OnceLock};
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use nicegal_core::embedding::ImageEmbedder;
+use parking_lot::Mutex;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -53,12 +53,38 @@ impl ExternalImageRequest {
     }
 }
 
-type CacheKey = (&'static str, [u8; 32]);
+/// Vectors of recently searched external images, for the process's one image model.
 #[derive(Default)]
-struct VectorCache(VecDeque<(CacheKey, Vec<f32>)>);
+pub(crate) struct ExternalVectors(Mutex<VectorCache>);
+
+impl ExternalVectors {
+    pub(super) fn embed(&self, bytes: &[u8], model: &ImageEmbedder) -> Result<Vec<f32>, ApiError> {
+        let key = Sha256::digest(bytes).into();
+        // Serialize misses as well, avoiding repeated inference for simultaneous identical searches.
+        let mut cache = self.0.lock();
+        if let Some(vector) = cache.get(&key) {
+            return Ok(vector);
+        }
+        let raster = model.decode_image(bytes).map_err(|_| {
+            ApiError::bad_request("external image could not be decoded; choose another file")
+        })?;
+        if u64::from(raster.width()) * u64::from(raster.height()) > MAX_PIXELS as u64 {
+            return Err(ApiError::bad_request(
+                "external image exceeds 40 megapixels",
+            ));
+        }
+        let vector = model.embed_raster(raster)?;
+        cache.insert(key, vector.clone());
+        Ok(vector)
+    }
+}
+
+/// Least recently used vectors, keyed by the image's SHA-256.
+#[derive(Default)]
+struct VectorCache(VecDeque<([u8; 32], Vec<f32>)>);
 
 impl VectorCache {
-    fn get(&mut self, key: &(&'static str, [u8; 32])) -> Option<Vec<f32>> {
+    fn get(&mut self, key: &[u8; 32]) -> Option<Vec<f32>> {
         let index = self.0.iter().position(|entry| &entry.0 == key)?;
         let entry = self.0.remove(index)?;
         let vector = entry.1.clone();
@@ -66,35 +92,13 @@ impl VectorCache {
         Some(vector)
     }
 
-    fn insert(&mut self, key: (&'static str, [u8; 32]), vector: Vec<f32>) {
+    fn insert(&mut self, key: [u8; 32], vector: Vec<f32>) {
         self.0.retain(|entry| entry.0 != key);
         while self.0.len() >= CACHE_ENTRIES {
             self.0.pop_front();
         }
         self.0.push_back((key, vector));
     }
-}
-
-pub(super) fn embed(bytes: &[u8], model: &ImageEmbedder) -> Result<Vec<f32>, ApiError> {
-    static CACHE: OnceLock<Mutex<VectorCache>> = OnceLock::new();
-    let cache = CACHE.get_or_init(Mutex::default);
-    let key = (model.model().id(), Sha256::digest(bytes).into());
-    // Serialize misses as well, avoiding repeated inference for simultaneous identical searches.
-    let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
-    if let Some(vector) = cache.get(&key) {
-        return Ok(vector);
-    }
-    let raster = model.decode_image(bytes).map_err(|_| {
-        ApiError::bad_request("external image could not be decoded; choose another file")
-    })?;
-    if u64::from(raster.width()) * u64::from(raster.height()) > MAX_PIXELS as u64 {
-        return Err(ApiError::bad_request(
-            "external image exceeds 40 megapixels",
-        ));
-    }
-    let vector = model.embed_raster(raster)?;
-    cache.insert(key, vector.clone());
-    Ok(vector)
 }
 
 #[cfg(test)]
@@ -110,24 +114,24 @@ mod tests {
                 .unwrap()
                 .expect("cached image encoder");
         let png = nicegal_core::imaging::encode_png(1, 1, &[0, 0, 0, 255]).unwrap();
-        let vector = embed(&png, &model).unwrap();
+        let cache = ExternalVectors::default();
+        let vector = cache.embed(&png, &model).unwrap();
         assert_eq!(vector.len(), model.dimensions());
         assert!(vector.iter().all(|value| value.is_finite()));
-        assert_eq!(vector, embed(&png, &model).unwrap());
+        assert_eq!(vector, cache.embed(&png, &model).unwrap());
     }
 
     #[test]
-    fn cache_is_bounded_and_model_specific() {
+    fn cache_evicts_the_least_recently_used_vector() {
         let mut cache = VectorCache::default();
         for i in 0..=CACHE_ENTRIES {
-            cache.insert(("a", [i as u8; 32]), vec![i as f32]);
+            cache.insert([i as u8; 32], vec![i as f32]);
         }
         assert_eq!(cache.0.len(), CACHE_ENTRIES);
-        assert!(cache.get(&("a", [0; 32])).is_none());
-        assert!(cache.get(&("b", [1; 32])).is_none());
-        assert_eq!(cache.get(&("a", [1; 32])), Some(vec![1.0]));
-        cache.insert(("a", [33; 32]), vec![33.0]);
-        assert!(cache.get(&("a", [2; 32])).is_none());
+        assert!(cache.get(&[0; 32]).is_none());
+        assert_eq!(cache.get(&[1; 32]), Some(vec![1.0]));
+        cache.insert([33; 32], vec![33.0]);
+        assert!(cache.get(&[2; 32]).is_none());
     }
 
     #[test]

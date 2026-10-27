@@ -504,6 +504,23 @@ impl ImageEmbeddingModel {
         Ok(())
     }
 
+    /// The paired text encoder and tokenizer of a DeepGHS checkpoint, after validating its
+    /// metadata.
+    pub(super) fn deepghs_query_files(
+        self,
+        cached_only: bool,
+        progress: &dyn crate::hub::DownloadObserver,
+    ) -> Result<Option<(std::path::PathBuf, std::path::PathBuf)>> {
+        let text = self.deepghs_file("text_encode.onnx", cached_only, progress)?;
+        let tokenizer = self.deepghs_file("tokenizer.json", cached_only, progress)?;
+        let meta = self.deepghs_file("meta.json", cached_only, progress)?;
+        let (Some(text), Some(tokenizer), Some(meta)) = (text, tokenizer, meta) else {
+            return Ok(None);
+        };
+        self.validate_deepghs_meta(&meta)?;
+        Ok(Some((text, tokenizer)))
+    }
+
     fn deepghs_image_files(
         self,
         cached_only: bool,
@@ -1060,6 +1077,27 @@ impl ImageEmbedder {
         Self::load_with_cache_policy(options, true, &())
     }
 
+    /// Resolve every file [`Self::load_cached`] reads without building a session: downloading the
+    /// missing ones, or with `cached_only` reporting whether all are already cached.
+    pub fn fetch(
+        options: &ImageEmbedderOptions,
+        cached_only: bool,
+        progress: &dyn crate::hub::DownloadObserver,
+    ) -> Result<bool> {
+        let model = options.model;
+        Ok(if model.embedding_gemma2_budget().is_some() {
+            model
+                .embedding_gemma2_directory(cached_only, progress)?
+                .is_some()
+        } else if model.is_deepghs() {
+            model.deepghs_image_files(cached_only, progress)?.is_some()
+        } else {
+            model
+                .validated_model_directory(cached_only, progress)?
+                .is_some()
+        })
+    }
+
     fn load_with_cache_policy(
         options: &ImageEmbedderOptions,
         cached_only: bool,
@@ -1107,6 +1145,7 @@ impl ImageEmbedder {
         let (backend, execution_provider) = runtime::with_fallback(options.runtime, |provider| {
             let configured = runtime::configure_provider(provider, options.runtime.intra_threads)?;
             let init = fastembed::ImageInitOptionsUserDefined::new()
+                .with_environment(runtime::environment()?)
                 .with_execution_providers(vec![configured.dispatch])
                 .with_intra_threads(configured.intra_threads.get());
             let backend = if patched_graph.is_some() || fixed_batch(provider).is_some() {
@@ -1207,6 +1246,7 @@ impl ImageEmbedder {
         let (backend, execution_provider) = runtime::with_fallback(options.runtime, |provider| {
             let configured = runtime::configure_provider(provider, options.runtime.intra_threads)?;
             let init = EmbeddingGemma2InitOptionsUserDefined::new()
+                .with_environment(runtime::environment()?)
                 .with_execution_providers(vec![configured.dispatch])
                 .with_intra_threads(configured.intra_threads.get())
                 .with_settings(settings);
@@ -1676,6 +1716,27 @@ impl ImageQueryEmbedder {
     /// Load the paired text encoder strictly from cached files, without a network client.
     pub fn load_cached(options: &ImageQueryEmbedderOptions) -> Result<Option<Self>> {
         Self::load_with_cache_policy(options, true, &())
+    }
+
+    /// Resolve every file [`Self::load_cached`] reads without building a session: downloading the
+    /// missing ones, or with `cached_only` reporting whether all are already cached.
+    pub fn fetch(
+        options: &ImageQueryEmbedderOptions,
+        cached_only: bool,
+        progress: &dyn crate::hub::DownloadObserver,
+    ) -> Result<bool> {
+        let model = options.model;
+        Ok(if model.is_embedding_gemma2() {
+            model
+                .embedding_gemma2_directory(cached_only, progress)?
+                .is_some()
+        } else if model.is_deepghs() {
+            model.deepghs_query_files(cached_only, progress)?.is_some()
+        } else {
+            model
+                .validated_model_directory(cached_only, progress)?
+                .is_some()
+        })
     }
 
     fn load_with_cache_policy(

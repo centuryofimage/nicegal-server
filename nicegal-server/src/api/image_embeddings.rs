@@ -41,7 +41,7 @@ async fn coverage(
     State(state): State<AppState>,
     ApiQuery(request): ApiQuery<CoverageRequest>,
 ) -> Result<Json<CoverageResponse>, ApiError> {
-    let dimensions = state.image_query_embedder.dimensions();
+    let dimensions = state.models.image_query.dimensions();
     run_blocking(move || {
         let scope = super::libraries::scope(&state.databases, request.library_id)?;
         let db = state.databases.open_images_read_only(dimensions)?;
@@ -173,6 +173,7 @@ pub(crate) fn has_sources(spec: &Spec, databases: &Databases) -> anyhow::Result<
 }
 
 /// Use the same candidate selection as the embedding pass before preparing its model.
+#[tracing::instrument(name = "image_has_pending", level = "info", skip_all)]
 pub(crate) fn has_pending(
     spec: &Spec,
     databases: &Databases,

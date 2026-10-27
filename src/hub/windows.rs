@@ -242,15 +242,13 @@ mod tests {
         let det_path = download(&det, &cache)?;
         let rec_path = download(&rec, &cache)?;
         let det_config = source(&det.model_id, "inference.yml");
-        // Force the normal async client to fail, exercising the actual fallback branch.
-        let api = hf_hub::api::tokio::ApiBuilder::new()
-            .with_endpoint("http://127.0.0.1:1".into())
-            .with_progress(false)
-            .build()?;
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        let det_config_path = rt.block_on(det_config.get_with_progress(&api, &cache, ()))?;
+        // Stand in for a failed normal download to exercise the fallback itself.
+        let det_config_path = fallback(
+            &det_config,
+            &cache,
+            anyhow::anyhow!("the normal client could not connect"),
+            |_, _| true,
+        )?;
         let rec_config_path = download(&source(&rec.model_id, "inference.yml"), &cache)?;
         assert_eq!(
             cache.repo(det.repo()).get("inference.onnx"),
@@ -259,12 +257,10 @@ mod tests {
         runtime::initialize_bundled_runtime(runtime::ExecutionProvider::Cpu)?;
         let _ocr = crate::ocr::PaddleOcrModels::load_files(
             crate::ocr::OcrModelFiles {
-                source: &det,
                 model_path: &det_path,
                 config_path: &det_config_path,
             },
             crate::ocr::OcrModelFiles {
-                source: &rec,
                 model_path: &rec_path,
                 config_path: &rec_config_path,
             },

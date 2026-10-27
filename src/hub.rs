@@ -6,9 +6,8 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
-use hf_hub::api::tokio::{Api, ApiBuilder, Progress};
 use hf_hub::{Cache, Repo, RepoType};
-use tracing::{debug, error, info};
+use tracing::{error, info};
 
 #[derive(Debug)]
 struct DownloadCancelled;
@@ -28,9 +27,6 @@ pub fn is_cancellation(error: &anyhow::Error) -> bool {
             || cause
                 .downcast_ref::<hf_hub::api::sync::ApiError>()
                 .is_some_and(|error| matches!(error, hf_hub::api::sync::ApiError::Cancelled))
-            || cause
-                .downcast_ref::<hf_hub::api::tokio::ApiError>()
-                .is_some_and(|error| matches!(error, hf_hub::api::tokio::ApiError::Cancelled))
     })
 }
 
@@ -99,14 +95,6 @@ pub fn cache_dir() -> PathBuf {
     cache().path().clone()
 }
 
-/// An API client for downloading on a cache miss. Callers report progress through [`Progress`].
-pub fn api() -> Result<Api> {
-    ApiBuilder::from_env()
-        .with_progress(false)
-        .build()
-        .context("building the Hugging Face API client")
-}
-
 /// One versioned file in a Hugging Face model repository.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelSource {
@@ -147,64 +135,6 @@ impl ModelSource {
             revision: None,
             filename: filename.to_owned(),
         })
-    }
-
-    /// Resolve this file through Hugging Face's standard cache, downloading only on a cache miss.
-    pub async fn get_with_progress<P>(
-        &self,
-        api: &Api,
-        cache: &Cache,
-        mut progress: P,
-    ) -> Result<PathBuf>
-    where
-        P: Progress + Clone + Send + Sync + 'static,
-    {
-        if let Some(path) = self.cached_in(cache) {
-            debug!(model_id = %self.model_id, filename = %self.filename, path = %path.display(), "Hugging Face cache hit");
-            return Ok(path);
-        }
-
-        let started = self.log_download_start();
-        progress.init(0, &self.filename).await;
-        let result = api
-            .repo(self.repo())
-            .download_with_progress(&self.filename, progress.clone())
-            .await
-            .with_context(|| {
-                format!(
-                    "downloading {}/{} from Hugging Face",
-                    self.model_id, self.filename
-                )
-            });
-        #[cfg(windows)]
-        let result = match result {
-            Err(original) if windows::is_connection_error(&original) => {
-                let source = self.clone();
-                let cache = cache.clone();
-                let handle = tokio::runtime::Handle::current();
-                let mut progress = progress.clone();
-                tokio::task::spawn_blocking(move || {
-                    let mut previous = 0;
-                    windows::fallback(&source, &cache, original, |downloaded, total| {
-                        handle.block_on(async {
-                            if downloaded == 0 {
-                                progress.init(total, &source.filename).await;
-                                previous = 0;
-                            }
-                            progress.update(downloaded.saturating_sub(previous)).await;
-                            previous = downloaded;
-                            !progress.is_cancelled()
-                        })
-                    })
-                })
-                .await
-                .context("joining Windows download fallback")?
-            }
-            other => other,
-        };
-        self.log_download_result(started, &result);
-        progress.finish().await;
-        result
     }
 
     /// Resolve from the same cache in a blocking model-preparation worker. A search may use

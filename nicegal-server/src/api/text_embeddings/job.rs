@@ -106,7 +106,12 @@ pub(crate) fn run(
     let mut ocr = DB::new(ocr_database)?;
     // Declaring the model is what creates the vector table on a fresh database, and what discards
     // vectors that a model change has invalidated.
-    ocr.set_text_embedding_model(SPACE, embedder.model().id(), embedder.dimensions(), true)?;
+    ocr.set_text_embedding_model(
+        SPACE,
+        TextEmbedder::MODEL_ID,
+        TextEmbedder::DIMENSIONS,
+        true,
+    )?;
     if spec.force {
         ocr.clear_text_embeddings(SPACE)?;
     }
@@ -168,7 +173,7 @@ pub(crate) fn run(
             })
             .collect();
         let attempted = items.len();
-        let stored = ocr.save_text_embeddings(SPACE, embedder.model().id(), items)?;
+        let stored = ocr.save_text_embeddings(SPACE, TextEmbedder::MODEL_ID, items)?;
         if let Some(limit) = &mut remaining {
             *limit -= attempted;
         }
@@ -187,19 +192,14 @@ pub(crate) fn run(
     }
 }
 
-pub(crate) fn has_pending(
-    spec: &Spec,
-    ocr_database: &PathBuf,
-    model: &str,
-    dimensions: usize,
-) -> anyhow::Result<bool> {
+#[tracing::instrument(name = "text_has_pending", level = "info", skip_all)]
+pub(crate) fn has_pending(spec: &Spec, ocr_database: &PathBuf) -> anyhow::Result<bool> {
     let ocr = DB::new(ocr_database)?;
     let filters = SearchFilters::new(spec.scope.clone());
     let stored = ocr.text_embedding_model(SPACE)?;
-    if stored
-        .as_ref()
-        .is_some_and(|stored| stored.model != model || stored.dimensions != dimensions)
-    {
+    if stored.as_ref().is_some_and(|stored| {
+        stored.model != TextEmbedder::MODEL_ID || stored.dimensions != TextEmbedder::DIMENSIONS
+    }) {
         return Ok(ocr.text_embedding_coverage(SPACE, &filters)?.indexed > 0);
     }
     Ok(!ocr

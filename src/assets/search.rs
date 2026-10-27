@@ -67,8 +67,8 @@ fn natural_file_cmp(left: &[u8], right: &[u8]) -> Ordering {
 }
 
 impl AssetCatalog {
-    pub fn set_search_cancellation(&self, cancellation: &SearchCancellation) -> Result<()> {
-        cancellation.register(&self.conn)
+    pub fn set_search_cancellation(&mut self, cancellation: &SearchCancellation) -> Result<()> {
+        cancellation.register(&mut self.conn)
     }
 
     /// Search indexed paths inside the same library scope used by gallery listing. FTS5 narrows

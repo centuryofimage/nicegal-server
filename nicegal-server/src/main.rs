@@ -12,12 +12,9 @@ use camino::Utf8PathBuf as PathBuf;
 use clap::Parser;
 use nicegal_core::assets::AssetCatalog;
 use nicegal_core::db::DB;
-use nicegal_core::embedding::{
-    ImageEmbedderOptions, ImageEmbeddingModel, ImageQueryEmbedderOptions, TextEmbedderOptions,
-    TextEmbeddingModel,
-};
+use nicegal_core::embedding::{ImageEmbedderOptions, ImageEmbeddingModel};
 use nicegal_core::image_index::ImageIndexDb;
-use nicegal_core::runtime::{ExecutionProvider, RuntimeOptions};
+use nicegal_core::runtime::ExecutionProvider;
 use nicegal_core::thumbs::ThumbnailService;
 use serde::Serialize;
 use tokio::io::AsyncReadExt;
@@ -40,10 +37,6 @@ struct Args {
     /// Per-launch bearer token required by every request.
     #[arg(long, env = "NICEGAL_RPC_TOKEN", hide_env_values = true)]
     token: String,
-
-    /// Text embedding model used for vector search.
-    #[arg(long, env = "NICEGAL_EMBED_MODEL", value_name = "MODEL")]
-    embed_model: Option<TextEmbeddingModel>,
 
     /// Image/text encoder pair used for image similarity search.
     #[arg(long, env = "NICEGAL_IMAGE_MODEL", value_name = "MODEL")]
@@ -96,11 +89,7 @@ async fn main() -> Result<()> {
         runtime_config.clone(),
         args.execution_provider,
     )?);
-    let image_model_settings = Arc::new(api::ImageModelSettings::new(
-        Arc::clone(&runtime),
-        args.image_model,
-    ));
-    let image_model = image_model_settings.active();
+    let image_model = args.image_model.unwrap_or_else(|| runtime.image_model());
     let image_database = asset_database
         .parent()
         .context("asset database path has no parent directory")?
@@ -142,48 +131,18 @@ async fn main() -> Result<()> {
     runtime.clear_legacy_index_videos()?;
     drop(catalog);
 
-    // Models are loaded lazily when a job or request first needs them.
-    let mut embedder_options = TextEmbedderOptions::default();
-    if let Some(model) = args.embed_model {
-        embedder_options.model = model;
-    }
-    // The bundled runtime distribution selected above is process-global, so text and image
-    // embedders request the same execution provider as OCR.
-    embedder_options.runtime = RuntimeOptions {
-        execution_provider: runtime.active_execution_provider(),
-        ..RuntimeOptions::default()
-    };
-    let embedder = Arc::new(
-        api::models::TextModel::deferred(embedder_options.clone())
-            .with_provider_tracking(Arc::clone(&runtime)),
-    );
-    let image_embedder_options = ImageEmbedderOptions {
-        model: image_model,
-        runtime: embedder_options.runtime,
-        ..ImageEmbedderOptions::default()
-    };
-    let image_embedder = Arc::new(
-        api::models::ImageModel::deferred(image_embedder_options)
-            .with_provider_tracking(Arc::clone(&runtime)),
-    );
-    // The CLIP pair's text half, on CPU on purpose: query embedding is one short forward pass
-    // per search, where a GPU upload costs more than the pass itself, and the accelerator is
-    // wanted by indexing and OCR. Its model is the image encoder's paired text encoder, so it is
-    // selected with it here and changes only through a restart, exactly like indexing.
-    let image_query_embedder_options = ImageQueryEmbedderOptions {
-        model: image_model,
-        runtime: RuntimeOptions {
-            execution_provider: ExecutionProvider::Cpu,
-            ..RuntimeOptions::default()
+    // Models are loaded lazily when a job or request first needs them; `Models` picks each
+    // one's provider and how long it stays in memory.
+    let models = Arc::new(api::models::Models::new(
+        ImageEmbedderOptions {
+            model: image_model,
+            ..ImageEmbedderOptions::default()
         },
-        ..ImageQueryEmbedderOptions::default()
-    };
-    let image_query_embedder = Arc::new(api::models::ImageQueryModel::deferred(
-        image_query_embedder_options,
+        &runtime,
     ));
     drop(ImageIndexDb::new(
         &image_database,
-        image_embedder.dimensions(),
+        models.image.dimensions(),
     )?);
 
     let databases = Arc::new(api::Databases {
@@ -193,15 +152,10 @@ async fn main() -> Result<()> {
         thumbnails: thumbnail_database,
     });
     let thumbnails = Arc::new(ThumbnailService::new(&databases.thumbnails)?);
-    let ocr_models = Arc::new(api::ModelStore::new(runtime.active_execution_provider()));
     let jobs = Arc::new(api::JobManager::new(
         Arc::clone(&databases),
         Arc::clone(&thumbnails),
-        Arc::clone(&embedder),
-        Arc::clone(&image_embedder),
-        Arc::clone(&image_query_embedder),
-        Arc::clone(&ocr_models),
-        Arc::clone(&runtime),
+        Arc::clone(&models),
     ));
     if let Err(error) = jobs.recover().await {
         tracing::error!(?error, "could not recover background work");
@@ -210,13 +164,12 @@ async fn main() -> Result<()> {
         databases,
         thumbnails,
         jobs: Arc::clone(&jobs),
-        embedder,
-        image_query_embedder,
-        image_embedder,
-        image_model_settings,
-        ocr_models,
+        models,
         runtime,
         tags: Default::default(),
+        search_sessions: Default::default(),
+        patch_cache: Default::default(),
+        external_vectors: Default::default(),
     };
     let model_cleanup = state.start_model_cleanup();
     let app = api::router(state, authorization);

@@ -20,14 +20,13 @@ use nicegal_core::libraries::{DirectorySnapshot, IncludedFolder, Library, ScanOu
 use nicegal_core::scope::PathScope;
 use nicegal_core::thumbs::ThumbnailService;
 use serde::Deserialize;
-use tokio::runtime::Handle;
 use walkdir::WalkDir;
 
 use super::error::ApiError;
 use super::jobs::{FolderState, IndexStages, Job, JobCancelled};
-use super::models::{ImageModel, ImageQueryModel, TextModel};
+use super::models::Models;
 use super::prune_jobs::{self, ReconcileInput, ReconcileScope};
-use super::{Databases, RuntimeSettings, image_embeddings, ocr_models, text_embeddings};
+use super::{Databases, image_embeddings, text_embeddings};
 
 const OCR_COMMIT_CHUNK_SIZE: usize = 32;
 /// Cache folders that never hold library media.
@@ -45,9 +44,6 @@ enum ScanMode {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct Request {
     library_id: i64,
-    /// The OCR pair to recognize with. Loaded only when the scan finds images that need text
-    /// recognition and a different pair (or none) is loaded.
-    ocr_models: Option<ocr_models::job::Request>,
     /// Scan only the folders a library edit marked pending.
     #[serde(default)]
     pending_only: bool,
@@ -74,7 +70,6 @@ struct MaxDimensions {
 
 pub(crate) struct Spec {
     library_id: i64,
-    ocr_models: Option<ocr_models::job::Spec>,
     pending_only: bool,
     scan_mode: ScanMode,
     force: bool,
@@ -102,10 +97,6 @@ pub(crate) fn prepare(request: Request) -> Result<Spec, ApiError> {
         .transpose()?;
     Ok(Spec {
         library_id: request.library_id,
-        ocr_models: request
-            .ocr_models
-            .map(ocr_models::job::prepare)
-            .transpose()?,
         pending_only: request.pending_only,
         scan_mode: request.scan_mode,
         force: request.force,
@@ -116,11 +107,10 @@ pub(crate) fn prepare(request: Request) -> Result<Spec, ApiError> {
 }
 
 impl Spec {
-    /// A fast scan of what a viewed library has pending, with the saved OCR models applied later.
+    /// A fast scan of what a viewed library has pending.
     pub(crate) fn fast(library_id: i64, pending_only: bool) -> Self {
         Self {
             library_id,
-            ocr_models: None,
             pending_only,
             scan_mode: ScanMode::Fast,
             force: false,
@@ -143,23 +133,12 @@ impl Spec {
         }
         self.force |= other.force;
         self.retry_failed |= other.retry_failed;
-        if other.ocr_models.is_some() {
-            self.ocr_models = other.ocr_models.clone();
-        }
         if other.max_dimensions.is_some() {
             self.max_dimensions = other.max_dimensions;
         }
         if other.debug_limit.is_some() {
             self.debug_limit = other.debug_limit;
         }
-    }
-
-    pub(crate) fn apply_settings(&mut self, runtime: &RuntimeSettings) -> anyhow::Result<()> {
-        match &self.ocr_models {
-            Some(models) => runtime.save_ocr_models(models)?,
-            None => self.ocr_models = Some(runtime.ocr_models()?),
-        }
-        Ok(())
     }
 
     /// Everything this scan would walk, recognize with, and index, fixed when the job is accepted.
@@ -185,13 +164,7 @@ impl Spec {
 pub(super) struct Services<'a> {
     pub(super) databases: &'a Databases,
     pub(super) thumbnails: &'a ThumbnailService,
-    pub(super) text_embedder: &'a TextModel,
-    pub(super) image_embedder: &'a ImageModel,
-    pub(super) image_query_embedder: &'a ImageQueryModel,
-    pub(super) ocr_store: &'a ocr_models::ModelStore,
-    pub(super) runtime: &'a Arc<RuntimeSettings>,
-    /// Drives the async OCR model download from this blocking worker.
-    pub(super) handle: Handle,
+    pub(super) models: &'a Models,
 }
 
 /// One walk of the scan: an included folder, plus any included folders nested inside it that
@@ -215,8 +188,7 @@ struct ScanFolder<'a> {
 ///
 /// A folder's scan request is cleared only after both stages finish. The snapshot is saved
 /// after stage 1, so cancelling indexing never makes the next scan walk again.
-pub(super) fn run(mut spec: Spec, services: &Services<'_>, job: &Arc<Job>) -> anyhow::Result<()> {
-    let mut ocr_request = spec.ocr_models.take();
+pub(super) fn run(spec: Spec, services: &Services<'_>, job: &Arc<Job>) -> anyhow::Result<()> {
     let mut catalog = AssetCatalog::new(&services.databases.assets)?;
     let library = respell_reachable(&mut catalog, spec.library_id)?;
     job.set_index_stages(IndexStages {
@@ -351,7 +323,7 @@ pub(super) fn run(mut spec: Spec, services: &Services<'_>, job: &Arc<Job>) -> an
                 prune_jobs::reconcile(
                     ReconcileScope::new(path.clone(), &options()),
                     services.databases,
-                    services.image_embedder.dimensions(),
+                    services.models.image.dimensions(),
                     services.thumbnails,
                     ReconcileInput::Scanned(&assets),
                     job.as_ref(),
@@ -443,14 +415,7 @@ pub(super) fn run(mut spec: Spec, services: &Services<'_>, job: &Arc<Job>) -> an
         )?;
     }
     if library.options.ocr {
-        recognize_text(
-            &mut ocr_request,
-            &catalog,
-            &indexable,
-            &options(),
-            services,
-            job,
-        )?;
+        recognize_text(&catalog, &indexable, &options(), services, job)?;
         embed_text(&spec, &scope, services, job)?;
     }
 
@@ -828,7 +793,7 @@ fn quick_catalog(
         prune_jobs::reconcile(
             ReconcileScope::new(root.to_owned(), options),
             services.databases,
-            services.image_embedder.dimensions(),
+            services.models.image.dimensions(),
             services.thumbnails,
             ReconcileInput::Candidates(&candidates),
             job,
@@ -930,21 +895,18 @@ fn embed_images(
     {
         return Ok(());
     }
-    // Index coverage does not imply the paired query encoder was prepared successfully.
-    services.image_query_embedder.prepare_text_queries(job)?;
+    // Searches never download, so the scan fetches the paired query encoder's files even when
+    // every image is indexed. Building it is left to the first search that needs it.
+    services.models.ensure_image_query_available(job.as_ref())?;
     if !image_embeddings::has_pending(
         &image_spec,
         services.databases,
-        services.image_embedder.dimensions(),
+        services.models.image.dimensions(),
         Some(assets),
     )? {
         return Ok(());
     }
-    job.preparing_models(1);
-    let model = services
-        .image_embedder
-        .prepare_with_progress(job.as_ref())?;
-    job.models_loaded(1);
+    let model = services.models.image.prepare(job.as_ref())?;
     job.check_cancelled()?;
     image_embeddings::run(
         image_spec,
@@ -957,7 +919,6 @@ fn embed_images(
 }
 
 fn recognize_text(
-    ocr_request: &mut Option<ocr_models::job::Spec>,
     catalog: &AssetCatalog,
     assets: &[Asset],
     options: &IndexOptions,
@@ -970,11 +931,8 @@ fn recognize_text(
     if selection.is_empty() {
         return Ok(());
     }
-    let models = ocr_models(ocr_request, services, job)?;
-    let mut models = models
-        .sessions
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
+    let models = services.models.ocr.prepare(job.as_ref())?;
+    let mut models = models.lock();
     index::recognize_selection(
         catalog,
         &mut ocr,
@@ -986,26 +944,6 @@ fn recognize_text(
     job.check_cancelled()
 }
 
-/// The requested OCR pair, loading it only when it is not the pair already in memory. Without a
-/// requested pair, whatever is loaded is used.
-fn ocr_models(
-    ocr_request: &mut Option<ocr_models::job::Spec>,
-    services: &Services<'_>,
-    job: &Arc<Job>,
-) -> anyhow::Result<Arc<ocr_models::LoadedModels>> {
-    if let Some(requested) = ocr_request.take() {
-        return services.handle.block_on(ocr_models::job::run(
-            requested,
-            services.ocr_store,
-            services.runtime,
-            Arc::clone(job),
-        ));
-    }
-    services.ocr_store.snapshot().context(
-        "this library recognizes text but no OCR models are loaded; include ocrModels in the scan",
-    )
-}
-
 fn embed_text(
     spec: &Spec,
     scope: &PathScope,
@@ -1013,17 +951,12 @@ fn embed_text(
     job: &Arc<Job>,
 ) -> anyhow::Result<()> {
     let text_spec = text_embeddings::job::Spec::pending_for(scope.clone(), spec.debug_limit);
-    if !text_embeddings::job::has_pending(
-        &text_spec,
-        &services.databases.ocr,
-        services.text_embedder.model().id(),
-        services.text_embedder.dimensions(),
-    )? {
+    let models = services.models;
+    models.text_query.ensure_available(job.as_ref())?;
+    if !text_embeddings::job::has_pending(&text_spec, &services.databases.ocr)? {
         return Ok(());
     }
-    job.preparing_models(1);
-    let model = services.text_embedder.prepare_with_progress(job.as_ref())?;
-    job.models_loaded(1);
+    let model = models.text_index.prepare(job.as_ref())?;
     job.check_cancelled()?;
     text_embeddings::job::run(
         text_spec,
@@ -1129,7 +1062,7 @@ mod tests {
             ScanMode::Full
         );
         assert!(parse(serde_json::json!({"libraryId": 1, "scanMode": "auto"})).is_err());
-        assert!(!spec.pending_only && spec.ocr_models.is_none());
+        assert!(!spec.pending_only);
         for body in [
             serde_json::json!({"libraryId": 1, "debugLimit": 0}),
             serde_json::json!({"libraryId": 1, "maxDimensions": {"width": 0, "height": 5}}),

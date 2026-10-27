@@ -2,7 +2,6 @@
 
 mod fastembed;
 mod image;
-mod model;
 mod patches;
 mod run_log;
 
@@ -10,19 +9,16 @@ use anyhow::{Context, Result, bail};
 use tracing::{info, instrument};
 
 use crate::runtime::{ExecutionProvider, RuntimeOptions};
-use fastembed::{FastEmbedBackend, ocr_model_to_fastembed};
+use fastembed::FastEmbedBackend;
 pub use image::{
     ImageEmbedder, ImageEmbedderOptions, ImageEmbeddingModel, ImageQueryEmbedder,
     ImageQueryEmbedderOptions, PreparedImage,
 };
-pub use model::{ParseTextEmbeddingModelError, TextEmbeddingModel};
 pub use patches::PatchFeatures;
 
 /// How a [`TextEmbedder`] is built.
 #[derive(Debug, Clone)]
 pub struct TextEmbedderOptions {
-    /// The supported model to load.
-    pub model: TextEmbeddingModel,
     /// Longest input the backend accepts, in bytes of UTF-8. Longer text is truncated on a
     /// character boundary before embedding.
     pub max_input_bytes: usize,
@@ -38,7 +34,6 @@ pub struct TextEmbedderOptions {
 impl Default for TextEmbedderOptions {
     fn default() -> Self {
         Self {
-            model: TextEmbeddingModel::default(),
             max_input_bytes: 8192,
             max_batch_size: 64,
             runtime: RuntimeOptions::default(),
@@ -46,25 +41,29 @@ impl Default for TextEmbedderOptions {
     }
 }
 
-/// A loaded text embedding model.
+/// A loaded BGE small v1.5 session, which embeds OCR text and the queries that search it.
 ///
 /// The inference backend requires mutable access to its ONNX session. The backend's mutex keeps
 /// one process-wide model safe to share between the search and backfill workers; ONNX Runtime
 /// supplies the parallelism inside each inference call.
 pub struct TextEmbedder {
     backend: FastEmbedBackend,
-    model: TextEmbeddingModel,
     max_input_bytes: usize,
     max_batch_size: usize,
     execution_provider: ExecutionProvider,
 }
 
 impl TextEmbedder {
+    /// Identifier stored with every vector this model produces.
+    pub const MODEL_ID: &'static str = "BAAI/bge-small-en-v1.5";
+    /// The width of every vector this model produces.
+    pub const DIMENSIONS: usize = 384;
+
     /// Load the model described by `options`.
     ///
     /// The model is downloaded on first use into the standard Hugging Face cache and reused from
     /// there on subsequent starts.
-    #[instrument(name = "embedder_load", skip_all, fields(model = %options.model))]
+    #[instrument(name = "embedder_load", skip_all, fields(model = Self::MODEL_ID))]
     pub fn load(options: &TextEmbedderOptions) -> Result<Self> {
         Self::load_with_progress(options, &())
     }
@@ -82,6 +81,16 @@ impl TextEmbedder {
         Self::load_with_cache_policy(options, true, &())
     }
 
+    /// Resolve every file [`Self::load_cached`] reads without building a session: downloading the
+    /// missing ones, or with `cached_only` reporting whether all are already cached.
+    pub fn fetch(
+        _options: &TextEmbedderOptions,
+        cached_only: bool,
+        progress: &dyn crate::hub::DownloadObserver,
+    ) -> Result<bool> {
+        fastembed::fetch_bge_files(cached_only, progress)
+    }
+
     fn load_with_cache_policy(
         options: &TextEmbedderOptions,
         cached_only: bool,
@@ -95,19 +104,12 @@ impl TextEmbedder {
         }
 
         let Some((backend, cache_dir, execution_provider)) =
-            FastEmbedBackend::load_with_cache_policy(
-                ocr_model_to_fastembed(options.model),
-                &options.model.to_string(),
-                options.runtime,
-                cached_only,
-                progress,
-            )?
+            FastEmbedBackend::load_bge(options.runtime, cached_only, progress)?
         else {
             return Ok(None);
         };
         let embedder = Self {
             backend,
-            model: options.model,
             max_input_bytes: options.max_input_bytes,
             max_batch_size: options.max_batch_size,
             execution_provider,
@@ -117,7 +119,7 @@ impl TextEmbedder {
         // `model` is not repeated here: the enclosing `embedder_load` span already carries it, and
         // the compact log writer appends every ambient span field to each event inside it.
         info!(
-            dimensions = embedder.dimensions(),
+            dimensions = Self::DIMENSIONS,
             max_batch = embedder.max_batch_size,
             execution_provider = %embedder.execution_provider,
             cache = %cache_dir.display(),
@@ -126,20 +128,10 @@ impl TextEmbedder {
         Ok(Some(embedder))
     }
 
-    /// The typed model that produced this embedder's vectors.
-    pub fn model(&self) -> TextEmbeddingModel {
-        self.model
-    }
-
     /// The execution provider the backend actually compiled onto, which is not the requested one
     /// when `runtime`'s fallback chain ran.
     pub fn execution_provider(&self) -> ExecutionProvider {
         self.execution_provider
-    }
-
-    /// The width of every vector this embedder produces.
-    pub fn dimensions(&self) -> usize {
-        self.model.dimensions()
     }
 
     /// Largest batch [`Self::embed_documents`] should be given. Callers clamp to this rather than
@@ -179,7 +171,7 @@ impl TextEmbedder {
                 "batch of {} exceeds the {} the {} backend accepts",
                 texts.len(),
                 self.max_batch_size,
-                self.model
+                Self::MODEL_ID
             );
         }
         let texts: Vec<&str> = texts
@@ -201,24 +193,24 @@ impl TextEmbedder {
         let vectors = crate::runtime::exclusive_session_work(self.execution_provider, || {
             self.backend.embed(texts, self.max_batch_size)
         })
-        .with_context(|| format!("running the {} embedding model", self.model))?;
+        .with_context(|| format!("running the {} embedding model", Self::MODEL_ID))?;
         if vectors.len() != texts.len() {
             bail!(
                 "{} returned {} vectors for {} inputs",
-                self.model,
+                Self::MODEL_ID,
                 vectors.len(),
                 texts.len()
             );
         }
         if let Some(vector) = vectors
             .iter()
-            .find(|vector| vector.len() != self.dimensions())
+            .find(|vector| vector.len() != Self::DIMENSIONS)
         {
             bail!(
                 "{} returned a {}-element vector, expected {}",
-                self.model,
+                Self::MODEL_ID,
                 vector.len(),
-                self.dimensions()
+                Self::DIMENSIONS
             );
         }
         Ok(vectors)
@@ -277,13 +269,10 @@ mod tests {
     }
 
     #[test]
-    fn default_embedder_reports_its_model_metadata() {
-        let embedder = embedder();
-        assert_eq!(embedder.model(), TextEmbeddingModel::default());
-        assert_eq!(embedder.dimensions(), embedder.model().dimensions());
+    fn query_vectors_have_the_declared_width() {
         assert_eq!(
-            embedder.embed_query("receipt").unwrap().len(),
-            embedder.model().dimensions()
+            embedder().embed_query("receipt").unwrap().len(),
+            TextEmbedder::DIMENSIONS
         );
     }
 

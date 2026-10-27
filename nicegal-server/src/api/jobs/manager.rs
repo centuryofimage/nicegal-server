@@ -14,10 +14,10 @@ use super::routes::{RetainedRequest, wire_job_id};
 use super::views::LibraryView;
 use super::{JobCancelled, is_cancelled};
 use crate::api::error::ApiError;
-use crate::api::models::{ImageModel as ImageEmbedder, ImageQueryModel, TextModel as TextEmbedder};
+use crate::api::models::Models;
 use crate::api::ttl_map::TtlMap;
 use crate::api::{
-    Databases, image_embeddings, library_scan, ocr_models, prune_jobs, text_embeddings, thumbnails,
+    Databases, image_embeddings, library_scan, prune_jobs, text_embeddings, thumbnails,
 };
 
 pub(super) const MAX_RETAINED_JOBS: usize = 32;
@@ -39,22 +39,14 @@ pub(crate) struct JobManager {
     pub(super) registry: Mutex<JobRegistry>,
     pub(super) databases: Arc<Databases>,
     pub(super) thumbnails: Arc<ThumbnailService>,
-    pub(super) embedder: Arc<TextEmbedder>,
-    pub(super) image_embedder: Arc<ImageEmbedder>,
-    pub(super) image_query_embedder: Arc<ImageQueryModel>,
-    pub(super) ocr_models: Arc<ocr_models::ModelStore>,
-    pub(super) runtime: Arc<crate::api::RuntimeSettings>,
+    pub(super) models: Arc<Models>,
 }
 
 impl JobManager {
     pub(crate) fn new(
         databases: Arc<Databases>,
         thumbnails: Arc<ThumbnailService>,
-        embedder: Arc<TextEmbedder>,
-        image_embedder: Arc<ImageEmbedder>,
-        image_query_embedder: Arc<ImageQueryModel>,
-        ocr_models: Arc<ocr_models::ModelStore>,
-        runtime: Arc<crate::api::RuntimeSettings>,
+        models: Arc<Models>,
     ) -> Self {
         Self {
             next_id: AtomicU64::new(1),
@@ -64,11 +56,7 @@ impl JobManager {
             registry: Mutex::new(JobRegistry::default()),
             databases,
             thumbnails,
-            embedder,
-            image_embedder,
-            image_query_embedder,
-            ocr_models,
-            runtime,
+            models,
         }
     }
 }
@@ -90,11 +78,7 @@ impl JobManager {
         self.registry.lock()
     }
 
-    pub(in crate::api) fn start(self: &Arc<Self>, mut spec: JobSpec) -> Result<Arc<Job>, ApiError> {
-        if let JobSpec::LibraryScan(scan) = &mut spec {
-            scan.apply_settings(&self.runtime)
-                .map_err(ApiError::internal)?;
-        }
+    pub(in crate::api) fn start(self: &Arc<Self>, spec: JobSpec) -> Result<Arc<Job>, ApiError> {
         let (job, run_now) = {
             let mut registry = self.registry();
             if self.shutting_down.load(Ordering::Acquire) {
@@ -198,21 +182,10 @@ impl JobManager {
         if !job.begin() {
             return Err(JobCancelled.into());
         }
-        let spec = match spec {
-            JobSpec::OcrModelLoad(spec) => {
-                return ocr_models::job::run(spec, &self.ocr_models, &self.runtime, job)
-                    .await
-                    .map(|_| ());
-            }
-            spec => spec,
-        };
-
         let databases = Arc::clone(&self.databases);
         let thumbnails = Arc::clone(&self.thumbnails);
-        let embedder = Arc::clone(&self.embedder);
-        let image_embedder = Arc::clone(&self.image_embedder);
+        let models = Arc::clone(&self.models);
         let manager = Arc::clone(self);
-        let handle = tokio::runtime::Handle::current();
         let span = Span::current();
         tokio::task::spawn_blocking(move || {
             let _entered = span.enter();
@@ -223,12 +196,7 @@ impl JobManager {
                     &library_scan::Services {
                         databases: &databases,
                         thumbnails: &thumbnails,
-                        text_embedder: &embedder,
-                        image_embedder: &image_embedder,
-                        image_query_embedder: &manager.image_query_embedder,
-                        ocr_store: &manager.ocr_models,
-                        runtime: &manager.runtime,
-                        handle,
+                        models: &models,
                     },
                     &job,
                 ),
@@ -237,17 +205,11 @@ impl JobManager {
                 }
                 JobSpec::TextEmbed(spec) => {
                     let spec = spec.resolve(&databases)?;
-                    if !text_embeddings::job::has_pending(
-                        &spec,
-                        &databases.ocr,
-                        embedder.model().id(),
-                        embedder.dimensions(),
-                    )? {
+                    models.text_query.ensure_available(job.as_ref())?;
+                    if !text_embeddings::job::has_pending(&spec, &databases.ocr)? {
                         return Ok(());
                     }
-                    job.preparing_models(1);
-                    let model = embedder.prepare_with_progress(job.as_ref())?;
-                    job.models_loaded(1);
+                    let model = models.text_index.prepare(job.as_ref())?;
                     text_embeddings::job::run(spec, &databases.ocr, model.as_ref(), job.as_ref())
                 }
                 JobSpec::ImageEmbed(spec) => {
@@ -255,18 +217,16 @@ impl JobManager {
                     if !image_embeddings::has_sources(&spec, &databases)? {
                         return Ok(());
                     }
-                    manager.image_query_embedder.prepare_text_queries(&job)?;
+                    models.ensure_image_query_available(job.as_ref())?;
                     if !image_embeddings::has_pending(
                         &spec,
                         &databases,
-                        image_embedder.dimensions(),
+                        models.image.dimensions(),
                         None,
                     )? {
                         return Ok(());
                     }
-                    job.preparing_models(1);
-                    let model = image_embedder.prepare_with_progress(job.as_ref())?;
-                    job.models_loaded(1);
+                    let model = models.image.prepare(job.as_ref())?;
                     job.check_cancelled()?;
                     image_embeddings::run(
                         spec,
@@ -282,7 +242,7 @@ impl JobManager {
                     &databases.assets,
                     &databases.ocr,
                     &databases.images,
-                    image_embedder.dimensions(),
+                    models.image.dimensions(),
                     &thumbnails,
                     job.as_ref(),
                 ),
@@ -291,13 +251,10 @@ impl JobManager {
                     &databases.assets,
                     &databases.ocr,
                     &databases.images,
-                    image_embedder.dimensions(),
+                    models.image.dimensions(),
                     &thumbnails,
                     job.as_ref(),
                 ),
-                JobSpec::OcrModelLoad(_) => {
-                    unreachable!("handled before the blocking job boundary")
-                }
             })();
             manager.maintain_databases();
             result
@@ -315,7 +272,7 @@ impl JobManager {
             let mut ocr = nicegal_core::db::DB::new(&self.databases.ocr)?;
             let mut images = nicegal_core::image_index::ImageIndexDb::new(
                 &self.databases.images,
-                self.image_embedder.dimensions(),
+                self.models.image.dimensions(),
             )?;
             let ocr_deleted = ocr.prune_orphans(&self.databases.assets)?;
             let image_deleted = images.prune_orphans(&self.databases.assets)?;
@@ -341,18 +298,18 @@ impl JobManager {
         }
     }
 
+    /// Explicit setup: download and build every search model once, proving each one works.
+    /// Indexing models share their files and are built by the first scan with work for them.
     pub(super) fn prepare_job_models(&self, job: &Job) -> anyhow::Result<()> {
-        let needs_image_text = self.image_embedder.model().supports_text_queries();
-        job.preparing_models(2 + u64::from(needs_image_text));
-        self.embedder.prepare_with_progress(job)?;
-        job.models_loaded(1);
+        let models = &self.models;
+        let needs_image_text = models.image.model().supports_text_queries();
+        job.expect_models(2 + u64::from(needs_image_text));
+        models.text_query.prepare(job)?;
         job.check_cancelled()?;
-        self.image_embedder.prepare_with_progress(job)?;
-        job.models_loaded(1);
+        models.image.prepare(job)?;
         job.check_cancelled()?;
         if needs_image_text {
-            self.image_query_embedder.prepare_with_progress(job)?;
-            job.models_loaded(1);
+            models.image_query.prepare(job)?;
         }
         job.check_cancelled()
     }

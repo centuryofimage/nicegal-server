@@ -24,7 +24,7 @@ use nicegal_core::scope::PathScope;
 use serde::{Deserialize, Serialize};
 
 use super::error::ApiError;
-use super::external_image::{self, ExternalImageRequest};
+use super::external_image::{self, ExternalImageRequest, ExternalVectors};
 use super::extract::{ApiJson, ApiQuery};
 use super::{AppState, libraries, run_cancellable_with as run_search};
 
@@ -432,7 +432,7 @@ async fn search(
         queries: vec![plan],
         fusion: None,
     };
-    let session = super::search_sessions::begin(&headers)?;
+    let session = state.search_sessions.begin(&headers)?;
     let response = run_search(session.cancellation.clone(), move |cancellation| {
         execute_search(state, batch, cancellation, false)
     })
@@ -459,7 +459,7 @@ async fn multi_search(
     ApiJson(request): ApiJson<MultiSearchRequest>,
 ) -> Result<Json<MultiSearchResponse>, ApiError> {
     let plan = plan_multi_search(request)?;
-    let session = super::search_sessions::begin(&headers)?;
+    let session = state.search_sessions.begin(&headers)?;
     run_search(session.cancellation.clone(), move |cancellation| {
         execute_search(state, plan, cancellation, true)
     })
@@ -581,10 +581,10 @@ fn execute_search(
         fusion,
     } = plan;
     let databases = state.databases;
-    let embedder = state.embedder;
-    let image_query_embedder = state.image_query_embedder;
+    let models = state.models;
+    let embedder = &models.text_query;
+    let image_query_embedder = &models.image_query;
     let image_dimensions = image_query_embedder.dimensions();
-    let image_embedder = state.image_embedder;
     // Resolve the library before preparing embeddings. A library with nothing indexed yet still
     // produces an empty result set through the read-only stores.
     let mut scope = libraries::scope(&databases, library_id)?;
@@ -602,7 +602,7 @@ fn execute_search(
             .iter()
             .any(|plan| matches!(plan.input, QueryInput::Ocr(_)))
     {
-        let db = databases.open_ocr_read_only()?;
+        let mut db = databases.open_ocr_read_only()?;
         db.set_search_cancellation(&cancellation)?;
         Some(db)
     } else {
@@ -613,7 +613,7 @@ fn execute_search(
         .iter()
         .any(|plan| matches!(plan.input, QueryInput::Image(_)));
     let images = if has_image_queries {
-        let images = databases.open_images_read_only(image_dimensions)?;
+        let mut images = databases.open_images_read_only(image_dimensions)?;
         images.set_search_cancellation(&cancellation)?;
         Some(images)
     } else {
@@ -623,7 +623,7 @@ fn execute_search(
         .iter()
         .any(|plan| matches!(plan.input, QueryInput::File { .. }))
     {
-        let catalog = databases.open_assets_read_only()?;
+        let mut catalog = databases.open_assets_read_only()?;
         catalog.set_search_cancellation(&cancellation)?;
         Some(catalog)
     } else {
@@ -648,15 +648,15 @@ fn execute_search(
                 kind: OcrQueryKind::Vector,
                 text,
             }) if !ocr_embeddings.contains_key(text.as_str()) => {
-                ocr_embeddings.insert(text, embedder.ready_or_cached()?.embed_query(text)?);
+                ocr_embeddings.insert(text, embedder.session()?.embed_query(text)?);
             }
             _ => {}
         }
     }
     let mut image_vectors: HashMap<&str, Vec<f32>> = HashMap::new();
     if let Some(snapshot) = image_snapshot.as_ref() {
-        let mut resolver = ImageQueryResolver::new(&image_query_embedder, snapshot);
-        resolver.image_embedder = Some(&image_embedder);
+        let mut resolver = ImageQueryResolver::new(image_query_embedder, snapshot);
+        resolver.external = Some((&models.image, &state.external_vectors));
         for plan in &plans {
             if let QueryInput::Image(query) = &plan.input {
                 image_vectors.insert(plan.key.as_str(), resolver.resolve(query, &cancellation)?);
@@ -984,13 +984,13 @@ pub(super) fn resolve_image_query(
     else {
         unreachable!("an image plan builds an image query");
     };
-    let images = state
+    let mut images = state
         .databases
-        .open_images_read_only(state.image_query_embedder.dimensions())?;
+        .open_images_read_only(state.models.image_query.dimensions())?;
     images.set_search_cancellation(cancellation)?;
     let snapshot = images.begin_read_snapshot()?;
-    let mut resolver = ImageQueryResolver::new(&state.image_query_embedder, &snapshot);
-    resolver.image_embedder = Some(&state.image_embedder);
+    let mut resolver = ImageQueryResolver::new(&state.models.image_query, &snapshot);
+    resolver.external = Some((&state.models.image, &state.external_vectors));
     resolver.resolve(&query, cancellation)
 }
 
@@ -998,7 +998,8 @@ pub(super) fn resolve_image_query(
 /// identical text and asset IDs. A resolver belongs to one request and one image-model connection;
 /// its cache is deliberately short-lived so index updates are visible to the next request.
 struct ImageQueryResolver<'a> {
-    image_embedder: Option<&'a super::models::ImageModel>,
+    /// The image tower and its vector cache, for components that are external images.
+    external: Option<(&'a super::models::ImageModel, &'a ExternalVectors)>,
     external_vector: Vec<f32>,
     embedder: &'a super::models::ImageQueryModel,
     images: &'a ImageIndexDb,
@@ -1010,7 +1011,7 @@ impl<'a> ImageQueryResolver<'a> {
     fn new(embedder: &'a super::models::ImageQueryModel, images: &'a ImageIndexDb) -> Self {
         Self {
             embedder,
-            image_embedder: None,
+            external: None,
             external_vector: Vec::new(),
             images,
             text_vectors: HashMap::new(),
@@ -1046,16 +1047,16 @@ impl<'a> ImageQueryResolver<'a> {
     fn component_vector(&mut self, source: &ImageQuerySource) -> Result<&[f32], ApiError> {
         match source {
             ImageQuerySource::ExternalImage(bytes) => {
-                let model = self
-                    .image_embedder
-                    .expect("POST image resolver has an image model")
-                    .ready_or_cached()?;
+                let (model, vectors) = self
+                    .external
+                    .expect("POST image resolver has an image model");
+                let model = model.session()?;
                 if model.model() != self.embedder.model() {
                     return Err(ApiError::bad_request(
                         "external image model is incompatible with the active search model",
                     ));
                 }
-                self.external_vector = external_image::embed(bytes, &model)?;
+                self.external_vector = vectors.embed(bytes, &model)?;
                 Ok(&self.external_vector)
             }
             ImageQuerySource::Text(text) => {
@@ -1065,10 +1066,8 @@ impl<'a> ImageQueryResolver<'a> {
                     ));
                 }
                 if !self.text_vectors.contains_key(text) {
-                    self.text_vectors.insert(
-                        text.clone(),
-                        self.embedder.ready_or_cached()?.embed_query(text)?,
-                    );
+                    self.text_vectors
+                        .insert(text.clone(), self.embedder.session()?.embed_query(text)?);
                 }
                 Ok(self
                     .text_vectors
@@ -1531,11 +1530,14 @@ mod tests {
         let catalog = camino::Utf8PathBuf::try_from(temp.path().join("assets.db")).unwrap();
         drop(nicegal_core::assets::AssetCatalog::new(&catalog).unwrap());
         let images = ImageIndexDb::new_read_only(&path, 768, &catalog).unwrap();
-        let query_model =
-            super::super::models::ImageQueryModel::deferred(ImageQueryEmbedderOptions {
+        let query_model = super::super::models::ImageQueryModel::new(
+            ImageQueryEmbedderOptions {
                 model: ImageEmbeddingModel::DinoV3B16,
                 ..Default::default()
-            });
+            },
+            "Image description model",
+            super::super::model_idle::Residency::Interactive,
+        );
         let mut resolver = ImageQueryResolver::new(&query_model, &images);
         let error = resolver
             .resolve(

@@ -1,17 +1,20 @@
 //! Ordering belongs to the search service, independently of HTTP or Electron delivery order.
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::sync::Arc;
 use std::time::Instant;
 
+use axum::extract::State;
 use axum::{Json, http::HeaderMap};
 use nicegal_core::cancellation::SearchCancellation;
 use parking_lot::Mutex;
 use serde::Deserialize;
 
 use super::ttl_map::{Retained, TtlMap};
-use super::{error::ApiError, extract::ApiJson, identifier::validate_identifier};
+use super::{AppState, error::ApiError, extract::ApiJson, identifier::validate_identifier};
 
-static SESSIONS: LazyLock<Mutex<TtlMap<Session>>> = LazyLock::new(Mutex::default);
+/// Each search client's newest generation and in-flight lanes.
+#[derive(Clone, Default)]
+pub(crate) struct SearchSessions(Arc<Mutex<TtlMap<Session>>>);
 const MAX_CLIENT_LEN: usize = 128;
 
 struct Session {
@@ -44,14 +47,14 @@ impl Session {
 
 pub(super) struct SearchLease {
     pub(super) cancellation: SearchCancellation,
-    key: Option<(String, String, u64)>,
+    key: Option<(SearchSessions, String, String, u64)>,
 }
 
 impl Drop for SearchLease {
     fn drop(&mut self) {
         self.cancellation.cancel();
-        if let Some((client, lane, request)) = &self.key {
-            let mut sessions = SESSIONS.lock();
+        if let Some((sessions, client, lane, request)) = &self.key {
+            let mut sessions = sessions.0.lock();
             if let Some(session) = sessions.get_mut(client) {
                 if session.lanes.get(lane).is_some_and(|(id, _)| id == request) {
                     session.lanes.remove(lane);
@@ -94,52 +97,66 @@ fn session<'a>(
     }))
 }
 
-pub(super) fn begin(headers: &HeaderMap) -> Result<SearchLease, ApiError> {
-    let client = header(headers, "x-nicegal-search-client")?;
-    let generation = header(headers, "x-nicegal-search-generation")?;
-    let lane = header(headers, "x-nicegal-search-lane")?;
-    let cancellation = SearchCancellation::default();
-    if client.is_none() && generation.is_none() && lane.is_none() {
-        return Ok(SearchLease {
+impl SearchSessions {
+    pub(super) fn begin(&self, headers: &HeaderMap) -> Result<SearchLease, ApiError> {
+        let client = header(headers, "x-nicegal-search-client")?;
+        let generation = header(headers, "x-nicegal-search-generation")?;
+        let lane = header(headers, "x-nicegal-search-lane")?;
+        let cancellation = SearchCancellation::default();
+        if client.is_none() && generation.is_none() && lane.is_none() {
+            return Ok(SearchLease {
+                cancellation,
+                key: None,
+            });
+        }
+        let (Some(client), Some(generation), Some(lane)) = (client, generation, lane) else {
+            return Err(ApiError::bad_request(
+                "search client, generation and lane must be supplied together",
+            ));
+        };
+        validate_client(client)?;
+        let generation = generation
+            .parse::<u64>()
+            .map_err(|_| ApiError::bad_request("invalid search generation"))?;
+        if !matches!(lane, "literal" | "files" | "meaning" | "visual") {
+            return Err(ApiError::bad_request("invalid search lane"));
+        }
+        let mut sessions = self.0.lock();
+        let session = session(&mut sessions, client)?;
+        if generation < session.generation || (generation == session.generation && session.closed) {
+            return Err(ApiError::search_superseded());
+        }
+        if generation > session.generation {
+            session.cancel();
+            session.generation = generation;
+            session.closed = false;
+        }
+        session.next_request += 1;
+        let request = session.next_request;
+        if let Some((_, previous)) = session
+            .lanes
+            .insert(lane.to_owned(), (request, cancellation.clone()))
+        {
+            previous.cancel();
+        }
+        session.touched = Instant::now();
+        Ok(SearchLease {
             cancellation,
-            key: None,
-        });
+            key: Some((self.clone(), client.to_owned(), lane.to_owned(), request)),
+        })
     }
-    let (Some(client), Some(generation), Some(lane)) = (client, generation, lane) else {
-        return Err(ApiError::bad_request(
-            "search client, generation and lane must be supplied together",
-        ));
-    };
-    validate_client(client)?;
-    let generation = generation
-        .parse::<u64>()
-        .map_err(|_| ApiError::bad_request("invalid search generation"))?;
-    if !matches!(lane, "literal" | "files" | "meaning" | "visual") {
-        return Err(ApiError::bad_request("invalid search lane"));
+
+    fn cancel(&self, request: CancelRequest) -> Result<(), ApiError> {
+        validate_client(&request.client)?;
+        let mut sessions = self.0.lock();
+        let session = session(&mut sessions, &request.client)?;
+        if session.generation <= request.through_generation {
+            session.cancel();
+            session.generation = request.through_generation;
+        }
+        session.touched = Instant::now();
+        Ok(())
     }
-    let mut sessions = SESSIONS.lock();
-    let session = session(&mut sessions, client)?;
-    if generation < session.generation || (generation == session.generation && session.closed) {
-        return Err(ApiError::search_superseded());
-    }
-    if generation > session.generation {
-        session.cancel();
-        session.generation = generation;
-        session.closed = false;
-    }
-    session.next_request += 1;
-    let request = session.next_request;
-    if let Some((_, previous)) = session
-        .lanes
-        .insert(lane.to_owned(), (request, cancellation.clone()))
-    {
-        previous.cancel();
-    }
-    session.touched = Instant::now();
-    Ok(SearchLease {
-        cancellation,
-        key: Some((client.to_owned(), lane.to_owned(), request)),
-    })
 }
 
 #[derive(Deserialize)]
@@ -149,15 +166,11 @@ pub(super) struct CancelRequest {
     through_generation: u64,
 }
 
-pub(super) async fn cancel(ApiJson(request): ApiJson<CancelRequest>) -> Result<Json<()>, ApiError> {
-    validate_client(&request.client)?;
-    let mut sessions = SESSIONS.lock();
-    let session = session(&mut sessions, &request.client)?;
-    if session.generation <= request.through_generation {
-        session.cancel();
-        session.generation = request.through_generation;
-    }
-    session.touched = Instant::now();
+pub(super) async fn cancel(
+    State(state): State<AppState>,
+    ApiJson(request): ApiJson<CancelRequest>,
+) -> Result<Json<()>, ApiError> {
+    state.search_sessions.cancel(request)?;
     Ok(Json(()))
 }
 
@@ -176,51 +189,56 @@ mod tests {
         headers
     }
 
-    async fn cancel_through(client: &str, generation: u64) {
-        let _ = cancel(ApiJson(CancelRequest {
-            client: client.into(),
-            through_generation: generation,
-        }))
-        .await
-        .unwrap();
+    fn cancel_through(sessions: &SearchSessions, client: &str, generation: u64) {
+        sessions
+            .cancel(CancelRequest {
+                client: client.into(),
+                through_generation: generation,
+            })
+            .unwrap();
     }
 
-    #[tokio::test]
-    async fn delayed_cancellation_and_requests_cannot_replace_a_newer_search() {
+    #[test]
+    fn delayed_cancellation_and_requests_cannot_replace_a_newer_search() {
+        let sessions = SearchSessions::default();
         let client = "test-search-ordering";
-        let old = begin(&headers(client, 1, "literal")).unwrap();
-        let current = begin(&headers(client, 2, "literal")).unwrap();
+        let old = sessions.begin(&headers(client, 1, "literal")).unwrap();
+        let current = sessions.begin(&headers(client, 2, "literal")).unwrap();
         assert!(old.cancellation.check().is_err());
-        cancel_through(client, 1).await;
-        assert!(begin(&headers(client, 1, "visual")).is_err());
+        cancel_through(&sessions, client, 1);
+        assert!(sessions.begin(&headers(client, 1, "visual")).is_err());
         assert!(current.cancellation.check().is_ok());
-        cancel_through(client, 2).await;
+        cancel_through(&sessions, client, 2);
         assert!(current.cancellation.check().is_err());
-        assert!(begin(&headers(client, 2, "visual")).is_err());
-        assert!(begin(&headers(client, 3, "visual")).is_ok());
+        assert!(sessions.begin(&headers(client, 2, "visual")).is_err());
+        assert!(sessions.begin(&headers(client, 3, "visual")).is_ok());
     }
 
-    #[tokio::test]
-    async fn cancellation_before_request_arrival_is_remembered() {
+    #[test]
+    fn cancellation_before_request_arrival_is_remembered() {
+        let sessions = SearchSessions::default();
         let client = "test-search-cancel-first";
-        cancel_through(client, 8).await;
-        assert!(begin(&headers(client, 7, "files")).is_err());
-        assert!(begin(&headers(client, 8, "files")).is_err());
-        assert!(begin(&headers(client, 9, "files")).is_ok());
+        cancel_through(&sessions, client, 8);
+        assert!(sessions.begin(&headers(client, 7, "files")).is_err());
+        assert!(sessions.begin(&headers(client, 8, "files")).is_err());
+        assert!(sessions.begin(&headers(client, 9, "files")).is_ok());
     }
 
-    #[tokio::test]
-    async fn replacing_a_lane_preserves_other_lanes_and_clients_even_after_old_drop() {
+    #[test]
+    fn replacing_a_lane_preserves_other_lanes_and_clients_even_after_old_drop() {
+        let sessions = SearchSessions::default();
         let client = "test-search-lanes";
-        let old = begin(&headers(client, 1, "literal")).unwrap();
-        let sibling = begin(&headers(client, 1, "visual")).unwrap();
-        let other = begin(&headers("test-search-other-client", 1, "literal")).unwrap();
-        let replacement = begin(&headers(client, 1, "literal")).unwrap();
+        let old = sessions.begin(&headers(client, 1, "literal")).unwrap();
+        let sibling = sessions.begin(&headers(client, 1, "visual")).unwrap();
+        let other = sessions
+            .begin(&headers("test-search-other-client", 1, "literal"))
+            .unwrap();
+        let replacement = sessions.begin(&headers(client, 1, "literal")).unwrap();
         assert!(old.cancellation.check().is_err());
         drop(old);
         assert!(replacement.cancellation.check().is_ok());
         assert!(sibling.cancellation.check().is_ok());
-        cancel_through(client, 1).await;
+        cancel_through(&sessions, client, 1);
         assert!(
             replacement.cancellation.check().is_err(),
             "old lease must not remove its replacement"
@@ -231,12 +249,13 @@ mod tests {
 
     #[test]
     fn invalid_metadata_does_not_cancel_active_work_and_drop_cancels_its_worker() {
+        let sessions = SearchSessions::default();
         let client = "test-search-invalid";
-        let active = begin(&headers(client, 1, "meaning")).unwrap();
-        assert!(begin(&headers(client, 2, "unknown")).is_err());
+        let active = sessions.begin(&headers(client, 1, "meaning")).unwrap();
+        assert!(sessions.begin(&headers(client, 2, "unknown")).is_err());
         let mut incomplete = headers(client, 2, "meaning");
         incomplete.remove("x-nicegal-search-lane");
-        assert!(begin(&incomplete).is_err());
+        assert!(sessions.begin(&incomplete).is_err());
         assert!(active.cancellation.check().is_ok());
         let worker = active.cancellation.clone();
         drop(active);

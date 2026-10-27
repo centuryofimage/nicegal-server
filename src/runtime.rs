@@ -6,8 +6,10 @@
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::path::Path;
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result, anyhow, bail};
+use ort::environment::Environment;
 use ort::ep::{CPU, ExecutionProviderDispatch};
 use ort::session::Session;
 use ort::session::builder::GraphOptimizationLevel;
@@ -102,7 +104,7 @@ impl RuntimeOptions {
 /// recorder is not thread-safe: two sessions building or running at once can corrupt the D3D12
 /// driver's state and crash the process. The GPU work goes through that one queue in order anyway,
 /// so holding this lock loses no device concurrency.
-static DIRECTML_SESSIONS: parking_lot::Mutex<()> = parking_lot::const_mutex(());
+static DIRECTML_SESSIONS: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 /// Run `work`, which builds or runs `execution_provider` sessions, exclusively with every other
 /// DirectML session in the process. Other providers run without the lock. `work` must not call
@@ -174,11 +176,26 @@ pub struct LoadedSessions<const N: usize> {
 /// `ort` binds its library process-wide, so executable applications must call this once before
 /// constructing a [`Session`] directly or through a library such as FastEmbed.
 pub fn initialize_from_dylib(path: &Path) -> Result<()> {
-    ort::init_from(path)
+    let environment = ort::init_from(path)
         .map_err(|error| anyhow!("{error}"))
         .with_context(|| format!("loading ONNX Runtime from {}", path.display()))?
-        .commit();
-    Ok(())
+        .build()
+        .context("creating the ONNX Runtime environment")?;
+    ENVIRONMENT
+        .set(environment)
+        .map_err(|_| anyhow!("ONNX Runtime is already initialized"))
+}
+
+/// `ort` keeps its environment alive only while something holds it, and allows one per process.
+static ENVIRONMENT: OnceLock<Environment> = OnceLock::new();
+
+/// The process-wide ONNX Runtime environment that every session, including FastEmbed's, is
+/// built in.
+pub(crate) fn environment() -> Result<Environment> {
+    ENVIRONMENT
+        .get()
+        .cloned()
+        .context("ONNX Runtime is not initialized")
 }
 
 /// Select the bundled ONNX Runtime distribution next to the current executable.
@@ -261,7 +278,7 @@ pub fn initialize_bundled_runtime(execution_provider: ExecutionProvider) -> Resu
     initialize_from_dylib(&dylib)?;
     #[cfg(feature = "ort-webgpu")]
     if execution_provider == ExecutionProvider::Webgpu {
-        ort::environment::Environment::current()?
+        environment()?
             .register_ep_library(
                 "webgpu",
                 directory.join("onnxruntime/webgpu/libonnxruntime_providers_webgpu.so"),
@@ -436,7 +453,8 @@ fn compile_session(
 ) -> Result<Session> {
     let provider = configure_provider(execution_provider, intra_threads)?;
 
-    let mut builder = Session::builder()?
+    let environment = environment()?;
+    let mut builder = Session::builder(&environment)?
         .with_intra_threads(provider.intra_threads.get())
         .map_err(builder_error)?
         .with_parallel_execution(false)
@@ -457,7 +475,6 @@ fn compile_session(
             .map_err(builder_error)?;
     }
     let mut builder = if execution_provider == ExecutionProvider::Webgpu {
-        let environment = ort::environment::Environment::current()?;
         let device = environment
             .devices()
             .find(|device| {
@@ -504,7 +521,7 @@ fn openvino_provider(intra_threads: NonZeroUsize) -> Result<ConfiguredProvider> 
     let provider = OpenVINO::default()
         .with_num_threads(intra_threads.get())
         .with_dynamic_shapes(true);
-    ensure_available(&provider, ExecutionProvider::OpenVino)?;
+    ensure_available::<OpenVINO>(ExecutionProvider::OpenVino)?;
     Ok(ConfiguredProvider {
         dispatch: provider.build().error_on_failure(),
         intra_threads: NonZeroUsize::MIN,
@@ -516,7 +533,7 @@ fn directml_provider(intra_threads: NonZeroUsize) -> Result<ConfiguredProvider> 
     use ort::ep::DirectML;
 
     let provider = DirectML::default();
-    ensure_available(&provider, ExecutionProvider::Directml)?;
+    ensure_available::<DirectML>(ExecutionProvider::Directml)?;
     Ok(ConfiguredProvider {
         dispatch: provider.build().error_on_failure(),
         // Unlike OpenVINO, DirectML has no thread-pool knob of its own: it offloads to the GPU,
@@ -531,7 +548,7 @@ fn cuda_provider(intra_threads: NonZeroUsize) -> Result<ConfiguredProvider> {
     use ort::ep::CUDA;
 
     let provider = CUDA::default();
-    ensure_available(&provider, ExecutionProvider::Cuda)?;
+    ensure_available::<CUDA>(ExecutionProvider::Cuda)?;
     Ok(ConfiguredProvider {
         dispatch: provider.build().error_on_failure(),
         intra_threads,
@@ -543,7 +560,7 @@ fn coreml_provider(intra_threads: NonZeroUsize) -> Result<ConfiguredProvider> {
     use ort::ep::CoreML;
 
     let provider = CoreML::default();
-    ensure_available(&provider, ExecutionProvider::CoreML)?;
+    ensure_available::<CoreML>(ExecutionProvider::CoreML)?;
     Ok(ConfiguredProvider {
         dispatch: provider.build().error_on_failure(),
         intra_threads,
@@ -578,12 +595,8 @@ fn provider_unavailable(
     feature = "ort-cuda",
     feature = "ort-coreml"
 ))]
-fn ensure_available(
-    provider: &impl ort::ep::ExecutionProvider,
-    name: ExecutionProvider,
-) -> Result<()> {
-    let available = provider
-        .is_available()
+fn ensure_available<P: ort::ep::ExecutionProvider>(name: ExecutionProvider) -> Result<()> {
+    let available = P::is_available()
         .map_err(|error| anyhow!("{error}"))
         .with_context(|| format!("checking {name} execution provider availability"))?;
     if !available {

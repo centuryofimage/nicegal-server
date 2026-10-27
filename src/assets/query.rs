@@ -142,6 +142,7 @@ impl AssetCatalog {
     }
 
     /// Every asset in `scope`, in asset ID order.
+    #[tracing::instrument(level = "info", skip_all, fields(assets = tracing::field::Empty))]
     pub fn in_scope(&self, scope: &PathScope) -> Result<Vec<Asset>> {
         let scope = scope.bind("path");
         let mut statement = self.conn.prepare_cached(&format!(
@@ -151,8 +152,11 @@ impl AssetCatalog {
         ))?;
         let rows =
             statement.query_and_then(bind_named(&scope.params).as_slice(), asset_from_row)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .context("listing assets in scope")
+        let assets = rows
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("listing assets in scope")?;
+        tracing::Span::current().record("assets", assets.len());
+        Ok(assets)
     }
 
     /// Every asset in `scope`, newest first on `timeline`. Scope membership is a literal path

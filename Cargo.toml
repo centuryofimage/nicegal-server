@@ -28,8 +28,8 @@ ort-coreml = ["ort/coreml"]
 anyhow = "1.0.104"
 camino = "1.2.5"
 crossbeam-channel = "0.5.16"
-ffmpeg-the-third = { path = "vendor/ffmpeg-the-third", version = "6.0.0", default-features = false, features = ["format", "filter", "software-scaling", "static"] }
-fastembed = { path = "vendor/fastembed", version = "7.1.0", default-features = false, features = ["hf-hub-native-tls", "image-models"] }
+ffmpeg-the-third = { git = "https://github.com/centuryofimage/ffmpeg-the-third.git", rev = "6d26a05f1cdc3caa08c07d2d086ce3104d0fbdeb", version = "6.0.0", default-features = false, features = ["format", "filter", "software-scaling", "static"] }
+fastembed = { path = "vendor/fastembed", version = "7.5.0", default-features = false, features = ["hf-hub-native-tls", "image-models"] }
 fast_image_resize = { version = "6.1.0", default-features = false, features = ["std"] }
 gif = { version = "0.14.2", default-features = false, features = ["std"] }
 glob = "0.3.4"
@@ -42,17 +42,17 @@ itertools = "0.15.0"
 libc = "0.2"
 memmap2 = "0.9.11"
 kdam = { version = "0.6.4", features = ["rayon"] }
-turbojpeg = { path = "vendor/turbojpeg", version = "1.5.1", default-features = false, features = ["cmake", "require-simd"] }
+turbojpeg = { git = "https://github.com/centuryofimage/rust-turbojpeg.git", rev = "74ca9a0760bceb26c5d1f950b021094b828340ed", version = "1.5.1", default-features = false, features = ["cmake", "require-simd"] }
 ndarray = { version = "0.17.2", default-features = false }
 nom-exif = "3.7.0"
 nvtx = { version = "2.0.0", default-features = false, features = ["tracing"], optional = true }
-ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "tracing", "load-dynamic", "api-23"] }
-parking_lot = "0.12.4"
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "ndarray", "tracing", "load-dynamic", "api-23"] }
+parking_lot = "0.13.0"
 png = "0.18.1"
 rayon = "1.12.0"
 regex = { version = "1.13.1", optional = true }
 safetensors = "0.8.0"
-rusqlite = { version = "0.40.2", features = ["bundled", "hooks", "functions"] }
+rusqlite = { version = "0.41.0", features = ["bundled", "hooks", "functions"] }
 sqlite-vec = "0.1.9"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
@@ -67,13 +67,11 @@ yaml_serde = "0.10.7"
 [workspace]
 members = [".", "nicegal-cli", "nicegal-server"]
 default-members = [".", "nicegal-cli", "nicegal-server"]
-# Upstream checks run in vendor/turbojpeg against its own Cargo.lock.
-exclude = ["vendor/turbojpeg"]
 resolver = "2"
 
 [patch.crates-io]
 hf-hub = { path = "vendor/hf-hub" }
-ffmpeg-sys-the-third = { path = "vendor/ffmpeg-the-third/ffmpeg-sys-the-third" }
+ffmpeg-sys-the-third = { git = "https://github.com/centuryofimage/ffmpeg-the-third.git", rev = "6d26a05f1cdc3caa08c07d2d086ce3104d0fbdeb" }
 
 [profile.release]
 debug = 1     # for perf analysis

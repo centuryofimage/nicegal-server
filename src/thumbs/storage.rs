@@ -553,7 +553,7 @@ impl ThumbnailDb {
         Ok(deleted)
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "info", skip(self))]
     pub fn prune_orphans(&self, catalog: &Path) -> Result<usize> {
         self.conn
             .execute(
@@ -598,7 +598,7 @@ impl ThumbnailDb {
         Ok(result? + video_result?)
     }
 
-    #[tracing::instrument(level = "debug", skip(self))]
+    #[tracing::instrument(level = "info", skip(self))]
     pub fn maintain(&self) -> Result<()> {
         maintain(&self.conn).context("maintaining thumbnail database")
     }

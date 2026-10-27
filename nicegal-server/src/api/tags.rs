@@ -91,7 +91,7 @@ async fn tags(
     ApiQuery(request): ApiQuery<TagsRequest>,
 ) -> Result<Json<TagsResponse>, ApiError> {
     run_blocking(move || {
-        let model = state.image_query_embedder.model();
+        let model = state.models.image_query.model();
         if !TagSet::supports(model) {
             return Ok(Json(TagsResponse {
                 model: model.id(),

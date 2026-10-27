@@ -3,9 +3,7 @@ use serde::Deserialize;
 
 use super::job::JobKind;
 use crate::api::error::ApiError;
-use crate::api::{
-    image_embeddings, library_scan, ocr_models, prune_jobs, text_embeddings, thumbnails,
-};
+use crate::api::{image_embeddings, library_scan, prune_jobs, text_embeddings, thumbnails};
 
 #[derive(Debug, Deserialize)]
 #[serde(
@@ -16,7 +14,6 @@ use crate::api::{
 )]
 pub(super) enum JobRequest {
     ModelPrepare(EmptyParams),
-    OcrModelLoad(ocr_models::job::Request),
     LibraryScan(library_scan::Request),
     ThumbnailGenerate(thumbnails::job::Request),
     TextEmbed(text_embeddings::job::Request),
@@ -31,7 +28,6 @@ pub(super) struct EmptyParams {}
 
 pub(in crate::api) enum JobSpec {
     ModelPrepare,
-    OcrModelLoad(ocr_models::job::Spec),
     LibraryScan(library_scan::Spec),
     ThumbnailGenerate(thumbnails::job::Spec),
     TextEmbed(text_embeddings::job::Spec),
@@ -44,9 +40,6 @@ impl JobRequest {
     pub(super) fn prepare(self) -> Result<JobSpec, ApiError> {
         match self {
             Self::ModelPrepare(_) => Ok(JobSpec::ModelPrepare),
-            Self::OcrModelLoad(request) => {
-                Ok(JobSpec::OcrModelLoad(ocr_models::job::prepare(request)?))
-            }
             Self::LibraryScan(request) => Ok(JobSpec::LibraryScan(library_scan::prepare(request)?)),
             Self::ThumbnailGenerate(request) => Ok(JobSpec::ThumbnailGenerate(
                 thumbnails::job::prepare(request)?,
@@ -75,7 +68,7 @@ impl JobSpec {
             Self::ImageEmbed(spec) => spec.library_id(),
             Self::PruneMissing(spec) => Some(spec.library_id()),
             Self::LibraryPurge(spec) => Some(spec.library_id()),
-            Self::ModelPrepare | Self::OcrModelLoad(_) => None,
+            Self::ModelPrepare => None,
         }
     }
 
@@ -87,7 +80,6 @@ impl JobSpec {
     pub(super) fn kind(&self) -> JobKind {
         match self {
             Self::ModelPrepare => JobKind::ModelPrepare,
-            Self::OcrModelLoad(_) => JobKind::OcrModelLoad,
             Self::LibraryScan(_) => JobKind::LibraryScan,
             Self::ThumbnailGenerate(_) => JobKind::ThumbnailGenerate,
             Self::TextEmbed(_) => JobKind::TextEmbed,

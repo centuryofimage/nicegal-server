@@ -9,6 +9,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::{MethodRouter, get, post};
 use nicegal_core::db::{SearchFilters, TextEmbeddingSpace};
+use nicegal_core::embedding::TextEmbedder;
 use serde::{Deserialize, Serialize};
 
 use super::error::ApiError;
@@ -75,8 +76,8 @@ async fn status(
 ) -> Result<Json<StatusResponse>, ApiError> {
     let databases = state.databases;
     let embedder = EmbedderResponse {
-        model: state.embedder.model().id().to_owned(),
-        dimensions: state.embedder.dimensions(),
+        model: TextEmbedder::MODEL_ID.to_owned(),
+        dimensions: TextEmbedder::DIMENSIONS,
     };
 
     run_blocking(move || {

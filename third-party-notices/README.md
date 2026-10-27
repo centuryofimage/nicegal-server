@@ -11,10 +11,11 @@ packages on September 13, 2026, matching the pinned requirements:
   from the `openvino==2025.4.1` wheel.
 - `onnxruntime-1.30.0`: Linux wheel's `onnxruntime/LICENSE` and
   `ThirdPartyNotices.txt` from the native WebGPU test environment.
-- `onnxruntime-ep-webgpu-0.3.0`: `LICENSE` and `ThirdPartyNotices.txt` from
-  the Linux plugin wheel's `.dist-info/licenses` directory.
+- `onnxruntime-ep-webgpu-0.4.0`: `LICENSE` and `ThirdPartyNotices.txt` from
+  the Linux plugin wheel's `.dist-info/licenses` directory (copied October 26, 2026).
 - `libjpeg-turbo-3.1.0`: `LICENSE.md` and `README.ijg` from the libjpeg-turbo 3.1.0 source
-  that `turbojpeg-sys` builds on every platform (`vendor/turbojpeg/turbojpeg-sys/libjpeg-turbo`).
+  that `turbojpeg-sys` builds on every platform (`turbojpeg-sys/libjpeg-turbo` in the
+  `centuryofimage/rust-turbojpeg` fork that `Cargo.toml` pins by commit).
 
 The collector reads these snapshots so building the notices document does not need
 runtime installations. On runtime upgrades, copy the corresponding upstream text

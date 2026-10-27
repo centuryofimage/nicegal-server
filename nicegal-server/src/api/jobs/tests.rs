@@ -9,40 +9,30 @@ use nicegal_core::thumbs::ThumbnailService;
 use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::WatchStream;
 
-use crate::api::models::{ImageModel as ImageEmbedder, ImageQueryModel, TextModel as TextEmbedder};
-use crate::api::{Databases, ocr_models};
+use crate::api::Databases;
+use crate::api::model_slot::PrepareObserver;
+use crate::api::models::Models;
 
 use super::job::*;
 use super::manager::*;
 use super::request::*;
 use super::routes::*;
 
-#[tokio::test]
-async fn cancelled_ocr_load_stops_before_cache_or_network_access() {
+#[test]
+fn cancelled_ocr_load_stops_before_cache_or_network_access() {
     let temporary = tempfile::TempDir::new().unwrap();
     let manager = test_manager(&temporary);
-    let spec = ocr_models::job::prepare(
-        serde_json::from_value(serde_json::json!({
-            "detection": {"modelId": "nonexistent/cancelled-test"},
-            "recognition": {"modelId": "nonexistent/cancelled-test"}
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-    let job = Arc::new(Job::new(1, JobKind::OcrModelLoad));
+    let job = Job::new(1, JobKind::LibraryScan);
     job.begin();
     job.request_cancel();
-    let result = ocr_models::job::run(
-        spec,
-        &manager.ocr_models,
-        &manager.runtime,
-        Arc::clone(&job),
-    )
-    .await;
-    assert!(super::is_cancelled(
-        &result.err().expect("cancelled before loading")
-    ));
-    assert!(!manager.ocr_models.is_loaded());
+    let error = manager
+        .models
+        .ocr
+        .prepare(&job)
+        .err()
+        .expect("cancelled before loading");
+    assert!(super::is_cancelled(&error));
+    assert!(!manager.models.ocr.status().resident);
     assert_eq!(job.response().progress.models_loaded, 0);
 }
 
@@ -70,9 +60,14 @@ fn model_preparation_wire_contract_and_progress() {
     assert!(matches!(spec, JobSpec::ModelPrepare));
     let job = Job::new(1, spec.kind());
     assert!(job.begin());
-    job.preparing_models(3);
-    job.models_loaded(1);
+    job.expect_models(3);
+    job.loading_model("Image model", "test/model");
+    let loading = serde_json::to_value(job.response()).unwrap();
+    assert_eq!(loading["progress"]["loadingModel"]["modelId"], "test/model");
+    assert_eq!(loading["progress"]["loadingModel"]["name"], "Image model");
+    job.model_loaded();
     let response = serde_json::to_value(job.response()).unwrap();
+    assert!(response["progress"].get("loadingModel").is_none());
     assert_eq!(response["type"], "modelPrepare");
     assert_eq!(response["phase"], "loadingModels");
     assert_eq!(response["progress"]["total"], 3);
@@ -88,7 +83,7 @@ fn model_preparation_wire_contract_and_progress() {
 
 #[test]
 fn job_observer_tracks_progress_and_cancellation() {
-    let job = Job::new(7, JobKind::OcrModelLoad);
+    let job = Job::new(7, JobKind::LibraryScan);
     assert!(job.begin());
     job.on_event(IndexEvent::PhaseChanged(IndexPhase::Scanning));
     job.on_event(IndexEvent::Discovered { count: 12 });
@@ -110,7 +105,7 @@ fn job_observer_tracks_progress_and_cancellation() {
 
     let response = job.response();
     assert_eq!(response.job_id, wire_job_id(7));
-    assert_eq!(response.kind, JobKind::OcrModelLoad);
+    assert_eq!(response.kind, JobKind::LibraryScan);
     assert_eq!(response.status, JobStatus::Cancelling);
     assert_eq!(response.phase, JobPhase::Scanning);
     assert_eq!(response.progress.discovered, 12);
@@ -126,11 +121,12 @@ fn job_observer_tracks_progress_and_cancellation() {
 }
 
 #[test]
-fn file_downloads_preserve_model_steps_and_retry_byte_totals() {
+fn file_downloads_preserve_model_steps() {
     let job = Job::new(88, JobKind::ModelPrepare);
     job.begin();
-    job.preparing_models(3);
-    job.models_loaded(1);
+    job.expect_models(3);
+    job.loading_model("test model", "test/model");
+    job.model_loaded();
     let source = ModelSource::local(std::path::Path::new("image.onnx")).unwrap();
     job.progress(&source, 25, 100);
     let response = serde_json::to_value(job.response()).unwrap();
@@ -143,19 +139,9 @@ fn file_downloads_preserve_model_steps_and_retry_byte_totals() {
     assert!(job.response().progress.download.is_none());
     assert_eq!(job.response().progress.phase_completed, 1);
 
-    let ocr = Job::new(89, JobKind::OcrModelLoad);
-    ocr.ocr_download_progress(&source, 50, 100, 0, 0);
-    // Retrying this file replaces its contribution instead of double-counting it.
-    ocr.ocr_download_progress(&source, 0, 100, 50, 100);
-    ocr.ocr_download_progress(&source, 100, 100, 0, 100);
-    // A second file adds to the legacy job totals but has its own current-file counters.
-    ocr.ocr_download_progress(&source, 20, 40, 0, 0);
-    let progress = ocr.response().progress;
-    assert_eq!(progress.downloaded_bytes, 120);
-    assert_eq!(progress.download_total_bytes, 140);
-    assert_eq!(progress.download.unwrap().downloaded_bytes, 20);
-    ocr.fail("network error");
-    assert!(ocr.response().progress.download.is_none());
+    job.progress(&source, 50, 100);
+    job.fail("network error");
+    assert!(job.response().progress.download.is_none());
 }
 
 #[test]
@@ -365,17 +351,7 @@ fn job_identifiers_belong_to_this_backend_instance() {
 
 #[test]
 fn typed_job_envelope_rejects_unknown_fields() {
-    let valid = serde_json::json!({
-        "type": "ocrModelLoad",
-        "params": {
-            "detection": {
-                "modelId": "PaddlePaddle/PP-OCRv6_small_det_onnx"
-            },
-            "recognition": {
-                "modelId": "PaddlePaddle/PP-OCRv6_small_rec_onnx"
-            }
-        }
-    });
+    let valid = serde_json::json!({ "type": "modelPrepare", "params": {} });
     assert!(serde_json::from_value::<JobRequest>(valid).is_ok());
 
     let library_scan = serde_json::json!({
@@ -383,7 +359,7 @@ fn typed_job_envelope_rejects_unknown_fields() {
         "params": { "libraryId": 1, "pendingOnly": true }
     });
     assert!(serde_json::from_value::<JobRequest>(library_scan).is_ok());
-    for retired in ["libraryIndex", "catalogSync"] {
+    for retired in ["libraryIndex", "catalogSync", "ocrModelLoad"] {
         let request = serde_json::json!({ "type": retired, "params": { "root": "C:/gallery" } });
         assert!(
             serde_json::from_value::<JobRequest>(request).is_err(),
@@ -408,15 +384,8 @@ fn typed_job_envelope_rejects_unknown_fields() {
     assert!(serde_json::from_value::<JobRequest>(library_purge).is_ok());
 
     let unknown = serde_json::json!({
-        "type": "ocrModelLoad",
-        "params": {
-            "detection": {
-                "modelId": "PaddlePaddle/PP-OCRv6_small_det_onnx"
-            },
-            "recognition": {
-                "modelId": "PaddlePaddle/PP-OCRv6_small_rec_onnx"
-            }
-        },
+        "type": "modelPrepare",
+        "params": {},
         "unexpected": true
     });
     assert!(serde_json::from_value::<JobRequest>(unknown).is_err());
@@ -655,13 +624,6 @@ fn test_manager(runtime_config_dir: &tempfile::TempDir) -> Arc<JobManager> {
     crate::api::tests::initialize_test_runtime();
     let current_dir = PathBuf::try_from(runtime_config_dir.path().to_path_buf()).unwrap();
     let thumbnail_path = current_dir.join("unused-thumbnails.db");
-    let runtime = Arc::new(
-        crate::api::RuntimeSettings::load(
-            PathBuf::try_from(runtime_config_dir.path().join("runtime.json")).unwrap(),
-            None,
-        )
-        .unwrap(),
-    );
     Arc::new(JobManager::new(
         Arc::new(Databases {
             assets: current_dir.join("unused-assets.db"),
@@ -670,19 +632,7 @@ fn test_manager(runtime_config_dir: &tempfile::TempDir) -> Arc<JobManager> {
             thumbnails: thumbnail_path.clone(),
         }),
         Arc::new(ThumbnailService::new(&thumbnail_path).unwrap()),
-        Arc::new(TextEmbedder::deferred(
-            nicegal_core::embedding::TextEmbedderOptions::default(),
-        )),
-        Arc::new(ImageEmbedder::deferred(
-            nicegal_core::embedding::ImageEmbedderOptions::default(),
-        )),
-        Arc::new(ImageQueryModel::deferred(
-            nicegal_core::embedding::ImageQueryEmbedderOptions::default(),
-        )),
-        Arc::new(ocr_models::ModelStore::new(
-            nicegal_core::runtime::ExecutionProvider::Cpu,
-        )),
-        runtime,
+        Arc::new(Models::for_tests(true)),
     ))
 }
 
@@ -690,24 +640,11 @@ fn test_manager(runtime_config_dir: &tempfile::TempDir) -> Arc<JobManager> {
 async fn manager_rejects_concurrent_jobs_and_cancels_queued_work() {
     let runtime_config_dir = tempfile::TempDir::new().unwrap();
     let manager = test_manager(&runtime_config_dir);
-    let request: JobRequest = serde_json::from_value(serde_json::json!({
-        "type": "ocrModelLoad",
-        "params": {
-            "detection": { "modelId": "owner/detection" },
-            "recognition": { "modelId": "owner/recognition" }
-        }
-    }))
-    .unwrap();
-    let job = manager.start(request.prepare().unwrap()).unwrap();
+    let job = hold_active_job(&manager, JobKind::ModelPrepare);
 
-    let second: JobRequest = serde_json::from_value(serde_json::json!({
-        "type": "ocrModelLoad",
-        "params": {
-            "detection": { "modelId": "owner/detection" },
-            "recognition": { "modelId": "owner/recognition" }
-        }
-    }))
-    .unwrap();
+    let second: JobRequest =
+        serde_json::from_value(serde_json::json!({ "type": "modelPrepare", "params": {} }))
+            .unwrap();
     assert!(manager.start(second.prepare().unwrap()).is_err());
 
     let scan = |params: serde_json::Value| {
@@ -735,16 +672,8 @@ async fn manager_rejects_concurrent_jobs_and_cancels_queued_work() {
     assert_eq!(replacement.response().status, JobStatus::Queued);
     assert_eq!(manager.registry().queued.len(), 2);
 
-    let mut updates = job.subscribe();
     manager.cancel_all();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !updates.borrow().status.is_terminal() {
-            updates.changed().await.unwrap();
-        }
-    })
-    .await
-    .expect("cancelled job should reach a terminal state");
-    assert_eq!(job.response().status, JobStatus::Cancelled);
+    assert_eq!(job.response().status, JobStatus::Cancelling);
 }
 
 #[test]

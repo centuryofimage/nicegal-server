@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use super::error::{ApiError, ErrorCode};
 use super::extract::ApiJson;
 use super::search::{self, ImageQueryRequest};
-use super::{AppState, patch_cache, run_blocking};
+use super::{AppState, run_blocking};
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -119,7 +119,7 @@ async fn patch_scores(
         ));
     }
     let response = run_blocking(move || {
-        let model = state.image_embedder.ready_or_cached()?;
+        let model = state.models.image.session()?;
         if !model.supports_patch_features() {
             return Err(ApiError::bad_request(format!(
                 "{} does not provide patch features",
@@ -163,8 +163,7 @@ async fn patch_scores(
                     timestamp_ms: target.timestamp_ms,
                     error: ErrorCode::InvalidRequest,
                 });
-            } else if let Some(features) = patch_cache::get(
-                model_id,
+            } else if let Some(features) = state.patch_cache.get(
                 asset_id,
                 target.timestamp_ms,
                 asset.fingerprint,
@@ -217,8 +216,7 @@ async fn patch_scores(
             match model.patch_features_batch(rasters) {
                 Ok(features) => {
                     for ((index, target, asset, _), features) in chunk.iter().zip(features) {
-                        let cached = patch_cache::insert(
-                            model_id,
+                        let cached = state.patch_cache.insert(
                             asset.asset_id,
                             target.timestamp_ms,
                             asset.fingerprint,
@@ -233,7 +231,7 @@ async fn patch_scores(
                     for (index, target, asset, raster) in chunk {
                         results[*index] = Some(match model.patch_features(raster.clone()) {
                             Ok(features) => {
-                                let cached = patch_cache::insert(model_id, asset.asset_id, target.timestamp_ms, asset.fingerprint, features);
+                                let cached = state.patch_cache.insert(asset.asset_id, target.timestamp_ms, asset.fingerprint, features);
                                 score_features(*target, &cached, &query)
                             }
                             Err(error) => {
@@ -262,7 +260,7 @@ async fn patches(
         return Err(ApiError::bad_request("assetId must be greater than zero"));
     }
     let body = run_blocking(move || {
-        let model = state.image_embedder.ready_or_cached()?;
+        let model = state.models.image.session()?;
         if !model.supports_patch_features() {
             return Err(ApiError::bad_request(format!(
                 "{} does not provide patch features",
@@ -284,12 +282,10 @@ async fn patches(
             .image_query
             .map(|query| search::resolve_image_query(&state, query, &SearchCancellation::default()))
             .transpose()?;
-        if let Some(features) = patch_cache::get(
-            model.model().id(),
-            request.asset_id,
-            None,
-            asset.fingerprint,
-        ) {
+        if let Some(features) = state
+            .patch_cache
+            .get(request.asset_id, None, asset.fingerprint)
+        {
             return safetensors(
                 &features,
                 query.as_deref(),
@@ -305,8 +301,7 @@ async fn patches(
             .decode_image(&bytes)
             .with_context(|| format!("decoding {}", asset.path))
             .map_err(ApiError::internal)?;
-        let features = patch_cache::insert(
-            model.model().id(),
+        let features = state.patch_cache.insert(
             request.asset_id,
             None,
             asset.fingerprint,

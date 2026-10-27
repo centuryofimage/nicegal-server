@@ -1,15 +1,15 @@
 //! PaddleOCR text detection and recognition.
 //!
-//! Detector and recognizer models are loaded and run as a pair.
+//! Detector and recognizer models are loaded and run as a pair. There is one pair, PP-OCRv6 small.
 
 use std::num::NonZeroUsize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use ort::session::Session;
 use tracing::{Span, field, info, instrument};
 
-use crate::hub::ModelSource;
+use crate::hub::{DownloadObserver, ModelSource};
 use crate::runtime::{
     ExecutionProvider, LoadedSessions, RuntimeOptions, SessionSpec, load_sessions,
 };
@@ -19,18 +19,69 @@ mod inference;
 use inference::{PaddleOcrConfig, PaddleOcrEngine, PaddleOcrScratch};
 pub use inference::{PaddleOcrOptions, PaddleOcrOutput};
 
-/// The source identity, ONNX graph, and preprocessing configuration for one OCR model.
+/// PP-OCRv6 small: the detector and recognizer every OCR result is recognized with.
+const DETECTION_REPOSITORY: &str = "PaddlePaddle/PP-OCRv6_small_det_onnx";
+const RECOGNITION_REPOSITORY: &str = "PaddlePaddle/PP-OCRv6_small_rec_onnx";
+
+/// The ONNX graph and preprocessing configuration for one OCR model.
 #[derive(Clone, Copy)]
 pub struct OcrModelFiles<'a> {
-    pub source: &'a ModelSource,
     pub model_path: &'a Path,
     pub config_path: &'a Path,
 }
 
+/// [`OcrModelFiles`] with owned paths, as resolved from the Hugging Face cache.
+struct ResolvedFiles {
+    model: PathBuf,
+    config: PathBuf,
+}
+
+impl ResolvedFiles {
+    fn files(&self) -> OcrModelFiles<'_> {
+        OcrModelFiles {
+            model_path: &self.model,
+            config_path: &self.config,
+        }
+    }
+}
+
+/// `repository`'s graph and configuration, downloading missing ones unless `cached_only`; `None`
+/// means one is not cached.
+fn resolve(
+    repository: &str,
+    cached_only: bool,
+    progress: &dyn DownloadObserver,
+) -> Result<Option<ResolvedFiles>> {
+    let source = |filename: &str| ModelSource {
+        model_id: repository.to_owned(),
+        revision: Some("main".to_owned()),
+        filename: filename.to_owned(),
+    };
+    let Some(model) = source("inference.onnx").resolve(cached_only, progress)? else {
+        return Ok(None);
+    };
+    let Some(config) = source("inference.yml").resolve(cached_only, progress)? else {
+        return Ok(None);
+    };
+    Ok(Some(ResolvedFiles { model, config }))
+}
+
+/// Both models' files, see [`resolve`].
+fn resolve_pair(
+    cached_only: bool,
+    progress: &dyn DownloadObserver,
+) -> Result<Option<[ResolvedFiles; 2]>> {
+    let Some(detection) = resolve(DETECTION_REPOSITORY, cached_only, progress)? else {
+        return Ok(None);
+    };
+    let Some(recognition) = resolve(RECOGNITION_REPOSITORY, cached_only, progress)? else {
+        return Ok(None);
+    };
+    Ok(Some([detection, recognition]))
+}
+
 /// The PP-OCRv6 detector and recognizer compiled for one ONNX Runtime execution provider.
 pub struct PaddleOcrModels {
-    detection_source: ModelSource,
-    recognition_source: ModelSource,
     detection: Session,
     recognition: Session,
     config: PaddleOcrConfig,
@@ -38,66 +89,11 @@ pub struct PaddleOcrModels {
     execution_provider: ExecutionProvider,
 }
 
-// Keep the old positional API compatible while both implementations use file descriptors.
-macro_rules! legacy_loaders {
-    () => {
-        #[deprecated(note = "use load_files with OcrModelFiles")]
-        pub fn load(
-            detection_source: ModelSource,
-            detection_path: &Path,
-            detection_config_path: &Path,
-            recognition_source: ModelSource,
-            recognition_path: &Path,
-            recognition_config_path: &Path,
-        ) -> Result<Self> {
-            #[allow(deprecated)]
-            Self::load_with_options(
-                detection_source,
-                detection_path,
-                detection_config_path,
-                recognition_source,
-                recognition_path,
-                recognition_config_path,
-                RuntimeOptions::default(),
-            )
-        }
-
-        #[deprecated(note = "use load_files with OcrModelFiles")]
-        pub fn load_with_options(
-            detection_source: ModelSource,
-            detection_path: &Path,
-            detection_config_path: &Path,
-            recognition_source: ModelSource,
-            recognition_path: &Path,
-            recognition_config_path: &Path,
-            options: RuntimeOptions,
-        ) -> Result<Self> {
-            Self::load_files(
-                OcrModelFiles {
-                    source: &detection_source,
-                    model_path: detection_path,
-                    config_path: detection_config_path,
-                },
-                OcrModelFiles {
-                    source: &recognition_source,
-                    model_path: recognition_path,
-                    config_path: recognition_config_path,
-                },
-                options,
-            )
-        }
-    };
-}
-
 impl PaddleOcrModels {
-    legacy_loaders!();
-
     #[instrument(
         name = "paddle_ocr_load",
         skip_all,
         fields(
-            detection_model = %detection_files.source.model_id,
-            recognition_model = %recognition_files.source.model_id,
             requested_execution_provider = %options.execution_provider,
             execution_provider = field::Empty
         )
@@ -126,22 +122,12 @@ impl PaddleOcrModels {
         info!(execution_provider = %execution_provider, "PaddleOCR models compiled");
 
         Ok(Self {
-            detection_source: detection_files.source.clone(),
-            recognition_source: recognition_files.source.clone(),
             detection,
             recognition,
             config,
             scratch: PaddleOcrScratch::default(),
             execution_provider,
         })
-    }
-
-    pub fn detection_source(&self) -> &ModelSource {
-        &self.detection_source
-    }
-
-    pub fn recognition_source(&self) -> &ModelSource {
-        &self.recognition_source
     }
 
     /// The execution provider successfully configured for both OCR sessions.
@@ -181,7 +167,31 @@ pub struct PaddleOcrPool {
 }
 
 impl PaddleOcrPool {
-    legacy_loaders!();
+    /// The pair's Hugging Face repositories, for display.
+    pub const MODEL_ID: &'static str =
+        "PaddlePaddle/PP-OCRv6_small_det_onnx + PaddlePaddle/PP-OCRv6_small_rec_onnx";
+
+    /// Compile the pair, downloading missing files first.
+    pub fn load(options: RuntimeOptions, progress: &dyn DownloadObserver) -> Result<Self> {
+        let [detection, recognition] =
+            resolve_pair(false, progress)?.context("a download resolves every file")?;
+        Self::load_files(detection.files(), recognition.files(), options)
+    }
+
+    /// Compile the pair from cached files only; `None` means a file is missing.
+    pub fn load_cached(options: RuntimeOptions) -> Result<Option<Self>> {
+        resolve_pair(true, &())?
+            .map(|[detection, recognition]| {
+                Self::load_files(detection.files(), recognition.files(), options)
+            })
+            .transpose()
+    }
+
+    /// Download any missing file without compiling, or with `cached_only` report whether every
+    /// file is cached.
+    pub fn fetch(cached_only: bool, progress: &dyn DownloadObserver) -> Result<bool> {
+        Ok(resolve_pair(cached_only, progress)?.is_some())
+    }
 
     /// Compile the requested number of pairs, reusing their file descriptors.
     /// Every replica after the first is pinned to the provider the first pair obtained,
@@ -216,14 +226,6 @@ impl PaddleOcrPool {
             "PaddleOCR pool ready"
         );
         Ok(Self { replicas })
-    }
-
-    pub fn detection_source(&self) -> &ModelSource {
-        self.first().detection_source()
-    }
-
-    pub fn recognition_source(&self) -> &ModelSource {
-        self.first().recognition_source()
     }
 
     pub fn execution_provider(&self) -> ExecutionProvider {
