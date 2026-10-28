@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fs;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -8,7 +7,7 @@ use camino::{Utf8Path as Path, Utf8PathBuf as PathBuf};
 use super::media::{
     MediaProbe, is_catalog_media, is_catalog_video, metadata_version_for, probe_media,
 };
-use super::{ASSET_COLUMNS, Asset, AssetCatalog, MediaKind, asset_from_row, timestamp_ns};
+use super::{ASSET_COLUMNS, Asset, AssetCatalog, asset_from_row, timestamp_ns};
 use crate::scope::PathScope;
 use crate::storage::bind_named;
 
@@ -30,24 +29,6 @@ impl SourceFingerprint {
                 .context("source modification time exceeds SQLite's integer range")?,
             size: metadata.len(),
         })
-    }
-}
-
-/// Metadata needed to classify a filesystem entry without opening its media bytes.
-pub(crate) struct CatalogScanEntry {
-    fingerprint: SourceFingerprint,
-    source_created_ns: Option<i64>,
-    metadata_version: i32,
-    media_kind: MediaKind,
-}
-
-impl CatalogScanEntry {
-    pub(crate) fn is_current(&self, metadata: &fs::Metadata) -> Result<bool> {
-        Ok(
-            self.fingerprint == SourceFingerprint::from_metadata(metadata)?
-                && self.source_created_ns == timestamp_ns(metadata.created().ok())
-                && self.metadata_version == metadata_version_for(self.media_kind),
-        )
     }
 }
 
@@ -346,50 +327,6 @@ impl AssetCatalog {
         Ok((assets, timings))
     }
 
-    /// Read the small catalog fields needed to classify a directory walk.
-    pub(crate) fn scan_entries_under_root(
-        &self,
-        root: &Path,
-    ) -> Result<HashMap<PathBuf, CatalogScanEntry>> {
-        if !root.is_absolute() {
-            bail!("asset root must be absolute: {root}");
-        }
-        let scope = PathScope::root(root).bind("path");
-        let mut statement = self.conn.prepare_cached(&format!(
-            "SELECT path, source_modified_ns, source_size, source_created_ns, metadata_version, media_kind
-             FROM assets WHERE {}",
-            scope.sql
-        ))?;
-        let rows = statement.query_map(bind_named(&scope.params).as_slice(), |row| {
-            Ok((
-                PathBuf::from(row.get::<_, String>(0)?),
-                CatalogScanEntry {
-                    fingerprint: SourceFingerprint {
-                        modified_ns: row.get(1)?,
-                        size: row.get::<_, i64>(2)?.try_into().map_err(|error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                2,
-                                rusqlite::types::Type::Integer,
-                                Box::new(error),
-                            )
-                        })?,
-                    },
-                    source_created_ns: row.get(3)?,
-                    metadata_version: row.get(4)?,
-                    media_kind: MediaKind::from_db(&row.get::<_, String>(5)?).map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            5,
-                            rusqlite::types::Type::Text,
-                            error.into(),
-                        )
-                    })?,
-                },
-            ))
-        })?;
-        rows.collect::<rusqlite::Result<HashMap<_, _>>>()
-            .context("listing catalog scan entries under root")
-    }
-
     /// Return catalog rows under `root` that were not present in a completed filesystem scan.
     /// The scan set lives only on this connection and never rewrites persistent asset rows.
     pub fn unseen_under_root(
@@ -487,7 +424,6 @@ mod tests {
         videos.push(asset.clone());
         assert_eq!(catalog.all()?, videos);
         assert_eq!(catalog.under_root(&root)?, videos);
-        assert_eq!(catalog.scan_entries_under_root(&root)?.len(), videos.len());
         assert_eq!(
             catalog.count_gallery(&PathScope::root(&root))?,
             videos.len() as i64
@@ -498,15 +434,6 @@ mod tests {
                     .list_gallery(&PathScope::root(&root), timeline)?
                     .len(),
                 videos.len()
-            );
-            assert_eq!(
-                catalog.timeline_range(timeline, None, None)?.len(),
-                videos.len()
-            );
-            assert!(
-                catalog
-                    .timeline_range(timeline, Some(0), Some(20))?
-                    .is_empty()
             );
         }
         Ok(())
@@ -563,9 +490,6 @@ mod tests {
             [video_asset.asset_id],
         )?;
 
-        let entries = catalog.scan_entries_under_root(&root)?;
-        assert!(!entries[&video].is_current(&fs::metadata(&video)?)?);
-        assert!(entries[&image].is_current(&fs::metadata(&image)?)?);
         let refreshed = catalog.upsert(&video, &fs::metadata(&video)?)?;
         assert_eq!((refreshed.width, refreshed.height), (Some(128), Some(96)));
         assert_eq!(refreshed.metadata_version, VIDEO_METADATA_VERSION);

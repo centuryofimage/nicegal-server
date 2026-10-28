@@ -57,7 +57,6 @@ pub(super) enum JobPhase {
     ImageEmbedding,
     TextEmbedding,
     Pruning,
-    Cleanup,
     Finished,
 }
 
@@ -83,6 +82,11 @@ pub(super) struct JobProgress {
     /// The model whose session is being built; absent otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) loading_model: Option<LoadingModel>,
+    /// The phase whose work needs the models being loaded, such as `imageEmbedding`, and that the
+    /// job returns to once they are. Absent outside `loadingModels` and when the job only
+    /// prepares models.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) loading_for: Option<JobPhase>,
     pub(super) models_loaded: usize,
     /// Work per second over the last five seconds, in the unit [`phase_work`] counts.
     pub(super) items_per_second: Option<f64>,
@@ -128,10 +132,14 @@ impl DownloadObserver for Job {
 }
 
 /// The `loadingModels` phase covers exactly the time spent building sessions; a model already in
-/// memory never enters it.
+/// memory never enters it. A load during another phase is a detour: once the model is built, the
+/// job returns to that phase, so a stage sets its phase once whether or not a model loads.
 impl PrepareObserver for Job {
     fn loading_model(&self, name: &'static str, model_id: &'static str) {
         let mut data = self.data();
+        if !matches!(data.phase, JobPhase::Queued | JobPhase::LoadingModels) {
+            data.progress.loading_for = Some(data.phase);
+        }
         set_phase(&mut data, JobPhase::LoadingModels);
         data.progress.loading_model = Some(LoadingModel { name, model_id });
         let next = data.progress.phase_completed + 1;
@@ -143,8 +151,13 @@ impl PrepareObserver for Job {
         let mut data = self.data();
         data.progress.loading_model = None;
         data.progress.models_loaded += 1;
-        data.progress.phase_completed += 1;
-        data.phase_work += 1;
+        match data.progress.loading_for {
+            Some(phase) => set_phase(&mut data, phase),
+            None => {
+                data.progress.phase_completed += 1;
+                data.phase_work += 1;
+            }
+        }
         self.publish(&mut data);
     }
 }
@@ -390,6 +403,7 @@ impl Job {
         data.phase = JobPhase::Finished;
         data.progress.download = None;
         data.progress.loading_model = None;
+        data.progress.loading_for = None;
         self.publish(&mut data);
         info!(progress = ?data.progress, cancelled, "job finished");
     }
@@ -488,6 +502,7 @@ impl Job {
         data.phase = JobPhase::Finished;
         data.progress.download = None;
         data.progress.loading_model = None;
+        data.progress.loading_for = None;
         let message = message.into();
         data.error = Some(message.clone());
         self.publish(&mut data);

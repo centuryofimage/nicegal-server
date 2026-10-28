@@ -98,40 +98,14 @@ impl AssetCatalog {
             .collect())
     }
 
-    pub fn all(&self) -> Result<Vec<Asset>> {
+    #[cfg(test)]
+    pub(crate) fn all(&self) -> Result<Vec<Asset>> {
         let mut statement = self.conn.prepare_cached(&format!(
             "SELECT {ASSET_COLUMNS} FROM assets ORDER BY asset_id"
         ))?;
         let rows = statement.query_and_then([], asset_from_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .context("listing asset catalog")
-    }
-
-    pub fn timeline_range(
-        &self,
-        timeline: Timeline,
-        from_ns: Option<i64>,
-        to_ns: Option<i64>,
-    ) -> Result<Vec<Asset>> {
-        if matches!((from_ns, to_ns), (Some(from), Some(to)) if from >= to) {
-            bail!("timeline range start must be less than its end");
-        }
-        let expression = timeline.expression("assets");
-        let (predicate, parameters): (&str, Vec<i64>) = match (from_ns, to_ns) {
-            (None, None) => ("", Vec::new()),
-            (Some(from), None) => ("AND {time} >= ?1", vec![from]),
-            (None, Some(to)) => ("AND {time} < ?1", vec![to]),
-            (Some(from), Some(to)) => ("AND {time} >= ?1 AND {time} < ?2", vec![from, to]),
-        };
-        let predicate = predicate.replace("{time}", &expression);
-        let sql = format!(
-            "SELECT {ASSET_COLUMNS} FROM assets
-             WHERE 1 = 1 {predicate} ORDER BY {expression}, asset_id"
-        );
-        let mut statement = self.conn.prepare(&sql)?;
-        let rows = statement.query_and_then(params_from_iter(parameters), asset_from_row)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .context("listing asset timeline range")
     }
 
     pub fn under_root(&self, root: &Path) -> Result<Vec<Asset>> {
@@ -194,6 +168,7 @@ impl AssetCatalog {
 
     /// Asset IDs whose current source fingerprint previously failed during image decoding.
     /// A changed source is deliberately absent, so fixing or replacing a broken file retries it.
+    #[tracing::instrument(level = "debug", skip_all, fields(assets = fingerprints.len()))]
     pub fn current_decode_failure_asset_ids(
         &self,
         fingerprints: &[(i64, SourceFingerprint)],
@@ -370,41 +345,6 @@ mod tests {
                 "COALESCE(exif_taken_ns, source_modified_ns), asset_id"
             )?
             .contains("assets_taken_idx")
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn timeline_ranges_are_half_open_and_use_the_selected_timestamp() -> Result<()> {
-        let temp = TempDir::new()?;
-        let catalog_path = PathBuf::try_from(temp.path().join("assets.db"))?;
-        let catalog = AssetCatalog::new(&catalog_path)?;
-        for (id, modified, taken) in [
-            (1_i64, 100_i64, Some(400_i64)),
-            (2, 200, None),
-            (3, 300, Some(100)),
-        ] {
-            catalog.conn.execute(
-                "INSERT INTO assets(asset_id, path, source_modified_ns, exif_taken_ns, source_size, media_kind, media_format, is_animated) VALUES (?1, ?2, ?3, ?4, 0, 'image', 'png', 0)",
-                (id, format!("C:/gallery/{id}.png"), modified, taken),
-            )?;
-        }
-
-        let modified = catalog.timeline_range(Timeline::Modified, Some(200), Some(300))?;
-        assert_eq!(
-            modified
-                .iter()
-                .map(|asset| asset.asset_id)
-                .collect::<Vec<_>>(),
-            vec![2]
-        );
-        let capture = catalog.timeline_range(Timeline::Capture, Some(150), Some(450))?;
-        assert_eq!(
-            capture
-                .iter()
-                .map(|asset| asset.asset_id)
-                .collect::<Vec<_>>(),
-            vec![2, 1]
         );
         Ok(())
     }

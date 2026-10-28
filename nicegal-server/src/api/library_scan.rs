@@ -1,9 +1,9 @@
 //! `libraryScan`: catalog a library's folders, then bring its enabled search indexes up to date.
 //!
 //! The library's stored options decide which indexes run, so a client saves OCR and image choices
-//! with `PUT /v1/libraries/<id>` before scanning. Each model is prepared only when the scan finds
-//! work for it, including the OCR pair, which the request names and the job loads itself.
-//! Image search also prepares its paired query encoder for already indexed libraries.
+//! with `PUT /v1/libraries/<id>` before scanning. Each model is loaded only when the scan finds
+//! work for it. Image and OCR-text search also fetch their query encoders' files, so searches
+//! work for already indexed libraries.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -14,19 +14,18 @@ use anyhow::Context;
 use camino::Utf8PathBuf as PathBuf;
 use glob::Pattern;
 use nicegal_core::assets::{Asset, AssetCatalog, canonicalize_path};
-use nicegal_core::db::DB;
-use nicegal_core::index::{self, IndexEvent, IndexObserver, IndexOptions};
+use nicegal_core::image_index::ImageIndexOptions;
+use nicegal_core::index::{self, CatalogOptions, IndexEvent, IndexObserver, OcrIndexOptions};
 use nicegal_core::libraries::{DirectorySnapshot, IncludedFolder, Library, ScanOutcome};
 use nicegal_core::scope::PathScope;
-use nicegal_core::thumbs::ThumbnailService;
 use serde::Deserialize;
 use walkdir::WalkDir;
 
 use super::error::ApiError;
+use super::indexing::{self, Services};
 use super::jobs::{FolderState, IndexStages, Job, JobCancelled};
-use super::models::Models;
 use super::prune_jobs::{self, ReconcileInput, ReconcileScope};
-use super::{Databases, image_embeddings, text_embeddings};
+use super::text_embeddings::job::TextEmbedOptions;
 
 const OCR_COMMIT_CHUNK_SIZE: usize = 32;
 /// Cache folders that never hold library media.
@@ -141,30 +140,44 @@ impl Spec {
         }
     }
 
-    /// Everything this scan would walk, recognize with, and index, fixed when the job is accepted.
-    fn index_options(&self, exclude_dirs: &[PathBuf]) -> IndexOptions {
-        IndexOptions {
+    /// What each walk visits: everything below the folder except the library's exclusions.
+    fn catalog_options(&self, exclude_dirs: &[PathBuf]) -> CatalogOptions {
+        CatalogOptions {
             limit: self.debug_limit,
             exclude: DEFAULT_EXCLUDES
                 .iter()
                 .map(|pattern| Pattern::new(pattern).expect("default exclusions are valid"))
                 .collect(),
             exclude_dirs: exclude_dirs.to_vec(),
-            rescan: self.force,
-            retry_failed: self.retry_failed,
             subdirs: true,
-            commit_chunk_size: OCR_COMMIT_CHUNK_SIZE,
-            max_dimensions: self.max_dimensions,
-            ..IndexOptions::default()
         }
     }
-}
 
-/// Shared services a scan draws on; owned by the job manager.
-pub(super) struct Services<'a> {
-    pub(super) databases: &'a Databases,
-    pub(super) thumbnails: &'a ThumbnailService,
-    pub(super) models: &'a Models,
+    fn image_options(&self, index_videos: bool) -> ImageIndexOptions {
+        ImageIndexOptions {
+            force: false,
+            retry_failed: self.retry_failed,
+            limit: self.debug_limit,
+            index_videos,
+        }
+    }
+
+    fn ocr_options(&self) -> OcrIndexOptions {
+        OcrIndexOptions {
+            rescan: self.force,
+            retry_failed: self.retry_failed,
+            max_dimensions: self.max_dimensions,
+            commit_chunk_size: OCR_COMMIT_CHUNK_SIZE,
+            ..OcrIndexOptions::default()
+        }
+    }
+
+    fn text_options(&self) -> TextEmbedOptions {
+        TextEmbedOptions {
+            limit: self.debug_limit,
+            ..TextEmbedOptions::default()
+        }
+    }
 }
 
 /// One walk of the scan: an included folder, plus any included folders nested inside it that
@@ -218,7 +231,7 @@ pub(super) fn run(spec: Spec, services: &Services<'_>, job: &Arc<Job>) -> anyhow
             .collect(),
     );
 
-    let options = || spec.index_options(&library.exclude);
+    let options = spec.catalog_options(&library.exclude);
     // Walks whose catalog stage succeeded: (index into `folders`, took the full path).
     let mut complete = Vec::new();
     for (index, walk) in folders.iter().enumerate() {
@@ -263,7 +276,7 @@ pub(super) fn run(spec: Spec, services: &Services<'_>, job: &Arc<Job>) -> anyhow
         // Taken before cataloging: a directory that changes during the walk then differs from
         // its recorded mtime, and the next quick check lists it again instead of missing it.
         let before = if full {
-            match snapshot_directories(path, &options(), job.as_ref()) {
+            match snapshot_directories(path, &options, job.as_ref()) {
                 Ok(snapshot) => {
                     tracing::debug!(folder = %path, directories = snapshot.len(), "captured directory snapshot");
                     Some(snapshot)
@@ -278,17 +291,11 @@ pub(super) fn run(spec: Spec, services: &Services<'_>, job: &Arc<Job>) -> anyhow
         };
         let (assets, summary, next_snapshot) = if full {
             let (assets, summary) =
-                index::catalog_snapshot(&catalog, path, options(), job.as_ref())?;
+                index::catalog_snapshot(&catalog, path, &options, job.as_ref())?;
             (assets, summary, before)
         } else {
-            let checked = quick_catalog(
-                &catalog,
-                path,
-                &previous,
-                &options(),
-                job.as_ref(),
-                services,
-            );
+            let checked =
+                quick_catalog(&catalog, path, &previous, &options, job.as_ref(), services);
             match checked {
                 Ok((assets, summary, snapshot)) => (assets, summary, Some(snapshot)),
                 Err(error) if super::jobs::is_cancelled(&error) => {
@@ -321,7 +328,7 @@ pub(super) fn run(spec: Spec, services: &Services<'_>, job: &Arc<Job>) -> anyhow
             // quick check already cleaned up its changed directories in `quick_catalog`.
             let reconciled = if full {
                 prune_jobs::reconcile(
-                    ReconcileScope::new(path.clone(), &options()),
+                    ReconcileScope::new(path.clone(), &options),
                     services.databases,
                     services.models.image.dimensions(),
                     services.thumbnails,
@@ -405,18 +412,12 @@ pub(super) fn run(spec: Spec, services: &Services<'_>, job: &Arc<Job>) -> anyhow
     };
     job.check_cancelled()?;
     if library.options.image {
-        embed_images(
-            &spec,
-            &scope,
-            library.options.videos,
-            &indexable,
-            services,
-            job,
-        )?;
+        let options = spec.image_options(library.options.videos);
+        indexing::embed_images(services, &indexable, &options, job)?;
     }
     if library.options.ocr {
-        recognize_text(&catalog, &indexable, &options(), services, job)?;
-        embed_text(&spec, &scope, services, job)?;
+        indexing::recognize_text(services, &indexable, &spec.ocr_options(), job)?;
+        indexing::embed_text(services, &scope, &spec.text_options(), job)?;
     }
 
     // Folders count as scanned only once every enabled index has caught up with them. Both
@@ -533,7 +534,7 @@ fn directory_mtime(path: &camino::Utf8Path) -> anyhow::Result<i64> {
     Ok(i64::try_from(modified.as_nanos())?)
 }
 
-fn excluded_directory(path: &camino::Utf8Path, options: &IndexOptions) -> bool {
+fn excluded_directory(path: &camino::Utf8Path, options: &CatalogOptions) -> bool {
     options
         .exclude_dirs
         .iter()
@@ -562,7 +563,7 @@ const UNKNOWN_MTIME: i64 = i64::MIN;
 /// full path again.
 fn snapshot_directories(
     root: &camino::Utf8Path,
-    options: &IndexOptions,
+    options: &CatalogOptions,
     job: &Job,
 ) -> anyhow::Result<Vec<DirectorySnapshot>> {
     let mut directories = Vec::<DirectorySnapshot>::new();
@@ -622,15 +623,10 @@ fn snapshot_directories(
 
 /// Catalog one directory's own files without descending; its subdirectories are checked
 /// separately by their own snapshot entries.
-fn shallow_options(options: &IndexOptions) -> IndexOptions {
-    IndexOptions {
-        limit: options.limit,
-        exclude: options.exclude.clone(),
-        exclude_dirs: options.exclude_dirs.clone(),
-        rescan: options.rescan,
-        retry_failed: options.retry_failed,
+fn shallow_options(options: &CatalogOptions) -> CatalogOptions {
+    CatalogOptions {
         subdirs: false,
-        ..IndexOptions::default()
+        ..options.clone()
     }
 }
 
@@ -644,7 +640,7 @@ fn quick_catalog(
     catalog: &AssetCatalog,
     root: &camino::Utf8Path,
     previous: &[DirectorySnapshot],
-    options: &IndexOptions,
+    options: &CatalogOptions,
     job: &Job,
     services: &Services<'_>,
 ) -> anyhow::Result<(Vec<Asset>, index::CatalogSummary, Vec<DirectorySnapshot>)> {
@@ -719,7 +715,7 @@ fn quick_catalog(
         };
         new_subtrees.extend(children);
         let (found, summary) =
-            index::catalog_snapshot(catalog, &entry.path, shallow_options(options), job)?;
+            index::catalog_snapshot(catalog, &entry.path, &shallow_options(options), job)?;
         tracing::trace!(directory = %entry.path, assets = found.len(), scan_complete = summary.scan_complete, "cataloged changed directory");
         complete &= summary.scan_complete;
         if summary.scan_complete {
@@ -763,8 +759,7 @@ fn quick_catalog(
             continue;
         }
         let snapshot = snapshot_directories(&path, options, job)?;
-        let (found, summary) =
-            index::catalog_snapshot(catalog, &path, shallow_options_recursive(options), job)?;
+        let (found, summary) = index::catalog_snapshot(catalog, &path, options, job)?;
         tracing::trace!(directory = %path, directories = snapshot.len(), assets = found.len(), scan_complete = summary.scan_complete, "cataloged new directory subtree");
         complete &= summary.scan_complete;
         if summary.scan_complete {
@@ -824,7 +819,7 @@ fn quick_catalog(
 fn new_child_directories(
     directory: &camino::Utf8Path,
     known: &HashMap<PathBuf, i64>,
-    options: &IndexOptions,
+    options: &CatalogOptions,
     job: &Job,
 ) -> anyhow::Result<Vec<PathBuf>> {
     let mut found = Vec::new();
@@ -867,103 +862,6 @@ fn report_unreadable(job: &Job, directory: &camino::Utf8Path, error: &anyhow::Er
         path: Some(directory.to_owned()),
         message,
     });
-}
-
-fn shallow_options_recursive(options: &IndexOptions) -> IndexOptions {
-    let mut copied = shallow_options(options);
-    copied.subdirs = true;
-    copied
-}
-
-fn embed_images(
-    spec: &Spec,
-    scope: &PathScope,
-    index_videos: bool,
-    assets: &[Asset],
-    services: &Services<'_>,
-    job: &Arc<Job>,
-) -> anyhow::Result<()> {
-    let image_spec = image_embeddings::Spec::pending_for(
-        scope.clone(),
-        spec.retry_failed,
-        spec.debug_limit,
-        index_videos,
-    );
-    if !assets
-        .iter()
-        .any(|asset| asset.media_kind == nicegal_core::assets::MediaKind::Image || index_videos)
-    {
-        return Ok(());
-    }
-    // Searches never download, so the scan fetches the paired query encoder's files even when
-    // every image is indexed. Building it is left to the first search that needs it.
-    services.models.ensure_image_query_available(job.as_ref())?;
-    if !image_embeddings::has_pending(
-        &image_spec,
-        services.databases,
-        services.models.image.dimensions(),
-        Some(assets),
-    )? {
-        return Ok(());
-    }
-    let model = services.models.image.prepare(job.as_ref())?;
-    job.check_cancelled()?;
-    image_embeddings::run(
-        image_spec,
-        services.databases,
-        services.thumbnails,
-        model.as_ref(),
-        job.as_ref(),
-        Some(assets),
-    )
-}
-
-fn recognize_text(
-    catalog: &AssetCatalog,
-    assets: &[Asset],
-    options: &IndexOptions,
-    services: &Services<'_>,
-    job: &Arc<Job>,
-) -> anyhow::Result<()> {
-    let mut ocr = DB::new(&services.databases.ocr)?;
-    let selection = index::select_ocr_sources(catalog, &ocr, assets, options, job.as_ref())?;
-    job.check_cancelled()?;
-    if selection.is_empty() {
-        return Ok(());
-    }
-    let models = services.models.ocr.prepare(job.as_ref())?;
-    let mut models = models.lock();
-    index::recognize_selection(
-        catalog,
-        &mut ocr,
-        &mut models,
-        selection,
-        options,
-        job.as_ref(),
-    )?;
-    job.check_cancelled()
-}
-
-fn embed_text(
-    spec: &Spec,
-    scope: &PathScope,
-    services: &Services<'_>,
-    job: &Arc<Job>,
-) -> anyhow::Result<()> {
-    let text_spec = text_embeddings::job::Spec::pending_for(scope.clone(), spec.debug_limit);
-    let models = services.models;
-    models.text_query.ensure_available(job.as_ref())?;
-    if !text_embeddings::job::has_pending(&text_spec, &services.databases.ocr)? {
-        return Ok(());
-    }
-    let model = models.text_index.prepare(job.as_ref())?;
-    job.check_cancelled()?;
-    text_embeddings::job::run(
-        text_spec,
-        &services.databases.ocr,
-        model.as_ref(),
-        job.as_ref(),
-    )
 }
 
 #[cfg(test)]

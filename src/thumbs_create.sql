@@ -11,8 +11,8 @@ CREATE TABLE thumbnails(
     data BLOB NOT NULL,
     PRIMARY KEY(asset_id, size_bucket, generator_version)
 ) WITHOUT ROWID;
-CREATE INDEX thumbnail_lookup_idx
-    ON thumbnails(asset_id, generator_version, size_bucket);
+CREATE INDEX thumbnail_current_idx
+    ON thumbnails(asset_id, generator_version, source_modified_ns, source_size, size_bucket);
 CREATE TABLE video_thumbnails(
     asset_id INTEGER NOT NULL CHECK(asset_id > 0),
     timestamp_ms INTEGER NOT NULL CHECK(timestamp_ms >= 0),
@@ -26,6 +26,7 @@ CREATE TABLE video_thumbnails(
     data BLOB NOT NULL,
     PRIMARY KEY(asset_id, timestamp_ms, size_bucket)
 ) WITHOUT ROWID;
-CREATE INDEX video_thumbnail_assets_idx ON video_thumbnails(asset_id);
-PRAGMA user_version = 4;
+CREATE INDEX video_thumbnail_current_idx
+    ON video_thumbnails(asset_id, sampling_version, source_modified_ns, source_size);
+PRAGMA user_version = 5;
 COMMIT;

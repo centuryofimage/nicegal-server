@@ -47,20 +47,8 @@ pub fn image_buckets(path: &Path, buckets: &[u16]) -> Result<Vec<StaticPoster>> 
         .collect()
 }
 
-/// Encode size variants directly from a decoded frame, without a JPEG round trip.
-pub fn raster_buckets(source: &Raster, buckets: &[u16]) -> Result<Vec<StaticPoster>> {
-    raster_buckets_with_output(source, buckets, crate::video::VideoOutputOptions::default())
-}
-
-pub fn raster_buckets_with_output(
-    source: &Raster,
-    buckets: &[u16],
-    options: crate::video::VideoOutputOptions,
-) -> Result<Vec<StaticPoster>> {
-    raster_buckets_with_output_at(Path::new("<raster>"), source, buckets, options)
-}
-
-/// Encode video frame variants with a source path on each profiling span.
+/// Encode size variants directly from a decoded video frame, without a JPEG round trip. `path`
+/// names the source on each profiling span.
 pub fn raster_buckets_with_output_at(
     path: &Path,
     source: &Raster,
@@ -188,12 +176,6 @@ fn encode_poster(path: &Path, poster: Raster) -> Result<StaticPoster> {
 
 const WHITE: [u8; 3] = [255, 255, 255];
 
-/// Decode the GIF canvas's first composited frame and encode that static poster.
-/// The animated source is never resized, re-encoded, or returned as thumbnail bytes.
-pub fn gif_first_frame(path: &Path, maximum_edge: u32) -> Result<StaticPoster> {
-    still_image(path, maximum_edge)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,7 +191,8 @@ mod tests {
             height: 2,
             pixels: vec![64; 12],
         };
-        let png = raster_buckets_with_output(
+        let png = raster_buckets_with_output_at(
+            Path::new("frame"),
             &raster,
             &[128],
             crate::video::VideoOutputOptions {
@@ -219,7 +202,8 @@ mod tests {
         )?;
         assert_eq!(png[0].encoding, ThumbnailEncoding::Png);
         assert_eq!(imaging::Format::detect(&png[0].data)?, imaging::Format::Png);
-        let jpeg = raster_buckets_with_output(
+        let jpeg = raster_buckets_with_output_at(
+            Path::new("frame"),
             &raster,
             &[128],
             crate::video::VideoOutputOptions::default(),
@@ -255,7 +239,7 @@ mod tests {
         let path = PathBuf::try_from(temp.path().join("animated.gif"))?;
         write_gif(path.as_std_path())?;
 
-        let poster = gif_first_frame(&path, 2)?;
+        let poster = still_image(&path, 2)?;
         assert_eq!((poster.width, poster.height), (2, 1));
         assert_eq!(poster.encoding, ThumbnailEncoding::Jpeg);
         let decoded = imaging::decode(&poster.data)?;
@@ -296,7 +280,7 @@ mod tests {
         let temp = TempDir::new()?;
         let path = PathBuf::try_from(temp.path().join("broken.gif"))?;
         File::create(&path)?;
-        assert!(gif_first_frame(&path, 128).is_err());
+        assert!(still_image(&path, 128).is_err());
         Ok(())
     }
 }

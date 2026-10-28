@@ -18,11 +18,12 @@ use crate::storage::{
     READ_ONLY_FLAGS, configure_reader, configure_writer, maintain, validate_asset_ids,
 };
 
-const SCHEMA_VERSION: i32 = 10;
+const SCHEMA_VERSION: i32 = 11;
 const SCHEMA_LABEL: &str = "OCR database";
 const MIGRATIONS: &[(i32, &str)] = &[
     (8, include_str!("migrations/ocr_8_to_9.sql")),
     (9, "VACUUM;"),
+    (10, include_str!("migrations/ocr_10_to_11.sql")),
 ];
 
 /// Whether OCR data exists for an asset and still matches its catalog fingerprint.
@@ -453,8 +454,7 @@ impl DB {
                   AND e.source_modified_ns = ocr_results.source_modified_ns
                   AND e.source_size = ocr_results.source_size
              ) FROM ocr_results
-             WHERE asset_id = ?1 AND source_modified_ns = ?2 AND source_size = ?3
-               AND mark_delete = FALSE",
+             WHERE asset_id = ?1 AND source_modified_ns = ?2 AND source_size = ?3",
                 (
                     asset_id,
                     fingerprint.modified_ns,
@@ -480,8 +480,7 @@ impl DB {
             .conn
             .query_row(
                 "SELECT content FROM ocr_results
-                 WHERE asset_id = ?1 AND source_modified_ns = ?2 AND source_size = ?3
-                   AND mark_delete = FALSE",
+                 WHERE asset_id = ?1 AND source_modified_ns = ?2 AND source_size = ?3",
                 (asset_id, fingerprint.modified_ns, source_size),
                 |row| row.get(0),
             )
@@ -500,6 +499,7 @@ impl DB {
             .context("checking OCR source fingerprint")
     }
 
+    #[tracing::instrument(level = "debug", skip_all, fields(assets = fingerprints.len()))]
     pub fn current_asset_ids(
         &self,
         fingerprints: &[(i64, SourceFingerprint)],
@@ -587,8 +587,7 @@ impl DB {
                      source_size = excluded.source_size,
                      width = excluded.width,
                      height = excluded.height,
-                     content = excluded.content,
-                     mark_delete = FALSE",
+                     content = excluded.content",
             )?;
             let mut changed = 0;
             for result in results {
@@ -609,59 +608,6 @@ impl DB {
         };
         tx.commit()?;
         Ok(rowchanges)
-    }
-
-    pub fn mark_for_deletion(&mut self, path: &Path) -> Result<()> {
-        if !path.is_dir() {
-            bail!("path passed to mark_for_deletion must be a directory: {path}");
-        }
-        self.conn.execute(
-            "UPDATE ocr_results SET mark_delete = FALSE WHERE mark_delete = TRUE",
-            [],
-        )?;
-        let scope = PathScope::root(path).bind("source_path");
-        self.conn.execute(
-            &format!(
-                "UPDATE ocr_results SET mark_delete = TRUE WHERE {}",
-                scope.sql
-            ),
-            bind_named(&scope.params).as_slice(),
-        )?;
-        Ok(())
-    }
-
-    pub fn unmark_asset(&mut self, asset_id: i64) -> Result<()> {
-        self.unmark_assets(&[asset_id])?;
-        Ok(())
-    }
-
-    pub fn unmark_assets(&mut self, asset_ids: &[i64]) -> Result<usize> {
-        validate_asset_ids(asset_ids)?;
-        if asset_ids.is_empty() {
-            return Ok(0);
-        }
-        let tx = self.conn.transaction()?;
-        let changed = {
-            let mut statement =
-                tx.prepare("UPDATE ocr_results SET mark_delete = FALSE WHERE asset_id = ?1")?;
-            asset_ids.iter().try_fold(0usize, |changed, asset_id| {
-                statement.execute([asset_id]).map(|count| changed + count)
-            })?
-        };
-        tx.commit()?;
-        Ok(changed)
-    }
-
-    #[instrument(name = "sweep_deletions", level = "debug", skip_all)]
-    pub fn sweep_deletions(&mut self) -> Result<usize> {
-        let deleted = self
-            .conn
-            .execute("DELETE FROM ocr_results WHERE mark_delete = TRUE", [])
-            .context("deleting stale OCR results")?;
-        // The cascade reaches `ocr_embedding_state`; `vec0` is a virtual table, so its rows are
-        // only reachable through the explicit sweep.
-        self.sweep_text_embeddings()?;
-        Ok(deleted)
     }
 
     pub fn delete_asset(&mut self, asset_id: i64) -> Result<usize> {
@@ -1099,30 +1045,6 @@ impl DB {
         Ok(cleared)
     }
 
-    /// Drop `asset_id`'s vector in every space, whether or not its OCR row still exists.
-    pub fn delete_text_embedding(&mut self, asset_id: i64) -> Result<usize> {
-        let mut deleted = 0;
-        for space in TextEmbeddingSpace::ALL {
-            if !self.has_vector_table(space)? {
-                continue;
-            }
-            deleted += self
-                .conn
-                .execute(
-                    &format!("DELETE FROM {} WHERE asset_id = ?1", space.table()),
-                    [asset_id],
-                )
-                .context("deleting an asset embedding")?;
-        }
-        self.conn
-            .execute(
-                "DELETE FROM ocr_embedding_state WHERE asset_id = ?1",
-                [asset_id],
-            )
-            .context("deleting an asset embedding state")?;
-        Ok(deleted)
-    }
-
     /// Delete vectors whose OCR row is gone. `ocr_embedding_state` cascades on its own; `vec0` is
     /// a virtual table and cannot be a foreign key target, so its rows are swept explicitly.
     pub fn sweep_text_embeddings(&mut self) -> Result<usize> {
@@ -1162,25 +1084,44 @@ impl DB {
     ) -> Result<TextEmbeddingCoverage> {
         let bound = filters.bind(FilterScope::OCR_ROWS)?;
         let mut statement = self.conn.prepare_cached(&format!(
-            "SELECT count(*), count(ocr_embedding_state.asset_id), max(ocr_results.source_modified_ns) \
+            "SELECT count(*), count(ocr_embedding_state.asset_id), \
+                    count(*) FILTER (WHERE trim(ocr_results.content) <> ''), \
+                    count(*) FILTER (WHERE trim(ocr_results.content) <> '' \
+                                       AND ocr_embedding_state.asset_id IS NULL), \
+                    max(ocr_results.source_modified_ns) \
                FROM ocr_results \
                LEFT JOIN ocr_embedding_state \
                       ON ocr_embedding_state.asset_id = ocr_results.asset_id \
                      AND ocr_embedding_state.space = :space \
                      AND ocr_embedding_state.source_modified_ns = ocr_results.source_modified_ns \
                      AND ocr_embedding_state.source_size = ocr_results.source_size \
-              WHERE ocr_results.mark_delete = FALSE{filters}",
+              WHERE TRUE{filters}",
             filters = bound.sql,
         ))?;
         let params = bound.extend([(":space", Value::Text(space.as_str().to_owned()))]);
-        let (indexed, embedded, last_indexed_ns): (i64, i64, Option<i64>) = statement
+        let (indexed, embedded, with_text, pending, last_indexed_ns): (
+            i64,
+            i64,
+            i64,
+            i64,
+            Option<i64>,
+        ) = statement
             .query_row(bind_named(&params).as_slice(), |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
             })
             .context("counting OCR embedding coverage")?;
+        let count = |value: i64| usize::try_from(value).context("OCR row count exceeds usize");
         Ok(TextEmbeddingCoverage {
-            indexed: usize::try_from(indexed).context("OCR row count exceeds usize")?,
-            embedded: usize::try_from(embedded).context("embedded row count exceeds usize")?,
+            indexed: count(indexed)?,
+            embedded: count(embedded)?,
+            with_text: count(with_text)?,
+            pending: count(pending)?,
             last_indexed_ns,
         })
     }
@@ -1204,7 +1145,6 @@ impl DB {
                      AND ocr_embedding_state.source_modified_ns = ocr_results.source_modified_ns \
                      AND ocr_embedding_state.source_size = ocr_results.source_size \
               WHERE ocr_embedding_state.asset_id IS NULL \
-                AND ocr_results.mark_delete = FALSE \
                 AND trim(ocr_results.content) <> ''{filters} \
               ORDER BY ocr_results.source_modified_ns DESC, ocr_results.asset_id DESC \
               LIMIT :limit",
@@ -1292,7 +1232,7 @@ impl DB {
                          AND ocr_embedding_state.space = :space
                          AND ocr_embedding_state.source_modified_ns = ocr_results.source_modified_ns
                          AND ocr_embedding_state.source_size = ocr_results.source_size
-                 WHERE ocr_results.mark_delete = FALSE{filters}
+                 WHERE TRUE{filters}
             )"#,
             filters = bound.sql,
         );
@@ -1461,17 +1401,14 @@ pub struct TextEmbeddingCoverage {
     pub indexed: usize,
     /// Of those, the ones whose vector matches their current OCR fingerprint.
     pub embedded: usize,
+    /// Of those, the ones with text to embed. An image without text never gets a vector.
+    pub with_text: usize,
+    /// Rows with text but no current vector: what [`DB::pending_text_embeddings`] pages through.
+    pub pending: usize,
     /// The newest `source_modified_ns` among indexed rows, Unix nanoseconds. There is no
     /// wall-clock record of when OCR actually ran, so this is a proxy: "the most recently changed
     /// file this root has indexed text for." `None` when nothing is indexed.
     pub last_indexed_ns: Option<i64>,
-}
-
-impl TextEmbeddingCoverage {
-    /// Rows that still need embedding before vector search covers the whole root.
-    pub fn pending(self) -> usize {
-        self.indexed.saturating_sub(self.embedded)
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1692,7 +1629,11 @@ mod tests {
                         "AFTER UPDATE OF asset_id, content ON ocr_results\nWHEN old.asset_id IS NOT new.asset_id OR old.content IS NOT new.content BEGIN",
                         "AFTER UPDATE ON ocr_results BEGIN",
                     )
-                    .replace("PRAGMA user_version = 10;", "PRAGMA user_version = 8;");
+                    .replace(
+                        "    content TEXT NOT NULL\n);",
+                        "    mark_delete INTEGER NOT NULL DEFAULT 0 CHECK(mark_delete IN (0, 1)),\n    content TEXT NOT NULL\n);\nCREATE INDEX ocr_mark_delete_idx ON ocr_results(mark_delete);",
+                    )
+                    .replace("PRAGMA user_version = 11;", "PRAGMA user_version = 8;");
                 conn.execute_batch(&version_eight)?;
                 conn.execute("INSERT INTO ocr_results(asset_id, source_path, source_modified_ns, source_size, width, height, content) VALUES (1, 'retained.png', 1, 1, 1, 1, 'original')", [])?;
                 let before = conn.total_changes();
@@ -1717,9 +1658,16 @@ mod tests {
                 db.save_results(vec![result(&temp, 1, "original")?])?;
             }
             check_schema_read_only(&db.conn, SCHEMA_LABEL, SCHEMA_VERSION)?;
+            if migrate {
+                let columns: Vec<String> = db
+                    .conn
+                    .prepare("SELECT name FROM pragma_table_info('ocr_results')")?
+                    .query_map([], |row| row.get(0))?
+                    .collect::<rusqlite::Result<_>>()?;
+                assert!(!columns.iter().any(|column| column == "mark_delete"));
+            }
             for sql in [
-                "UPDATE ocr_results SET mark_delete = TRUE WHERE asset_id = 1",
-                "UPDATE ocr_results SET mark_delete = FALSE WHERE asset_id = 1",
+                "UPDATE ocr_results SET source_size = 2 WHERE asset_id = 1",
                 "UPDATE ocr_results SET source_modified_ns = 2 WHERE asset_id = 1",
                 "UPDATE ocr_results SET content = content WHERE asset_id = 1",
             ] {
@@ -1985,32 +1933,6 @@ mod tests {
     }
 
     #[test]
-    fn deletion_does_not_match_a_sibling_directory_with_the_same_prefix() -> Result<()> {
-        let temp = TempDir::new()?;
-        let mut db = test_db(&temp)?;
-        let directory = PathBuf::try_from(temp.path().join("gallery"))?;
-        let sibling = PathBuf::try_from(temp.path().join("gallery-old"))?;
-        let mut inside = result(&temp, 11, "inside")?;
-        inside.path = directory.join("inside.png");
-        let mut outside = result(&temp, 12, "outside")?;
-        outside.path = sibling.join("outside.png");
-        db.save_results(vec![inside, outside])?;
-
-        std::fs::create_dir_all(&directory)?;
-        db.mark_for_deletion(&directory)?;
-
-        assert_eq!(db.sweep_deletions()?, 1);
-        assert!(db.is_indexed(
-            12,
-            SourceFingerprint {
-                modified_ns: 987_654_321,
-                size: 1234,
-            }
-        )?);
-        Ok(())
-    }
-
-    #[test]
     fn deleting_assets_removes_text_vectors_and_embedding_state() -> Result<()> {
         let temp = TempDir::new()?;
         let (mut db, _) = embedded_db(&temp)?;
@@ -2150,8 +2072,6 @@ mod tests {
             db.asset_text_embedding_status(1, changed)?,
             Some((true, false))
         );
-        db.mark_for_deletion(&root)?;
-        assert_eq!(db.asset_text_embedding_status(1, changed)?, None);
         db.delete_assets(&[1])?;
         assert_eq!(db.asset_text_embedding_status(1, changed)?, None);
         Ok(())
@@ -2349,8 +2269,17 @@ mod tests {
             TextEmbeddingCoverage {
                 indexed: 3,
                 embedded: 3,
+                with_text: 3,
+                pending: 0,
                 last_indexed_ns: Some(987_654_321),
             }
+        );
+
+        db.save_results(vec![result(&temp, 4, "  ")?])?;
+        let coverage = db.text_embedding_coverage(SPACE, &SearchFilters::under(&root))?;
+        assert_eq!(
+            (coverage.indexed, coverage.with_text, coverage.pending),
+            (4, 3, 0)
         );
 
         let mut rescanned = result(&temp, 1, "due north, rescanned")?;
@@ -2359,7 +2288,7 @@ mod tests {
 
         let coverage = db.text_embedding_coverage(SPACE, &SearchFilters::under(&root))?;
         assert_eq!(coverage.embedded, 2);
-        assert_eq!(coverage.pending(), 1);
+        assert_eq!(coverage.pending, 1);
         let (total, results) = db.search_text_vectors(
             &[1.0, 0.0, 0.0],
             SPACE,
@@ -2385,7 +2314,7 @@ mod tests {
         )?;
         assert_eq!(
             db.text_embedding_coverage(SPACE, &SearchFilters::under(&root))?
-                .pending(),
+                .pending,
             0
         );
         assert!(
@@ -2407,9 +2336,7 @@ mod tests {
             2
         );
 
-        db.mark_for_deletion(Path::from_path(temp.path()).unwrap())?;
-        db.unmark_asset(1)?;
-        assert_eq!(db.sweep_deletions()?, 1);
+        db.delete_asset(3)?;
 
         let (total, results) = db.search_text_vectors(
             &[1.0, 0.0, 0.0],
@@ -2662,6 +2589,8 @@ mod tests {
             TextEmbeddingCoverage {
                 indexed: 1,
                 embedded: 1,
+                with_text: 1,
+                pending: 0,
                 last_indexed_ns: Some(2 * HOUR),
             }
         );

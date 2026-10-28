@@ -14,23 +14,15 @@ use rusqlite::{Connection, OptionalExtension, params_from_iter};
 use tracing::{debug_span, field, trace_span};
 // Keep this in sync with THUMBNAIL_SCHEMA_VERSION in the Electron frontend's
 // src/main/backend/thumbnail-reader.ts; it reads this database directly.
-const SCHEMA_VERSION: i32 = 4;
+const SCHEMA_VERSION: i32 = 5;
 const SCHEMA_LABEL: &str = "thumbnail database";
-const MIGRATIONS: &[(i32, &str)] = &[(3, "VACUUM;")];
-const VIDEO_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS video_thumbnails(
-    asset_id INTEGER NOT NULL CHECK(asset_id > 0),
-    timestamp_ms INTEGER NOT NULL CHECK(timestamp_ms >= 0),
-    size_bucket INTEGER NOT NULL CHECK(size_bucket IN (128, 256, 512, 1024)),
-    sampling_version INTEGER NOT NULL CHECK(sampling_version > 0),
-    source_modified_ns INTEGER NOT NULL,
-    source_size INTEGER NOT NULL CHECK(source_size >= 0),
-    width INTEGER NOT NULL CHECK(width > 0),
-    height INTEGER NOT NULL CHECK(height > 0),
-    encoding TEXT NOT NULL CHECK(encoding IN ('image/jpeg', 'image/png', 'image/webp')),
-    data BLOB NOT NULL,
-    PRIMARY KEY(asset_id, timestamp_ms, size_bucket)
-) WITHOUT ROWID;
-CREATE INDEX IF NOT EXISTS video_thumbnail_assets_idx ON video_thumbnails(asset_id);";
+/// Version 5 replaces the asset-only indexes with ones that also hold each source fingerprint, so
+/// "are this source's thumbnails current?" is answered from the index. Both tables keep encoded
+/// images in their primary key's rows, and reading rows to compare fingerprints walks image pages.
+const MIGRATIONS: &[(i32, &str)] = &[
+    (3, "VACUUM;"),
+    (4, include_str!("../thumbs_migrate_v5.sql")),
+];
 
 pub struct ThumbnailDb {
     conn: Connection,
@@ -119,9 +111,6 @@ impl ThumbnailDb {
             include_str!("../thumbs_create.sql"),
             MIGRATIONS,
         )?;
-        // Version 4 is also consumed directly by Electron. Additive table creation keeps its
-        // existing reader compatible with databases created before video thumbnails existed.
-        conn.execute_batch(VIDEO_TABLE_SQL)?;
         Ok(Self { conn })
     }
 
@@ -403,19 +392,6 @@ impl ThumbnailDb {
         Ok(current)
     }
 
-    /// Remove variants from older generators after the current generator has been backfilled.
-    pub fn sweep_old_generators(&self, generator_version: u32) -> Result<usize> {
-        if generator_version == 0 {
-            bail!("generator version must be greater than zero");
-        }
-        self.conn
-            .execute(
-                "DELETE FROM thumbnails WHERE generator_version <> ?1",
-                [generator_version],
-            )
-            .context("sweeping stale thumbnail generator versions")
-    }
-
     /// Remove variants from older generators for the specified catalog assets only.
     pub fn sweep_old_generators_for_assets(
         &self,
@@ -583,7 +559,7 @@ impl ThumbnailDb {
                 "DELETE FROM video_thumbnails
              WHERE asset_id IN (
                  SELECT DISTINCT candidates.asset_id
-                   FROM video_thumbnails AS candidates INDEXED BY video_thumbnail_assets_idx
+                   FROM video_thumbnails AS candidates INDEXED BY video_thumbnail_current_idx
                   WHERE NOT EXISTS (
                       SELECT 1 FROM maintenance_catalog.assets
                        WHERE assets.asset_id = candidates.asset_id

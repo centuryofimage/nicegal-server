@@ -64,8 +64,8 @@ impl JobSpec {
         match self {
             Self::LibraryScan(spec) => Some(spec.library_id()),
             Self::ThumbnailGenerate(spec) => Some(spec.library_id()),
-            Self::TextEmbed(spec) => spec.library_id(),
-            Self::ImageEmbed(spec) => spec.library_id(),
+            Self::TextEmbed(spec) => Some(spec.library_id()),
+            Self::ImageEmbed(spec) => Some(spec.library_id()),
             Self::PruneMissing(spec) => Some(spec.library_id()),
             Self::LibraryPurge(spec) => Some(spec.library_id()),
             Self::ModelPrepare => None,

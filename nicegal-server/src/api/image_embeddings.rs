@@ -1,5 +1,6 @@
 //! Image embedding jobs.
 
+use super::indexing::Services;
 use super::{AppState, Databases, extract::ApiQuery, run_blocking};
 use crate::api::jobs::cancel_if;
 use axum::{
@@ -10,13 +11,8 @@ use axum::{
 use nicegal_core::assets::{Asset, AssetCatalog};
 use nicegal_core::db::SearchFilters;
 use nicegal_core::embedding::ImageEmbedder;
-use nicegal_core::image_index::{
-    ImageIndexDb, ImageIndexOptions, has_pending_catalog_images, index_catalog_images_observed,
-    index_images_observed,
-};
+use nicegal_core::image_index::{ImageIndexDb, ImageIndexOptions, index_selected_images};
 use nicegal_core::index::IndexObserver;
-use nicegal_core::scope::PathScope;
-use nicegal_core::thumbs::ThumbnailService;
 use serde::{Deserialize, Serialize};
 
 use super::error::ApiError;
@@ -61,48 +57,30 @@ pub(crate) struct Request {
 }
 
 pub(crate) struct Spec {
-    /// Set for a standalone job; its scope and video choice are read from the library when the job
-    /// runs.
-    library_id: Option<i64>,
-    scope: PathScope,
+    library_id: i64,
     force: bool,
-    retry_failed: bool,
     debug_limit: Option<usize>,
-    index_videos: bool,
 }
 
 impl Spec {
-    pub(crate) fn pending_for(
-        scope: PathScope,
-        retry_failed: bool,
-        debug_limit: Option<usize>,
-        index_videos: bool,
-    ) -> Self {
-        Self {
-            library_id: None,
-            scope,
-            force: false,
-            retry_failed,
-            debug_limit,
-            index_videos,
-        }
-    }
-}
-
-impl Spec {
-    pub(crate) fn library_id(&self) -> Option<i64> {
+    pub(crate) fn library_id(&self) -> i64 {
         self.library_id
     }
 
-    /// Read a standalone job's library scope.
-    pub(crate) fn resolve(mut self, databases: &Databases) -> anyhow::Result<Self> {
-        if let Some(library_id) = self.library_id {
-            let catalog = AssetCatalog::new_read_only(&databases.assets)?;
-            let library = super::libraries::stored(&catalog, library_id)?;
-            self.scope = library.scope();
-            self.index_videos = library.options.videos;
-        }
-        Ok(self)
+    /// The library's cataloged files and what to embed of them, read when the job runs.
+    pub(crate) fn resolve(
+        &self,
+        databases: &Databases,
+    ) -> anyhow::Result<(Vec<Asset>, ImageIndexOptions)> {
+        let catalog = AssetCatalog::new_read_only(&databases.assets)?;
+        let library = super::libraries::stored(&catalog, self.library_id)?;
+        let options = ImageIndexOptions {
+            force: self.force,
+            retry_failed: false,
+            limit: self.debug_limit,
+            index_videos: library.options.videos,
+        };
+        Ok((catalog.in_scope(&library.scope())?, options))
     }
 }
 
@@ -113,100 +91,31 @@ pub(crate) fn prepare(request: Request) -> Result<Spec, ApiError> {
         ));
     }
     Ok(Spec {
-        library_id: Some(request.library_id),
-        scope: PathScope::default(),
+        library_id: request.library_id,
         force: request.force,
-        retry_failed: false,
         debug_limit: request.debug_limit,
-        // Replaced by the library's choice in `resolve`.
-        index_videos: true,
     })
 }
 
-pub(crate) fn run(
-    spec: Spec,
-    databases: &Databases,
-    thumbnails: &ThumbnailService,
+/// Embed `sources`, selected by `select_catalog_images`, with a loaded `embedder`.
+pub(super) fn run(
+    services: &Services<'_>,
     embedder: &ImageEmbedder,
+    sources: Vec<Asset>,
     observer: &dyn IndexObserver,
-    catalog: Option<&[Asset]>,
 ) -> anyhow::Result<()> {
+    let databases = services.databases;
     let assets = AssetCatalog::new(&databases.assets)?;
     let mut images = ImageIndexDb::new(&databases.images, embedder.dimensions())?;
-    let options = ImageIndexOptions {
-        force: spec.force,
-        retry_failed: spec.retry_failed,
-        index_videos: spec.index_videos,
-        limit: spec.debug_limit,
-        thumbnail_database: Some(databases.thumbnails.clone()),
-        thumbnail_service: Some(thumbnails.clone()),
-    };
-    match catalog {
-        Some(catalog) => index_catalog_images_observed(
-            &assets,
-            &mut images,
-            embedder,
-            catalog,
-            options,
-            observer,
-        ),
-        None => index_images_observed(
-            &assets,
-            &mut images,
-            embedder,
-            &spec.scope,
-            options,
-            observer,
-        ),
-    }
-    .and_then(cancel_if)
-}
-
-/// Empty libraries do not trigger model downloads, including explicit backfills.
-pub(crate) fn has_sources(spec: &Spec, databases: &Databases) -> anyhow::Result<bool> {
-    Ok(AssetCatalog::new_read_only(&databases.assets)?
-        .in_scope(&spec.scope)?
-        .iter()
-        .any(|asset| {
-            asset.media_kind == nicegal_core::assets::MediaKind::Image || spec.index_videos
-        }))
-}
-
-/// Use the same candidate selection as the embedding pass before preparing its model.
-#[tracing::instrument(name = "image_has_pending", level = "info", skip_all)]
-pub(crate) fn has_pending(
-    spec: &Spec,
-    databases: &Databases,
-    dimensions: usize,
-    catalog: Option<&[Asset]>,
-) -> anyhow::Result<bool> {
-    tracing::debug!("checking pending image embeddings");
-    let assets = AssetCatalog::new_read_only(&databases.assets)?;
-    let images = ImageIndexDb::new_read_only(&databases.images, dimensions, &databases.assets)?;
-    tracing::debug!("opened read-only embedding selection databases");
-    let owned;
-    let catalog = match catalog {
-        Some(catalog) => catalog,
-        None => {
-            owned = assets.in_scope(&spec.scope)?;
-            &owned
-        }
-    };
-    let pending = has_pending_catalog_images(
+    index_selected_images(
         &assets,
-        &images,
-        catalog,
-        &ImageIndexOptions {
-            force: spec.force,
-            retry_failed: spec.retry_failed,
-            index_videos: spec.index_videos,
-            limit: spec.debug_limit,
-            thumbnail_database: Some(databases.thumbnails.clone()),
-            thumbnail_service: None,
-        },
-    )?;
-    tracing::debug!(pending, "checked pending image embeddings");
-    Ok(pending)
+        &mut images,
+        embedder,
+        sources,
+        Some(services.thumbnails),
+        observer,
+    )
+    .and_then(cancel_if)
 }
 
 #[cfg(test)]

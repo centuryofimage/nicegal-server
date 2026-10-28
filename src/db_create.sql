@@ -9,10 +9,8 @@ CREATE TABLE ocr_results(
     source_size INTEGER NOT NULL CHECK(source_size >= 0),
     width INTEGER NOT NULL CHECK(width > 0),
     height INTEGER NOT NULL CHECK(height > 0),
-    mark_delete INTEGER NOT NULL DEFAULT 0 CHECK(mark_delete IN (0, 1)),
     content TEXT NOT NULL
 );
-CREATE INDEX ocr_mark_delete_idx ON ocr_results(mark_delete);
 CREATE INDEX ocr_source_path_idx ON ocr_results(source_path);
 -- One index per timeline, matching the two expressions a time-filtered search can order on.
 CREATE INDEX ocr_modified_idx ON ocr_results(source_modified_ns);
@@ -58,5 +56,5 @@ CREATE TABLE ocr_embedding_state(
     source_size INTEGER NOT NULL CHECK(source_size >= 0),
     PRIMARY KEY(space, asset_id)
 );
-PRAGMA user_version = 10;
+PRAGMA user_version = 11;
 COMMIT;

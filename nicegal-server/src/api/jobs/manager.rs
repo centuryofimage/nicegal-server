@@ -14,11 +14,10 @@ use super::routes::{RetainedRequest, wire_job_id};
 use super::views::LibraryView;
 use super::{JobCancelled, is_cancelled};
 use crate::api::error::ApiError;
+use crate::api::indexing::{self, Services};
 use crate::api::models::Models;
 use crate::api::ttl_map::TtlMap;
-use crate::api::{
-    Databases, image_embeddings, library_scan, prune_jobs, text_embeddings, thumbnails,
-};
+use crate::api::{Databases, library_scan, prune_jobs, thumbnails};
 
 pub(super) const MAX_RETAINED_JOBS: usize = 32;
 
@@ -189,53 +188,24 @@ impl JobManager {
         let span = Span::current();
         tokio::task::spawn_blocking(move || {
             let _entered = span.enter();
+            let services = Services {
+                databases: &databases,
+                thumbnails: &thumbnails,
+                models: &models,
+            };
             let result = (|| match spec {
                 JobSpec::ModelPrepare => manager.prepare_job_models(&job),
-                JobSpec::LibraryScan(spec) => library_scan::run(
-                    spec,
-                    &library_scan::Services {
-                        databases: &databases,
-                        thumbnails: &thumbnails,
-                        models: &models,
-                    },
-                    &job,
-                ),
+                JobSpec::LibraryScan(spec) => library_scan::run(spec, &services, &job),
                 JobSpec::ThumbnailGenerate(spec) => {
                     thumbnails::job::run(spec, &databases.assets, &thumbnails, job.as_ref())
                 }
                 JobSpec::TextEmbed(spec) => {
-                    let spec = spec.resolve(&databases)?;
-                    models.text_query.ensure_available(job.as_ref())?;
-                    if !text_embeddings::job::has_pending(&spec, &databases.ocr)? {
-                        return Ok(());
-                    }
-                    let model = models.text_index.prepare(job.as_ref())?;
-                    text_embeddings::job::run(spec, &databases.ocr, model.as_ref(), job.as_ref())
+                    let (scope, options) = spec.resolve(&databases)?;
+                    indexing::embed_text(&services, &scope, &options, &job)
                 }
                 JobSpec::ImageEmbed(spec) => {
-                    let spec = spec.resolve(&databases)?;
-                    if !image_embeddings::has_sources(&spec, &databases)? {
-                        return Ok(());
-                    }
-                    models.ensure_image_query_available(job.as_ref())?;
-                    if !image_embeddings::has_pending(
-                        &spec,
-                        &databases,
-                        models.image.dimensions(),
-                        None,
-                    )? {
-                        return Ok(());
-                    }
-                    let model = models.image.prepare(job.as_ref())?;
-                    job.check_cancelled()?;
-                    image_embeddings::run(
-                        spec,
-                        &databases,
-                        &thumbnails,
-                        model.as_ref(),
-                        job.as_ref(),
-                        None,
-                    )
+                    let (assets, options) = spec.resolve(&databases)?;
+                    indexing::embed_images(&services, &assets, &options, &job)
                 }
                 JobSpec::PruneMissing(spec) => prune_jobs::run(
                     spec,

@@ -34,7 +34,6 @@ impl IndexObserver for Job {
                     IndexPhase::ImageEmbedding => JobPhase::ImageEmbedding,
                     IndexPhase::TextEmbedding => JobPhase::TextEmbedding,
                     IndexPhase::Pruning => JobPhase::Pruning,
-                    IndexPhase::Cleanup => JobPhase::Cleanup,
                 };
                 set_phase(&mut data, phase);
             }
@@ -103,6 +102,7 @@ pub(super) fn set_phase(data: &mut JobData, next: JobPhase) {
         data.phase = next;
         if next != JobPhase::LoadingModels {
             data.progress.loading_model = None;
+            data.progress.loading_for = None;
         }
         data.progress.discovered = 0;
         data.progress.total = None;

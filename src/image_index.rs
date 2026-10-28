@@ -25,27 +25,21 @@ use crate::assets::{Asset, AssetCatalog, MediaKind};
 use crate::db::SearchFilters;
 use crate::embedding::{ImageEmbedder, PreparedImage};
 use crate::index::{
-    IndexEvent, IndexObserver, IndexPhase, IndexProgressDelta, aborted, send_unless_aborted,
-    spawn_named,
+    IndexEvent, IndexObserver, IndexProgressDelta, aborted, send_unless_aborted, spawn_named,
 };
-use crate::scope::PathScope;
 
 mod storage;
 use storage::StoredImageEmbedding;
 pub use storage::{ImageIndexDb, ImageIndexReadSnapshot, ImageVectorHit, ImageVectorSearchOptions};
 
-/// Flags for an incremental image-indexing pass.
-#[derive(Debug, Clone)]
+/// Which cataloged images an incremental pass selects.
+#[derive(Debug, Clone, Copy)]
 pub struct ImageIndexOptions {
     pub force: bool,
     pub retry_failed: bool,
     pub limit: Option<usize>,
     /// Whether video frames are eligible for this pass.
     pub index_videos: bool,
-    /// Used to check whether indexed videos already have complete thumbnails.
-    pub thumbnail_database: Option<PathBuf>,
-    /// Shared writer used to persist indexed video samples and their gallery poster.
-    pub thumbnail_service: Option<crate::thumbs::ThumbnailService>,
 }
 
 impl Default for ImageIndexOptions {
@@ -55,81 +49,29 @@ impl Default for ImageIndexOptions {
             retry_failed: false,
             limit: None,
             index_videos: true,
-            thumbnail_database: None,
-            thumbnail_service: None,
         }
     }
 }
 
-/// Incrementally embed cataloged images in `scope`.
+/// Embed `sources` from [`select_catalog_images`], reporting their count as the pass's total.
+/// `thumbnails` persists video samples and their gallery poster, and is required when `sources`
+/// holds a video.
 ///
 /// Decode workers overlap source I/O with a single batched inference lane. ONNX Runtime owns all
 /// model execution parallelism; no session replicas are created.
 #[instrument(
     name = "image_index",
     skip_all,
-    fields(model = %embedder.model(), sources = tracing::field::Empty)
+    fields(model = %embedder.model(), sources = sources.len())
 )]
-pub fn index_images_observed(
+pub fn index_selected_images(
     catalog: &AssetCatalog,
     db: &mut ImageIndexDb,
     embedder: &ImageEmbedder,
-    scope: &PathScope,
-    options: ImageIndexOptions,
+    sources: Vec<Asset>,
+    thumbnails: Option<&crate::thumbs::ThumbnailService>,
     observer: &dyn IndexObserver,
 ) -> Result<bool> {
-    let assets = catalog.in_scope(scope)?;
-    index_catalog_images(catalog, db, embedder, &assets, options, observer)
-}
-
-/// Embed a supplied catalog snapshot, preserving its order when selecting pending work.
-#[instrument(
-    name = "image_index",
-    skip_all,
-    fields(model = %embedder.model(), sources = tracing::field::Empty)
-)]
-pub fn index_catalog_images_observed(
-    catalog: &AssetCatalog,
-    db: &mut ImageIndexDb,
-    embedder: &ImageEmbedder,
-    assets: &[Asset],
-    options: ImageIndexOptions,
-    observer: &dyn IndexObserver,
-) -> Result<bool> {
-    index_catalog_images(catalog, db, embedder, assets, options, observer)
-}
-
-fn index_catalog_images(
-    catalog: &AssetCatalog,
-    db: &mut ImageIndexDb,
-    embedder: &ImageEmbedder,
-    assets: &[Asset],
-    options: ImageIndexOptions,
-    observer: &dyn IndexObserver,
-) -> Result<bool> {
-    let ImageIndexOptions {
-        force,
-        retry_failed,
-        limit,
-        index_videos,
-        thumbnail_database,
-        thumbnail_service,
-    } = options;
-    observer.on_event(IndexEvent::PhaseChanged(IndexPhase::ImageEmbedding));
-    let sources = pending_catalog_images(
-        catalog,
-        db,
-        assets,
-        &ImageIndexOptions {
-            force,
-            retry_failed,
-            limit,
-            index_videos,
-            thumbnail_database: thumbnail_database.clone(),
-            thumbnail_service: thumbnail_service.clone(),
-        },
-    )?;
-    tracing::Span::current().record("sources", sources.len());
     observer.on_event(IndexEvent::Discovered {
         count: sources.len(),
     });
@@ -144,9 +86,7 @@ fn index_catalog_images(
         .iter()
         .any(|asset| asset.media_kind == MediaKind::Video)
     {
-        thumbnail_service
-            .as_ref()
-            .context("video indexing requires a thumbnail service")?;
+        thumbnails.context("video indexing requires a thumbnail service")?;
     }
 
     BoundedImagePipeline {
@@ -154,24 +94,23 @@ fn index_catalog_images(
         db,
         embedder,
         observer,
-        thumbnails: thumbnail_service.as_ref(),
+        thumbnails,
     }
     .run(sources)
 }
 
-/// Check the exact incremental selection before loading an image model.
-pub fn has_pending_catalog_images(
+/// The images and videos among `assets` that lack a current vector, in `assets` order. Run it
+/// before loading a model, so a library with nothing pending loads none. A video is current only
+/// with complete thumbnails, so `thumbnail_database` is required once one has a vector.
+#[instrument(
+    level = "info",
+    skip_all,
+    fields(assets = assets.len(), pending = tracing::field::Empty)
+)]
+pub fn select_catalog_images(
     catalog: &AssetCatalog,
     db: &ImageIndexDb,
-    assets: &[Asset],
-    options: &ImageIndexOptions,
-) -> Result<bool> {
-    Ok(!pending_catalog_images(catalog, db, assets, options)?.is_empty())
-}
-
-fn pending_catalog_images(
-    catalog: &AssetCatalog,
-    db: &ImageIndexDb,
+    thumbnail_database: Option<&Path>,
     assets: &[Asset],
     options: &ImageIndexOptions,
 ) -> Result<Vec<Asset>> {
@@ -198,10 +137,7 @@ fn pending_catalog_images(
         let video_current = db.current_video_asset_ids(&videos)?;
         if !video_current.is_empty() {
             let cache = crate::thumbs::ThumbnailDb::new_read_only(
-                options
-                    .thumbnail_database
-                    .as_deref()
-                    .context("video indexing requires a thumbnail database")?,
+                thumbnail_database.context("video indexing requires a thumbnail database")?,
             )?;
             current.extend(videos_with_complete_thumbnails(
                 db,
@@ -230,6 +166,7 @@ fn pending_catalog_images(
     if let Some(limit) = options.limit {
         sources.truncate(limit);
     }
+    tracing::Span::current().record("pending", sources.len());
     Ok(sources)
 }
 
@@ -242,10 +179,13 @@ fn is_embedding_image(asset: &Asset) -> bool {
             ))
 }
 
-fn is_embedding_candidate(asset: &Asset, index_videos: bool) -> bool {
+/// Whether image embedding covers `asset`: a decodable still image, or a video when
+/// `index_videos` is set.
+pub fn is_embedding_candidate(asset: &Asset, index_videos: bool) -> bool {
     is_embedding_image(asset) && (index_videos || asset.media_kind != MediaKind::Video)
 }
 
+#[instrument(level = "debug", skip_all, fields(videos = vector_current.len()))]
 fn videos_with_complete_thumbnails(
     db: &ImageIndexDb,
     cache: &crate::thumbs::ThumbnailDb,
@@ -842,18 +782,20 @@ mod tests {
             index_videos: false,
             ..ImageIndexOptions::default()
         };
-        assert!(!has_pending_catalog_images(
-            &catalog, &images, &assets, &options
-        )?);
-        assert!(has_pending_catalog_images(
-            &catalog,
-            &images,
-            &assets,
-            &ImageIndexOptions {
-                index_videos: true,
-                ..ImageIndexOptions::default()
-            }
-        )?);
+        assert!(select_catalog_images(&catalog, &images, None, &assets, &options)?.is_empty());
+        assert!(
+            !select_catalog_images(
+                &catalog,
+                &images,
+                None,
+                &assets,
+                &ImageIndexOptions {
+                    index_videos: true,
+                    ..ImageIndexOptions::default()
+                }
+            )?
+            .is_empty()
+        );
         Ok(())
     }
 
@@ -916,25 +858,16 @@ mod tests {
             retry_failed,
             ..ImageIndexOptions::default()
         };
-        assert!(has_pending_catalog_images(
-            &catalog,
-            &images,
-            &assets,
-            &options(false)
-        )?);
+        assert!(
+            !select_catalog_images(&catalog, &images, None, &assets, &options(false))?.is_empty()
+        );
         catalog.record_decode_failure(&assets[0])?;
-        assert!(!has_pending_catalog_images(
-            &catalog,
-            &images,
-            &assets,
-            &options(false)
-        )?);
-        assert!(has_pending_catalog_images(
-            &catalog,
-            &images,
-            &assets,
-            &options(true)
-        )?);
+        assert!(
+            select_catalog_images(&catalog, &images, None, &assets, &options(false))?.is_empty()
+        );
+        assert!(
+            !select_catalog_images(&catalog, &images, None, &assets, &options(true))?.is_empty()
+        );
         Ok(())
     }
 

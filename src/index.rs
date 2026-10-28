@@ -15,8 +15,8 @@ use tracing::{Span, debug, debug_span, error, field, info, instrument};
 use walkdir::WalkDir;
 
 use crate::assets::{
-    Asset, AssetCatalog, CatalogScanEntry, CatalogUpsertTimings, SourceFingerprint,
-    canonicalize_path, is_catalog_media, is_catalog_video, is_ocr_image,
+    Asset, AssetCatalog, CatalogUpsertTimings, SourceFingerprint, canonicalize_path,
+    is_catalog_media, is_catalog_video, is_ocr_image,
 };
 use crate::db::{DB, OcrResult};
 use crate::ocr::{PaddleOcrModels, PaddleOcrOptions, PaddleOcrPool};
@@ -30,61 +30,57 @@ const MAX_DECODE_WORKERS: usize = 4;
 
 type CatalogVideoProbeResult = (PathBuf, Option<crate::video::VideoMetadata>, Duration);
 
-pub struct IndexOptions {
+/// Which files a catalog walk visits.
+#[derive(Debug, Clone)]
+pub struct CatalogOptions {
+    /// Debug guardrail: stop the walk after this many files.
     pub limit: Option<usize>,
     pub exclude: Vec<Pattern>,
     /// Literal directories the walk skips with their whole subtree, such as a library's excluded
     /// folders. Unlike `exclude`, these are paths, so glob characters in folder names are safe.
     pub exclude_dirs: Vec<PathBuf>,
-    pub rescan: bool,
-    /// Retry source revisions whose prior decode failed, while retaining current OCR results.
-    pub retry_failed: bool,
     pub subdirs: bool,
-    pub commit_chunk_size: usize,
-    pub cleanup: bool,
-    pub max_dimensions: Option<(usize, usize)>,
-    pub ocr: PaddleOcrOptions,
 }
 
-impl Default for IndexOptions {
+impl Default for CatalogOptions {
     fn default() -> Self {
         Self {
             limit: None,
             exclude: Vec::new(),
             exclude_dirs: Vec::new(),
+            subdirs: true,
+        }
+    }
+}
+
+/// Which cataloged images OCR selects, and how it recognizes and records them.
+#[derive(Debug, Clone, Copy)]
+pub struct OcrIndexOptions {
+    /// Select every image, even those with current text.
+    pub rescan: bool,
+    /// Retry source revisions whose prior decode failed, while retaining current OCR results.
+    pub retry_failed: bool,
+    /// Skip images larger than this (width, height).
+    pub max_dimensions: Option<(usize, usize)>,
+    pub commit_chunk_size: usize,
+    pub paddle: PaddleOcrOptions,
+}
+
+impl Default for OcrIndexOptions {
+    fn default() -> Self {
+        Self {
             rescan: false,
             retry_failed: false,
-            subdirs: true,
-            commit_chunk_size: DEFAULT_COMMIT_CHUNK_SIZE,
-            cleanup: false,
             max_dimensions: None,
-            ocr: PaddleOcrOptions::default(),
+            commit_chunk_size: DEFAULT_COMMIT_CHUNK_SIZE,
+            paddle: PaddleOcrOptions::default(),
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IndexSummary {
-    pub indexed: usize,
-    pub deleted: usize,
-    pub cancelled: bool,
-    /// Discovery and cataloging exhausted their scope without access errors or reaching a debug
-    /// limit.
-    pub scan_complete: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CatalogSummary {
     pub cataloged: usize,
-    pub cancelled: bool,
-    pub scan_complete: bool,
-}
-
-/// Work found by one directory walk. Only new or changed rows enter derived indexing;
-/// unseen paths are candidates for verified deletion after a complete walk.
-pub struct CatalogDelta {
-    pub cataloged: Vec<Asset>,
-    pub unseen_paths: Vec<PathBuf>,
     pub cancelled: bool,
     pub scan_complete: bool,
 }
@@ -99,7 +95,6 @@ pub enum IndexPhase {
     ImageEmbedding,
     TextEmbedding,
     Pruning,
-    Cleanup,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -158,63 +153,6 @@ pub trait IndexObserver: Send + Sync {
     fn on_event(&self, _event: IndexEvent) {}
 }
 
-/// Scan and catalog a root without starting any derived work.
-///
-/// Only `IndexOptions::exclude`, `IndexOptions::limit`, and `IndexOptions::subdirs` apply. Changed
-/// assets are committed in bounded batches; progress is published only after each batch is durable
-/// and visible to concurrent SQLite readers.
-pub fn catalog_dir_observed(
-    assets: &AssetCatalog,
-    path: &Path,
-    options: IndexOptions,
-    observer: &dyn IndexObserver,
-) -> Result<CatalogSummary> {
-    catalog_dir_with_step(assets, path, options, observer, |_| Ok(false))
-}
-
-/// Catalog a directory and pass its committed assets, in scan order, to derived work.
-/// Returning true from the step cancels the job without discarding committed results.
-pub fn catalog_dir_with_step(
-    assets: &AssetCatalog,
-    path: &Path,
-    options: IndexOptions,
-    observer: &dyn IndexObserver,
-    catalog_step: impl FnOnce(&[Asset]) -> Result<bool>,
-) -> Result<CatalogSummary> {
-    let (catalog, mut summary) = catalog_snapshot(assets, path, options, observer)?;
-    summary.cancelled = summary.cancelled || catalog_step(&catalog)? || observer.is_cancelled();
-    Ok(summary)
-}
-
-/// Discover new, changed, and missing catalog paths without probing unchanged media. `path` is
-/// used as spelled, like `catalog_snapshot`'s.
-pub fn catalog_delta_dir_observed(
-    assets: &AssetCatalog,
-    path: &Path,
-    options: IndexOptions,
-    observer: &dyn IndexObserver,
-) -> Result<CatalogDelta> {
-    anyhow::ensure!(path.is_absolute(), "catalog path must be absolute: {path}");
-    let root = path.to_owned();
-    let pipeline = CatalogPipeline {
-        assets,
-        options: &options,
-        observer,
-    };
-    let files = pipeline.collect_files(&root, ScanSelection::Delta)?;
-    let (cataloged, catalog_complete) = if pipeline.cancelled() {
-        (Vec::new(), false)
-    } else {
-        pipeline.catalog_files(&files.paths)?
-    };
-    Ok(CatalogDelta {
-        cataloged,
-        unseen_paths: files.unseen_paths,
-        cancelled: pipeline.cancelled(),
-        scan_complete: files.complete && catalog_complete && !pipeline.cancelled(),
-    })
-}
-
 /// Scan and catalog a directory, returning every asset the walk visited in scan order. Unchanged
 /// assets keep their rows; only new or changed files are probed. `path` is used as spelled and
 /// links below it are not resolved, so pass a canonical library root or a path built from one.
@@ -226,17 +164,17 @@ pub fn catalog_delta_dir_observed(
 pub fn catalog_snapshot(
     assets: &AssetCatalog,
     path: &Path,
-    options: IndexOptions,
+    options: &CatalogOptions,
     observer: &dyn IndexObserver,
 ) -> Result<(Vec<Asset>, CatalogSummary)> {
     anyhow::ensure!(path.is_absolute(), "catalog path must be absolute: {path}");
     let root = path.to_owned();
     let pipeline = CatalogPipeline {
         assets,
-        options: &options,
+        options,
         observer,
     };
-    let files = pipeline.collect_files(&root, ScanSelection::All)?;
+    let files = pipeline.collect_files(&root)?;
     let (catalog, catalog_complete) = if pipeline.cancelled() {
         (Vec::new(), false)
     } else {
@@ -253,54 +191,6 @@ pub fn catalog_snapshot(
     span.record("cataloged", summary.cataloged);
     span.record("cancelled", summary.cancelled);
     Ok((catalog, summary))
-}
-
-/// Scan and catalog a root, then OCR its new or changed images with the loaded PaddleOCR pair.
-///
-/// Cataloging finishes before derived work. OCR decode and completion order may differ from scan
-/// order; see [`BoundedOcrPipeline`].
-pub fn index_dir_observed(
-    assets: &mut AssetCatalog,
-    db: &mut DB,
-    models: &mut PaddleOcrPool,
-    path: &Path,
-    options: IndexOptions,
-    observer: &dyn IndexObserver,
-) -> Result<IndexSummary> {
-    index_dir_with_catalog_step(assets, db, models, path, options, observer, |_| Ok(false))
-}
-
-/// Run an additional derived-index step with committed assets in scan order, before OCR.
-/// Returning true cancels the remaining work while retaining committed results.
-pub fn index_dir_with_catalog_step(
-    assets: &mut AssetCatalog,
-    db: &mut DB,
-    models: &mut PaddleOcrPool,
-    path: &Path,
-    options: IndexOptions,
-    observer: &dyn IndexObserver,
-    catalog_step: impl FnOnce(&[Asset]) -> Result<bool>,
-) -> Result<IndexSummary> {
-    if options.commit_chunk_size == 0 {
-        bail!("OCR commit chunk size must be greater than zero");
-    }
-    options.ocr.validate()?;
-    IndexPipeline {
-        assets,
-        db,
-        models,
-        options,
-        observer,
-    }
-    .run(path, catalog_step)
-}
-
-struct IndexPipeline<'a> {
-    assets: &'a mut AssetCatalog,
-    db: &'a mut DB,
-    models: &'a mut PaddleOcrPool,
-    options: IndexOptions,
-    observer: &'a dyn IndexObserver,
 }
 
 /// The images in a catalog pass that still need text recognition.
@@ -323,13 +213,18 @@ impl OcrSelection {
 
 /// Choose which assets of `catalog` need OCR: current images without a result for their present
 /// fingerprint, skipping recorded decode failures and images over `options.max_dimensions`.
-/// `options.rescan` selects every image and `options.retry_failed` retries decode failures.
+/// `options.rescan` selects every image and `options.retry_failed` retries decode failures. Run
+/// it before loading the models, so a library with nothing pending loads none.
+#[instrument(
+    level = "info",
+    skip_all,
+    fields(assets = catalog.len(), pending = field::Empty)
+)]
 pub fn select_ocr_sources(
     assets: &AssetCatalog,
     db: &DB,
     catalog: &[Asset],
-    options: &IndexOptions,
-    observer: &dyn IndexObserver,
+    options: &OcrIndexOptions,
 ) -> Result<OcrSelection> {
     let image_fingerprints = catalog
         .iter()
@@ -356,9 +251,6 @@ pub fn select_ocr_sources(
     let mut sources = Vec::new();
     let mut skipped = 0;
     for asset in catalog {
-        if observer.is_cancelled() {
-            break;
-        }
         if !is_ocr_image(asset)
             || current.contains(&asset.asset_id)
             || decode_failed.contains(&asset.asset_id)
@@ -379,6 +271,7 @@ pub fn select_ocr_sources(
         }
         sources.push(asset.clone());
     }
+    Span::current().record("pending", sources.len());
     Ok(OcrSelection {
         sources,
         total: catalog.len(),
@@ -386,36 +279,46 @@ pub fn select_ocr_sources(
     })
 }
 
-/// Recognize a selection with loaded models, announcing the OCR phase first. Returns how many
-/// assets were indexed; cancellation stops early with committed results retained.
+/// Recognize a selection from [`select_ocr_sources`] with loaded models, reporting the pass's
+/// total first. Returns how many assets were indexed; cancellation stops early with committed
+/// results retained.
+#[instrument(
+    name = "ocr",
+    skip_all,
+    fields(
+        sources = selection.len(),
+        decode_workers = field::Empty,
+        inference_workers = field::Empty,
+        decoded_capacity = field::Empty,
+        indexed = field::Empty
+    )
+)]
 pub fn recognize_selection(
     assets: &AssetCatalog,
     db: &mut DB,
     models: &mut PaddleOcrPool,
     selection: OcrSelection,
-    options: &IndexOptions,
+    options: &OcrIndexOptions,
     observer: &dyn IndexObserver,
 ) -> Result<usize> {
     if options.commit_chunk_size == 0 {
         bail!("OCR commit chunk size must be greater than zero");
     }
-    options.ocr.validate()?;
-    announce_ocr_selection(observer, selection.total, selection.skipped);
-    let mut sources = selection.sources;
-    sources.retain(is_ocr_image);
+    options.paddle.validate()?;
+    report_ocr_selection(observer, selection.total, selection.skipped);
     BoundedOcrPipeline {
         assets,
         db,
         models,
-        options: options.ocr,
+        options: options.paddle,
         commit_chunk_size: options.commit_chunk_size,
         observer,
     }
-    .run(sources)
+    .run(selection.sources)
 }
 
-fn announce_ocr_selection(observer: &dyn IndexObserver, total: usize, skipped: usize) {
-    observer.on_event(IndexEvent::PhaseChanged(IndexPhase::Ocr));
+/// Every asset of the pass counts towards OCR progress; the ones selection skipped are done.
+fn report_ocr_selection(observer: &dyn IndexObserver, total: usize, skipped: usize) {
     observer.on_event(IndexEvent::DiscoveryComplete { total });
     if skipped > 0 {
         observer.on_event(IndexEvent::Progress(IndexProgressDelta {
@@ -427,165 +330,9 @@ fn announce_ocr_selection(observer: &dyn IndexObserver, total: usize, skipped: u
     }
 }
 
-impl IndexPipeline<'_> {
-    #[instrument(
-        name = "index",
-        skip_all,
-        fields(root = %path, indexed = field::Empty, deleted = field::Empty, cancelled = field::Empty)
-    )]
-    fn run(
-        &mut self,
-        path: &Path,
-        catalog_step: impl FnOnce(&[Asset]) -> Result<bool>,
-    ) -> Result<IndexSummary> {
-        let root = canonicalize_path(path).context("canonicalizing index path")?;
-        let (selection, scan_complete) = {
-            let Some((catalog, scan_complete)) = self.prepare_catalog(&root)? else {
-                return Ok(record_summary(cancelled_summary(0)));
-            };
-            let selection = self.select_ocr_sources(&catalog)?;
-            if catalog_step(&catalog)? || self.cancelled() {
-                return Ok(record_summary(cancelled_summary(0)));
-            }
-            (selection, scan_complete)
-        };
-        // The derived catalog step may have switched the shared observer to image embedding.
-        // Announce OCR only after that step returns so its completions cannot be accumulated under
-        // the image phase. Selection still happens first so a CLIP decode failure recorded by the
-        // derived step cannot suppress an independent OCR attempt in this same run.
-        announce_ocr_selection(self.observer, selection.total, selection.skipped);
-        let indexed = self.run_ocr(selection.sources)?;
-        if self.cancelled() {
-            return Ok(record_summary(cancelled_summary(indexed)));
-        }
-
-        let mut summary = self.finish_cleanup(indexed)?;
-        summary.scan_complete = scan_complete;
-        Ok(record_summary(summary))
-    }
-
-    fn prepare_catalog(&mut self, root: &Path) -> Result<Option<(Vec<Asset>, bool)>> {
-        let files = CatalogPipeline {
-            assets: &*self.assets,
-            options: &self.options,
-            observer: self.observer,
-        }
-        .collect_files(root, ScanSelection::All)?;
-        if self.cancelled() {
-            return Ok(None);
-        }
-        // Preserve the catalog-first barrier introduced in e19f372. OCR is a derived index; it
-        // must not delay otherwise usable image paths from becoming visible to the gallery.
-        let (catalog, catalog_complete) = CatalogPipeline {
-            assets: &*self.assets,
-            options: &self.options,
-            observer: self.observer,
-        }
-        .catalog_files(&files.paths)?;
-        if self.cancelled() {
-            return Ok(None);
-        }
-        let scan_complete = files.complete && catalog_complete;
-        // Legacy OCR-only mark/sweep cannot represent excluded or unvisited paths.
-        self.options.cleanup &= scan_complete
-            && self.options.subdirs
-            && self.options.exclude.is_empty()
-            && self.options.exclude_dirs.is_empty();
-        if self.options.cleanup {
-            self.db.mark_for_deletion(root)?;
-        }
-        Ok(Some((catalog, scan_complete)))
-    }
-
-    #[instrument(
-        name = "select",
-        skip_all,
-        fields(catalog = catalog.len(), sources = field::Empty)
-    )]
-    fn select_ocr_sources(&mut self, catalog: &[Asset]) -> Result<OcrSelection> {
-        if self.options.cleanup {
-            // A present image is not stale even when unchanged, over the caller's dimension limit,
-            // or a new OCR attempt fails. Cleanup removes disappeared sources, not good old results.
-            let asset_ids = catalog
-                .iter()
-                .filter(|asset| is_ocr_image(asset))
-                .map(|asset| asset.asset_id)
-                .collect::<Vec<_>>();
-            self.db.unmark_assets(&asset_ids)?;
-        }
-        let selection =
-            select_ocr_sources(self.assets, self.db, catalog, &self.options, self.observer)?;
-        Span::current().record("sources", selection.sources.len());
-        Ok(selection)
-    }
-
-    #[instrument(
-        name = "ocr",
-        skip_all,
-        fields(
-            sources = sources.len(),
-            decode_workers = field::Empty,
-            inference_workers = field::Empty,
-            decoded_capacity = field::Empty,
-            indexed = field::Empty
-        )
-    )]
-    fn run_ocr(&mut self, mut sources: Vec<Asset>) -> Result<usize> {
-        // Keep the OCR boundary explicit even if a caller bypasses normal selection during a
-        // forced rescan or a retry of a failed source.
-        sources.retain(is_ocr_image);
-        BoundedOcrPipeline {
-            assets: self.assets,
-            db: self.db,
-            models: self.models,
-            options: self.options.ocr,
-            commit_chunk_size: self.options.commit_chunk_size,
-            observer: self.observer,
-        }
-        .run(sources)
-    }
-
-    #[instrument(name = "cleanup", skip_all, fields(deleted = field::Empty))]
-    fn finish_cleanup(&mut self, indexed: usize) -> Result<IndexSummary> {
-        self.phase(IndexPhase::Cleanup);
-        self.observer
-            .on_event(IndexEvent::DiscoveryComplete { total: 1 });
-        let deleted = if self.options.cleanup {
-            self.db.sweep_deletions()?
-        } else {
-            0
-        };
-        self.progress(IndexProgressDelta {
-            phase_completed: 1,
-            deleted,
-            ..IndexProgressDelta::default()
-        });
-        Span::current().record("deleted", deleted);
-        debug!("swept stale OCR entries");
-        Ok(IndexSummary {
-            indexed,
-            deleted,
-            cancelled: false,
-            scan_complete: false,
-        })
-    }
-
-    fn cancelled(&self) -> bool {
-        self.observer.is_cancelled()
-    }
-
-    fn phase(&self, phase: IndexPhase) {
-        self.observer.on_event(IndexEvent::PhaseChanged(phase));
-    }
-
-    fn progress(&self, delta: IndexProgressDelta) {
-        self.observer.on_event(IndexEvent::Progress(delta));
-    }
-}
-
 struct CatalogPipeline<'a> {
     assets: &'a AssetCatalog,
-    options: &'a IndexOptions,
+    options: &'a CatalogOptions,
     observer: &'a dyn IndexObserver,
 }
 
@@ -672,24 +419,13 @@ fn run_catalog_video_probes(
 
 struct DiscoveredFiles {
     paths: Vec<PathBuf>,
-    unseen_paths: Vec<PathBuf>,
     complete: bool,
-}
-
-#[derive(Clone, Copy)]
-enum ScanSelection {
-    All,
-    Delta,
 }
 
 impl CatalogPipeline<'_> {
     #[instrument(name = "scan", skip_all, fields(files = field::Empty))]
-    fn collect_files(&self, root: &Path, selection: ScanSelection) -> Result<DiscoveredFiles> {
+    fn collect_files(&self, root: &Path) -> Result<DiscoveredFiles> {
         self.phase(IndexPhase::Scanning);
-        let mut existing: Option<HashMap<PathBuf, CatalogScanEntry>> = match selection {
-            ScanSelection::All => None,
-            ScanSelection::Delta => Some(self.assets.scan_entries_under_root(root)?),
-        };
         let mut walker = WalkDir::new(root).follow_links(true);
         if !self.options.subdirs {
             walker = walker.max_depth(1);
@@ -746,29 +482,6 @@ impl CatalogPipeline<'_> {
             if !is_catalog_media(&source_path) {
                 continue;
             }
-            // Removing every visited path leaves only possible deletions at the end of the walk.
-            if let Some(existing) = &mut existing
-                && let Some(known) = existing.remove(&source_path)
-            {
-                // WalkDir reuses directory-entry metadata on Windows for ordinary files.
-                let current = (|| -> Result<bool> { known.is_current(&entry.metadata()?) })();
-                match current {
-                    Ok(true) => continue,
-                    Ok(false) => {}
-                    Err(error) => {
-                        complete = false;
-                        self.report_item_error(
-                            Some(source_path),
-                            format!("checking catalog source metadata failed: {error}"),
-                        );
-                        self.progress(IndexProgressDelta {
-                            failed: 1,
-                            ..IndexProgressDelta::default()
-                        });
-                        continue;
-                    }
-                }
-            }
             // A limit only leaves the walk incomplete once another file is actually left out.
             if self.options.limit.is_some_and(|limit| files.len() >= limit) {
                 complete = false;
@@ -783,14 +496,6 @@ impl CatalogPipeline<'_> {
         Span::current().record("files", files.len());
         Ok(DiscoveredFiles {
             paths: files,
-            // An incomplete walk cannot establish absence, so never expose deletion candidates.
-            unseen_paths: if complete {
-                existing
-                    .map(|entries| entries.into_keys().collect())
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            },
             complete: complete && !self.cancelled(),
         })
     }
@@ -1518,23 +1223,6 @@ fn decode_image(path: &Path) -> Result<RgbImage> {
         .context("assembling decoded image buffer")
 }
 
-fn record_summary(summary: IndexSummary) -> IndexSummary {
-    let span = Span::current();
-    span.record("indexed", summary.indexed);
-    span.record("deleted", summary.deleted);
-    span.record("cancelled", summary.cancelled);
-    summary
-}
-
-fn cancelled_summary(indexed: usize) -> IndexSummary {
-    IndexSummary {
-        indexed,
-        deleted: 0,
-        cancelled: true,
-        scan_complete: false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -1574,7 +1262,7 @@ mod tests {
         std::fs::write(&video, b"video")?;
         let observer = EventObserver::default();
 
-        catalog_snapshot(&assets, &root, IndexOptions::default(), &observer)?;
+        catalog_snapshot(&assets, &root, &CatalogOptions::default(), &observer)?;
         let active = observer
             .0
             .lock()
@@ -1588,7 +1276,7 @@ mod tests {
         assert_eq!(active, [(video.clone(), true), (video, false)]);
 
         observer.0.lock().unwrap().clear();
-        catalog_snapshot(&assets, &root, IndexOptions::default(), &observer)?;
+        catalog_snapshot(&assets, &root, &CatalogOptions::default(), &observer)?;
         assert!(
             observer
                 .0
@@ -1613,7 +1301,7 @@ mod tests {
         let (cataloged, summary) = catalog_snapshot(
             &assets,
             &root,
-            IndexOptions::default(),
+            &CatalogOptions::default(),
             &EventObserver::default(),
         )?;
         assert!(summary.scan_complete);
@@ -1648,34 +1336,22 @@ mod tests {
     }
 
     #[test]
-    fn ocr_progress_is_reannounced_after_a_derived_catalog_step() {
+    fn ocr_counts_skipped_assets_as_done() {
         let observer = EventObserver::default();
-        observer.on_event(IndexEvent::PhaseChanged(IndexPhase::ImageEmbedding));
-        observer.on_event(IndexEvent::DiscoveryComplete { total: 71_882 });
-        observer.on_event(IndexEvent::Progress(IndexProgressDelta {
-            phase_completed: 71_882,
-            ..IndexProgressDelta::default()
-        }));
-
-        announce_ocr_selection(&observer, 72_228, 71_882);
-
+        report_ocr_selection(&observer, 72_228, 71_882);
         let events = observer.0.lock().unwrap();
-        assert!(matches!(
-            events[3],
-            IndexEvent::PhaseChanged(IndexPhase::Ocr)
-        ));
-        assert!(matches!(
-            events[4],
-            IndexEvent::DiscoveryComplete { total: 72_228 }
-        ));
-        assert!(matches!(
-            events[5],
-            IndexEvent::Progress(IndexProgressDelta {
-                phase_completed: 71_882,
-                skipped: 71_882,
-                ..
-            })
-        ));
+        assert_eq!(
+            *events,
+            [
+                IndexEvent::DiscoveryComplete { total: 72_228 },
+                IndexEvent::Progress(IndexProgressDelta {
+                    phase_completed: 71_882,
+                    processed: 71_882,
+                    skipped: 71_882,
+                    ..IndexProgressDelta::default()
+                }),
+            ]
+        );
     }
 
     /// A directory link that needs no privileges: a junction on Windows, a symlink elsewhere.
@@ -1708,23 +1384,23 @@ mod tests {
         link_dir(&private.join("nested"), &library.join("nested-alias"))?;
 
         let observer = TestObserver { cancelled: false };
-        let options = IndexOptions {
+        let options = CatalogOptions {
             exclude_dirs: vec![private],
-            ..IndexOptions::default()
+            ..CatalogOptions::default()
         };
         let files = CatalogPipeline {
             assets: &assets,
             options: &options,
             observer: &observer,
         }
-        .collect_files(&library, ScanSelection::All)?
+        .collect_files(&library)?
         .paths;
         assert_eq!(files, [library.join("kept.png")]);
         Ok(())
     }
 
     #[test]
-    fn derived_step_receives_scan_order_instead_of_insertion_order() -> Result<()> {
+    fn catalog_returns_scan_order_instead_of_insertion_order() -> Result<()> {
         let temp = TempDir::new()?;
         let root = canonicalize_path(&PathBuf::try_from(temp.path().to_owned())?)?;
         let assets = AssetCatalog::new(&root.join("assets.db"))?;
@@ -1732,72 +1408,29 @@ mod tests {
             std::fs::write(root.join(name), b"unreadable image")?;
         }
         let observer = TestObserver { cancelled: false };
-        let options = IndexOptions::default();
+        let options = CatalogOptions::default();
         let expected = CatalogPipeline {
             assets: &assets,
             options: &options,
             observer: &observer,
         }
-        .collect_files(&root, ScanSelection::All)?
+        .collect_files(&root)?
         .paths;
         for path in expected.iter().rev() {
             assets.upsert(path, &path.metadata()?)?;
         }
-        let mut called = false;
-        let summary = catalog_dir_with_step(&assets, &root, options, &observer, |catalog| {
-            called = true;
-            assert_eq!(
-                catalog.iter().map(|asset| &asset.path).collect::<Vec<_>>(),
-                expected.iter().collect::<Vec<_>>()
-            );
-            assert!(
-                catalog
-                    .windows(2)
-                    .all(|pair| pair[0].asset_id > pair[1].asset_id)
-            );
-            Ok(false)
-        })?;
-        assert!(called);
+        let (catalog, summary) = catalog_snapshot(&assets, &root, &options, &observer)?;
+        assert_eq!(
+            catalog.iter().map(|asset| &asset.path).collect::<Vec<_>>(),
+            expected.iter().collect::<Vec<_>>()
+        );
+        assert!(
+            catalog
+                .windows(2)
+                .all(|pair| pair[0].asset_id > pair[1].asset_id)
+        );
         assert!(summary.scan_complete);
         assert_eq!(summary.cataloged, 3);
-        Ok(())
-    }
-
-    #[test]
-    fn delta_catalog_classifies_new_changed_unchanged_and_unseen_paths() -> Result<()> {
-        let temp = TempDir::new()?;
-        let root = canonicalize_path(&PathBuf::try_from(temp.path().to_owned())?)?;
-        let assets = AssetCatalog::new(&root.join("assets.db"))?;
-        let existing = root.join("existing.png");
-        std::fs::write(&existing, b"original")?;
-        let original = assets.upsert(&existing, &existing.metadata()?)?;
-        std::fs::write(&existing, b"changed content")?;
-        let unchanged = root.join("unchanged.png");
-        std::fs::write(&unchanged, b"unchanged")?;
-        assets.upsert(&unchanged, &unchanged.metadata()?)?;
-        let missing = root.join("missing.png");
-        std::fs::write(&missing, b"removed")?;
-        assets.upsert(&missing, &missing.metadata()?)?;
-        std::fs::remove_file(&missing)?;
-        let new_path = root.join("new.png");
-        std::fs::write(&new_path, b"new")?;
-
-        let observer = TestObserver { cancelled: false };
-        let delta = catalog_delta_dir_observed(&assets, &root, IndexOptions::default(), &observer)?;
-        let mut passed = delta
-            .cataloged
-            .iter()
-            .map(|asset| asset.path.clone())
-            .collect::<Vec<_>>();
-        passed.sort();
-        assert_eq!(passed, vec![existing.clone(), new_path]);
-        assert_eq!(delta.unseen_paths, vec![missing]);
-        assert!(delta.scan_complete);
-        assert_ne!(
-            assets.get_by_path(&existing)?.unwrap().fingerprint,
-            original.fingerprint
-        );
-        assert!(assets.get_by_path(&unchanged)?.is_some());
         Ok(())
     }
 
@@ -1807,61 +1440,34 @@ mod tests {
         let root = PathBuf::try_from(temp.path().to_owned())?;
         let assets = AssetCatalog::new(&root.join("assets.db"))?;
         let observer = TestObserver { cancelled: false };
-        let options = IndexOptions::default();
+        let options = CatalogOptions::default();
         let scan = CatalogPipeline {
             assets: &assets,
             options: &options,
             observer: &observer,
         };
-        assert!(scan.collect_files(&root, ScanSelection::All)?.complete);
-        assert!(
-            !scan
-                .collect_files(&root.join("unavailable"), ScanSelection::All)?
-                .complete
-        );
+        assert!(scan.collect_files(&root)?.complete);
+        assert!(!scan.collect_files(&root.join("unavailable"))?.complete);
         std::fs::write(root.join("a.png"), b"a")?;
         std::fs::write(root.join("b.png"), b"b")?;
         // A limit the walk never reaches leaves it complete; reaching it with a file left does not.
         for (limit, complete) in [(100, true), (2, true), (1, false)] {
-            let limited = IndexOptions {
+            let limited = CatalogOptions {
                 limit: Some(limit),
-                ..IndexOptions::default()
+                ..CatalogOptions::default()
             };
             let files = CatalogPipeline {
                 options: &limited,
                 ..scan
             }
-            .collect_files(&root, ScanSelection::All)?;
+            .collect_files(&root)?;
             assert_eq!(files.complete, complete, "limit {limit}");
             assert_eq!(files.paths.len(), limit.min(2), "limit {limit}");
         }
         let cancelled = TestObserver { cancelled: true };
-        let summary = catalog_dir_observed(&assets, &root, options, &cancelled)?;
+        let (_, summary) = catalog_snapshot(&assets, &root, &options, &cancelled)?;
         assert!(summary.cancelled);
         assert!(!summary.scan_complete);
-        Ok(())
-    }
-
-    #[test]
-    fn incomplete_delta_does_not_offer_paths_for_deletion() -> Result<()> {
-        let temp = TempDir::new()?;
-        let root = canonicalize_path(&PathBuf::try_from(temp.path().to_owned())?)?;
-        let assets = AssetCatalog::new(&root.join("assets.db"))?;
-        let missing = root.join("missing.png");
-        std::fs::write(&missing, b"removed")?;
-        assets.upsert(&missing, &missing.metadata()?)?;
-        std::fs::remove_file(&missing)?;
-        std::fs::write(root.join("a.png"), b"a")?;
-        std::fs::write(root.join("b.png"), b"b")?;
-        let observer = TestObserver { cancelled: false };
-        let options = IndexOptions {
-            limit: Some(1),
-            ..IndexOptions::default()
-        };
-        let delta = catalog_delta_dir_observed(&assets, &root, options, &observer)?;
-        assert!(!delta.scan_complete);
-        assert!(delta.unseen_paths.is_empty());
-        assert!(assets.get_by_path(&missing)?.is_some());
         Ok(())
     }
 
@@ -1887,7 +1493,7 @@ mod tests {
         let temp = TempDir::new()?;
         let root = PathBuf::try_from(temp.path().to_owned())?;
         let assets = AssetCatalog::new(&root.join("assets.db"))?;
-        let options = IndexOptions::default();
+        let options = CatalogOptions::default();
         let observer = TestObserver { cancelled: false };
         let catalog = CatalogPipeline {
             assets: &assets,
@@ -1973,11 +1579,10 @@ mod tests {
     }
 
     #[test]
-    fn default_index_options_keep_durable_chunks_small() {
-        let options = IndexOptions::default();
+    fn default_ocr_options_keep_durable_chunks_small() {
+        let options = OcrIndexOptions::default();
         assert_eq!(options.commit_chunk_size, 32);
-        assert!(options.subdirs);
         assert!(!options.rescan);
-        assert!(!options.cleanup);
+        assert!(CatalogOptions::default().subdirs);
     }
 }

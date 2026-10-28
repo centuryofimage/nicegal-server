@@ -96,7 +96,7 @@ async fn status(
             stored,
             indexed: coverage.indexed,
             embedded: coverage.embedded,
-            pending: coverage.pending(),
+            pending: coverage.pending,
             last_indexed_at: coverage
                 .last_indexed_ns
                 .map(|ns| ns.div_euclid(1_000_000_000)),

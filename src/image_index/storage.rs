@@ -171,6 +171,7 @@ impl ImageIndexDb {
         Ok(())
     }
 
+    #[tracing::instrument(level = "debug", skip_all, fields(assets = fingerprints.len()))]
     pub(super) fn current_asset_ids(
         &self,
         fingerprints: &[(i64, SourceFingerprint)],
@@ -187,6 +188,7 @@ impl ImageIndexDb {
     }
 
     /// Video currency also includes the decoder's sampling policy.
+    #[tracing::instrument(level = "debug", skip_all, fields(assets = fingerprints.len()))]
     pub(super) fn current_video_asset_ids(
         &self,
         fingerprints: &[(i64, SourceFingerprint)],
@@ -202,6 +204,7 @@ impl ImageIndexDb {
     }
 
     /// Sample keys currently exposed to search for selected videos. No vector rows are read.
+    #[tracing::instrument(level = "debug", skip_all, fields(videos = asset_ids.len()))]
     pub(super) fn video_sample_timestamps_for_assets(
         &self,
         asset_ids: &std::collections::HashSet<i64>,

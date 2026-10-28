@@ -6,6 +6,7 @@ mod identifier;
 mod image_embeddings;
 mod image_model;
 mod image_patches;
+mod indexing;
 mod jobs;
 mod libraries;
 mod library_scan;

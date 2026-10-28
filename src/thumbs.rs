@@ -18,7 +18,6 @@ use crate::poster;
 use crate::video;
 
 pub const SIZE_BUCKETS: [u16; 4] = [128, 256, 512, 1024];
-pub const EAGER_SIZE_BUCKETS: [u16; 3] = [128, 256, 512];
 /// Indexed video frames other than the poster only appear as matched-frame grid tiles.
 /// Skipping 1024 saves about two thirds of their storage; readers fall back to 512.
 pub const VIDEO_FRAME_SIZE_BUCKETS: [u16; 3] = [128, 256, 512];
@@ -1222,12 +1221,32 @@ mod tests {
         db.store_video_samples(&kept, std::slice::from_ref(&sample))?;
         db.store_video_samples(&orphan, &[sample])?;
 
-        // Existing version-4 databases predate the narrow pruning index.
+        // A version-4 database, with its asset-only indexes, migrates to the fingerprint ones.
         let thumbnail_path = PathBuf::try_from(temp.path().join("thumbnails.db"))?;
         drop(db);
-        rusqlite::Connection::open(&thumbnail_path)?
-            .execute_batch("DROP INDEX video_thumbnail_assets_idx")?;
+        let conn = rusqlite::Connection::open(&thumbnail_path)?;
+        conn.execute_batch(
+            "DROP INDEX thumbnail_current_idx;
+             DROP INDEX video_thumbnail_current_idx;
+             CREATE INDEX thumbnail_lookup_idx ON thumbnails(asset_id, generator_version, size_bucket);
+             CREATE INDEX video_thumbnail_assets_idx ON video_thumbnails(asset_id);
+             PRAGMA user_version = 4;",
+        )?;
+        drop(conn);
         let db = ThumbnailDb::new(&thumbnail_path)?;
+        let conn = rusqlite::Connection::open(&thumbnail_path)?;
+        let indexes = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'index' ORDER BY name")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert_eq!(
+            indexes,
+            ["thumbnail_current_idx", "video_thumbnail_current_idx"]
+        );
+        assert_eq!(
+            conn.pragma_query_value(None, "user_version", |row| row.get::<_, i32>(0))?,
+            5
+        );
 
         assert_eq!(db.prune_orphans(&catalog_path)?, 8);
         assert_eq!(db.prune_orphans(&catalog_path)?, 0);

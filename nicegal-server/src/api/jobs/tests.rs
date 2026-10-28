@@ -82,6 +82,33 @@ fn model_preparation_wire_contract_and_progress() {
 }
 
 #[test]
+fn scan_model_loads_detour_from_the_phase_they_serve() {
+    let job = Job::new(9, JobKind::LibraryScan);
+    assert!(job.begin());
+    job.on_event(IndexEvent::PhaseChanged(IndexPhase::ImageEmbedding));
+    job.loading_model("Image model", "test/image");
+    let loading = serde_json::to_value(job.response()).unwrap();
+    assert_eq!(loading["phase"], "loadingModels");
+    assert_eq!(loading["progress"]["loadingFor"], "imageEmbedding");
+    assert_eq!(loading["progress"]["total"], 1);
+    job.model_loaded();
+    let resumed = serde_json::to_value(job.response()).unwrap();
+    assert_eq!(resumed["phase"], "imageEmbedding");
+    assert!(resumed["progress"].get("loadingFor").is_none());
+    assert!(resumed["progress"]["total"].is_null());
+    assert_eq!(resumed["progress"]["modelsLoaded"], 1);
+
+    let prepare = Job::new(10, JobKind::ModelPrepare);
+    assert!(prepare.begin());
+    prepare.expect_models(1);
+    prepare.loading_model("Image model", "test/image");
+    let response = serde_json::to_value(prepare.response()).unwrap();
+    assert!(response["progress"].get("loadingFor").is_none());
+    prepare.model_loaded();
+    assert_eq!(prepare.response().phase, JobPhase::LoadingModels);
+}
+
+#[test]
 fn job_observer_tracks_progress_and_cancellation() {
     let job = Job::new(7, JobKind::LibraryScan);
     assert!(job.begin());
@@ -181,7 +208,6 @@ fn throughput_resets_when_indexing_phase_changes() {
         IndexPhase::Cataloging,
         IndexPhase::Thumbnails,
         IndexPhase::Ocr,
-        IndexPhase::Cleanup,
         IndexPhase::ImageEmbedding,
         IndexPhase::TextEmbedding,
     ] {

@@ -14,8 +14,8 @@ mod upsert;
 pub use media::{is_catalog_media, is_catalog_video, is_ocr_image};
 pub use paths::canonicalize_path;
 pub use search::{FileSearchField, FileSearchHit};
+pub(crate) use upsert::CatalogUpsertTimings;
 pub use upsert::SourceFingerprint;
-pub(crate) use upsert::{CatalogScanEntry, CatalogUpsertTimings};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaKind {

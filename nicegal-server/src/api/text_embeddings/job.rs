@@ -3,10 +3,10 @@
 //! Runs independently or after OCR indexing without rescanning images.
 
 use crate::api::jobs::cancel_if;
-use camino::Utf8PathBuf as PathBuf;
+use anyhow::Context;
 use nicegal_core::db::{DB, SearchFilters, TextEmbedding, TextEmbeddingSpace};
 use nicegal_core::embedding::TextEmbedder;
-use nicegal_core::index::{IndexEvent, IndexObserver, IndexPhase, IndexProgressDelta};
+use nicegal_core::index::{IndexEvent, IndexObserver, IndexProgressDelta};
 use nicegal_core::scope::PathScope;
 use serde::Deserialize;
 
@@ -37,39 +37,34 @@ pub(crate) struct Request {
 
 #[derive(Debug)]
 pub(crate) struct Spec {
-    /// Set for a standalone job; its scope is read from the library when the job runs.
-    library_id: Option<i64>,
-    scope: PathScope,
-    force: bool,
-    batch_size: Option<usize>,
-    debug_limit: Option<usize>,
+    library_id: i64,
+    options: TextEmbedOptions,
+}
+
+/// How a text embedding pass runs.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct TextEmbedOptions {
+    /// Re-embed text that already has a current vector.
+    pub(crate) force: bool,
+    /// Rows per embedder call; the embedder's own limit when absent or smaller.
+    pub(crate) batch_size: Option<usize>,
+    /// Debug guardrail: embed at most this many rows.
+    pub(crate) limit: Option<usize>,
 }
 
 impl Spec {
-    /// Build the incremental default used after a library scan.
-    pub(crate) fn pending_for(scope: PathScope, debug_limit: Option<usize>) -> Self {
-        Self {
-            library_id: None,
-            scope,
-            force: false,
-            batch_size: None,
-            debug_limit,
-        }
-    }
-}
-
-impl Spec {
-    pub(crate) fn library_id(&self) -> Option<i64> {
+    pub(crate) fn library_id(&self) -> i64 {
         self.library_id
     }
 
-    /// Read a standalone job's library scope.
-    pub(crate) fn resolve(mut self, databases: &Databases) -> anyhow::Result<Self> {
-        if let Some(library_id) = self.library_id {
-            let catalog = AssetCatalog::new_read_only(&databases.assets)?;
-            self.scope = libraries::stored(&catalog, library_id)?.scope();
-        }
-        Ok(self)
+    /// The library's scope and how to embed it, read when the job runs.
+    pub(crate) fn resolve(
+        &self,
+        databases: &Databases,
+    ) -> anyhow::Result<(PathScope, TextEmbedOptions)> {
+        let catalog = AssetCatalog::new_read_only(&databases.assets)?;
+        let scope = libraries::stored(&catalog, self.library_id)?.scope();
+        Ok((scope, self.options))
     }
 }
 
@@ -84,51 +79,92 @@ pub(crate) fn prepare(request: Request) -> Result<Spec, ApiError> {
         )));
     }
     Ok(Spec {
-        library_id: Some(request.library_id),
-        scope: PathScope::default(),
-        force: request.force,
-        batch_size: request.batch_size,
-        debug_limit: None,
+        library_id: request.library_id,
+        options: TextEmbedOptions {
+            force: request.force,
+            batch_size: request.batch_size,
+            limit: None,
+        },
     })
 }
 
-pub(crate) fn run(
-    spec: Spec,
-    ocr_database: &PathBuf,
-    embedder: &TextEmbedder,
-    observer: &dyn IndexObserver,
-) -> anyhow::Result<()> {
-    // The write connection is opened up front but takes no write lock by doing so: in WAL mode
-    // SQLite acquires it at the first statement of a write transaction and releases it at commit.
-    // The only transactions here are the two short ones below and one per saved batch, so the
-    // embedder's forward pass — the slow part — always runs with no lock held and searches keep
-    // reading throughout.
-    let mut ocr = DB::new(ocr_database)?;
-    // Declaring the model is what creates the vector table on a fresh database, and what discards
-    // vectors that a model change has invalidated.
+/// The OCR text a pass embeds, from [`select`].
+pub(crate) struct Backlog {
+    filters: SearchFilters,
+    /// Rows the pass will embed.
+    count: usize,
+    options: TextEmbedOptions,
+}
+
+impl Backlog {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+}
+
+/// Count the text under `scope` that needs a vector, before the model loads. This writes: it
+/// declares this build's model, which creates the vector table on a fresh database and discards
+/// vectors from another model. Those are useless to queries either way, and once discarded all
+/// of their rows count as pending.
+#[tracing::instrument(name = "select_text", level = "info", skip_all, fields(pending = tracing::field::Empty))]
+pub(crate) fn select(
+    databases: &Databases,
+    scope: &PathScope,
+    options: &TextEmbedOptions,
+) -> anyhow::Result<Backlog> {
+    let mut ocr = DB::new(&databases.ocr)?;
     ocr.set_text_embedding_model(
         SPACE,
         TextEmbedder::MODEL_ID,
         TextEmbedder::DIMENSIONS,
         true,
     )?;
-    if spec.force {
+    let filters = SearchFilters::new(scope.clone());
+    let coverage = ocr.text_embedding_coverage(SPACE, &filters)?;
+    let count = if options.force {
+        coverage.with_text
+    } else {
+        coverage.pending
+    };
+    let count = options.limit.map_or(count, |limit| count.min(limit));
+    tracing::Span::current().record("pending", count);
+    Ok(Backlog {
+        filters,
+        count,
+        options: *options,
+    })
+}
+
+/// Embed `backlog` with a loaded `embedder`. An embedder error fails the pass: the rows stay
+/// pending, so the next scan retries them.
+pub(crate) fn run(
+    databases: &Databases,
+    embedder: &TextEmbedder,
+    backlog: Backlog,
+    observer: &dyn IndexObserver,
+) -> anyhow::Result<()> {
+    // The write connection is opened up front but takes no write lock by doing so: in WAL mode
+    // SQLite acquires it at the first statement of a write transaction and releases it at commit.
+    // The only write transactions here are one per saved batch, so the embedder's forward pass
+    // (the slow part) always runs with no lock held and searches keep reading throughout.
+    let mut ocr = DB::new(&databases.ocr)?;
+    let Backlog {
+        filters,
+        count,
+        options,
+    } = backlog;
+    if options.force {
         ocr.clear_text_embeddings(SPACE)?;
     }
-
-    let batch_size = spec
+    let batch_size = options
         .batch_size
         .unwrap_or_else(|| embedder.max_batch_size())
         .min(embedder.max_batch_size());
 
-    observer.on_event(IndexEvent::PhaseChanged(IndexPhase::TextEmbedding));
-    let filters = SearchFilters::new(spec.scope.clone());
-    let backlog = ocr.text_embedding_coverage(SPACE, &filters)?.pending();
-    let backlog = spec.debug_limit.map_or(backlog, |limit| backlog.min(limit));
-    observer.on_event(IndexEvent::Discovered { count: backlog });
-    observer.on_event(IndexEvent::DiscoveryComplete { total: backlog });
+    observer.on_event(IndexEvent::Discovered { count });
+    observer.on_event(IndexEvent::DiscoveryComplete { total: count });
 
-    let mut remaining = spec.debug_limit;
+    let mut remaining = options.limit;
     loop {
         cancel_if(observer.is_cancelled())?;
         let next_batch_size = remaining.map_or(batch_size, |limit| batch_size.min(limit));
@@ -142,27 +178,9 @@ pub(crate) fn run(
         }
 
         let texts: Vec<&str> = pending.iter().map(|row| row.content.as_str()).collect();
-        let vectors = match embedder.embed_documents(&texts) {
-            Ok(vectors) => vectors,
-            Err(error) => {
-                // One unembeddable batch must not strand the rest of the backlog, but the rows are
-                // reported rather than silently skipped: they stay pending, so a retry re-tries
-                // them and an operator can see why coverage never reaches 100%.
-                for row in &pending {
-                    observer.on_event(IndexEvent::Error {
-                        path: None,
-                        message: format!("text embedding asset {} failed: {error:#}", row.asset_id),
-                    });
-                }
-                observer.on_event(IndexEvent::Progress(IndexProgressDelta {
-                    processed: pending.len(),
-                    phase_completed: pending.len(),
-                    failed: pending.len(),
-                    ..IndexProgressDelta::default()
-                }));
-                return Ok(());
-            }
-        };
+        let vectors = embedder
+            .embed_documents(&texts)
+            .context("embedding OCR text failed")?;
 
         let items: Vec<TextEmbedding> = pending
             .iter()
@@ -190,21 +208,6 @@ pub(crate) fn run(
             return Ok(());
         }
     }
-}
-
-#[tracing::instrument(name = "text_has_pending", level = "info", skip_all)]
-pub(crate) fn has_pending(spec: &Spec, ocr_database: &PathBuf) -> anyhow::Result<bool> {
-    let ocr = DB::new(ocr_database)?;
-    let filters = SearchFilters::new(spec.scope.clone());
-    let stored = ocr.text_embedding_model(SPACE)?;
-    if stored.as_ref().is_some_and(|stored| {
-        stored.model != TextEmbedder::MODEL_ID || stored.dimensions != TextEmbedder::DIMENSIONS
-    }) {
-        return Ok(ocr.text_embedding_coverage(SPACE, &filters)?.indexed > 0);
-    }
-    Ok(!ocr
-        .pending_text_embeddings(SPACE, &filters, 1, MAX_CONTENT_BYTES)?
-        .is_empty())
 }
 
 #[cfg(test)]

@@ -38,9 +38,10 @@ production Electron does not fetch thumbnail bytes over HTTP.
 
 Vector search is the primary search mode; glob, FTS, and regex remain available and are reached by
 naming them explicitly. OCR-text vectors live in the OCR store and are produced by the server
-itself with BGE small English v1.5, the only OCR text model. CLIP image vectors live in `qdrant-clip-vit-b-32.db`, derived from the full
-publisher/model slug. The server creates no model sessions and downloads no models before
-readiness. Models are prepared when indexing is requested. Browsing, catalog sync, thumbnails, and literal OCR search remain available
+itself with BGE small English v1.5, the only OCR text model. Image vectors live in one store per
+image model beside the asset catalog, named from its full publisher/model slug, such as
+`facebook-pe-core-l14-336.db`. The server creates no model sessions and downloads no models before
+readiness. Models load when indexing or a search first needs them. Browsing, catalog sync, thumbnails, and literal OCR search remain available
 without models. Schema validation and bundled runtime initialization still occur before readiness.
 
 Configure the three independent stores with `--asset-database`/`NICEGAL_ASSET_DB`,
@@ -52,68 +53,63 @@ configured asset catalog from the active model filename.
 
 ### Search model preparation
 
-`GET /v1/models` returns `{text, clipImage, clipText}`. Each entry contains
-`{state: "notLoaded" | "preparing" | "ready" | "failed", error: string | null}`.
-The state describes sessions in this process, not disk-cache availability: a restart resets it to
-`notLoaded`. Failed preparation retains its diagnostic until the next preparation attempt, which
-clears the error and enters `preparing`; a successful attempt enters `ready`. Status reads do not
-wait for download or compilation. OCR continues to use `GET /v1/ocr/models` and its existing
-`ocrModelLoad` job.
+`GET /v1/models` returns `{text, textIndex, clipImage, clipText, ocr}`, each
+`{state, error, resident}`:
 
-`POST /v1/models/load-cached` with `{"model":"clipText"}` loads only the cached paired CLIP
-text-query encoder and returns `{"loaded":true}`. A missing cache or image-only model returns
-`{"loaded":false}` without downloading; a corrupt cached model returns `models_not_ready` and
-records the failure in model status. This optional endpoint does not load OCR models. The desktop
-leaves encoder preparation to backend scans and search requests.
+| Entry | Model | Provider | Unloads after idle |
+| --- | --- | --- | --- |
+| `text` | BGE small English v1.5, OCR-text queries | CPU | 30 minutes |
+| `textIndex` | BGE small English v1.5, OCR-text indexing | Selected | 2 minutes |
+| `clipImage` | The active image model | Selected | 2 minutes |
+| `clipText` | The image model's paired text-query encoder | CPU | 30 minutes |
+| `ocr` | PP-OCRv6 small detector and recognizer, as one pair | Selected | 2 minutes |
 
-`POST /v1/jobs` with `{"type":"modelPrepare","params":{}}` prepares the text, CLIP image,
-and paired CLIP text sessions without indexing a root. It is also available to API clients for explicit preparation.
-An `imageEmbed` job prepares the CLIP pair; `textEmbed` prepares the text session; a
-`libraryScan` ensures whichever sessions its enabled search needs. For image-enabled libraries
-with cataloged sources, it ensures the paired text-query encoder even when no images need
-reindexing. The image encoder is loaded only when indexing has pending work. Model ensure
-operations reuse completed downloads and sessions and retry interrupted preparation.
-Failed jobs can be retried by starting the same request again. Preparation uses the usual
-single-active-job scheduling and reports failures through both the job error and model status.
+`state` is `notLoaded`, `preparing`, `ready`, `failed`, or `unsupported` (`clipText` for an
+image-only model). `ready` means usable: either a session is built or a scan confirmed the files are
+cached, so it survives idle unloading and the model rebuilds from its files on next use. `resident`
+says whether a session is in memory right now. A failed preparation keeps its `error` until the
+next attempt, which enters `preparing`. A restart resets every entry to `notLoaded` until a scan
+or a load marks it again. Status reads never wait for a download or a build.
 
-Embedding preparation uses `loadingModels`: `progress.total` is the number of required
-sessions (1, 2, or 3), and `phaseCompleted`/`modelsLoaded` advances after each session.
-FastEmbed combines downloading/cache resolution and session compilation, so label this phase
-"Preparing search models (may download)" with indeterminate activity while each session loads.
-There are no per-byte FastEmbed download percentages. Cancellation is honored between sessions;
-an in-flight synchronous model download or compilation must finish first. Successfully prepared
-sessions remain reusable after cancellation; cancellation does not delete cached model files.
+`POST /v1/models/warm` with `{"models": ["text", "clipText", "clipImage"]}` builds the named
+sessions from cached files ahead of a search and returns the status object. It never downloads: a
+model whose files are missing is left as it is, and any other failure is returned as an error.
 
-Model sessions unload after approximately five minutes without use, checked every 15 seconds.
-Active searches and indexing retain strong session references and prevent idle unloading.
-Status polling does not count as use. Eviction frees sessions, preserves downloaded files,
-and reports embedding models as `notLoaded`; OCR status no longer includes a loaded pair.
-Indexing reloads its selected models as needed.
+Searches build their query encoder from cached files on first use and never download. Indexing
+work loads only what it needs:
 
-OCR reuse compares the complete detector and recognizer specification, including both YAML
-config filenames. An explicit `ocrModelLoad` for the already loaded specification reuses its
-sessions. Cancellation during compilation retains a successfully compiled pair for later use,
-but the cancelled scan does not continue into recognition.
+- A `libraryScan` runs only the stages its library enables. The image stage makes sure the paired
+  query encoder's files are cached, then builds the image model only when some file lacks a current
+  vector. The OCR stage builds the OCR pair only when some image needs recognition. The text stage
+  makes sure the text query encoder's files are cached, then builds `textIndex` only when some text
+  lacks a current vector. A scan that finds nothing to do builds no session.
+- `imageEmbed` and `textEmbed` do the same as the scan's image and text stages.
+- `modelPrepare` builds `text`, `clipImage` and, when the image model has one, `clipText`, without
+  indexing anything.
 
-OCR, BGE, and image/query encoders use the same keyed model slot for session ownership,
-serialized preparation, status, cancellation, and idle eviction. Model-specific loaders
-resolve files and construct/validate their sessions; only the slot publishes a successful
-result. Both synchronous FastEmbed loaders and asynchronous OCR preparation follow that
-lifecycle. OCR file-resolution stages check cancellation through the shared preparation
-context; compilation finishes before a successful session is published and cancellation
-is returned to its caller. Dropped asynchronous preparations release their slot and clear
-the preparing state, and failed replacements preserve the previous usable session.
+Making sure files are cached downloads missing ones without building a session, except that a
+`failed` model is built, which is how rescanning retries it. Failed jobs can be retried by starting
+the same request again; failures show in both the job error and model status.
 
-Vector and CLIP searches lazily reload their text-query encoder from disk after a restart or idle unloading.
-An already set-up library can be searched immediately without reindexing or visiting Settings. `/v1/models` reports `preparing` while the search request waits for compilation, then
-`ready`. The CLIP image encoder and OCR recognition sessions are not needed to search existing
-vectors and remain unloaded until indexing/setup requests them.
+Only building a session enters the `loadingModels` phase; a model already in memory never does.
+While a session builds, `progress.loadingModel` carries the model's role (`name`, such as
+"Image model", not localized) and `modelId`. `modelsLoaded` advances as each session finishes;
+for `modelPrepare`, `phaseCompleted` does too. A scan or embedding job instead returns to the
+stage that needed the session. A file download sets `progress.download` instead, in whatever phase needs it.
+Cancellation is honored between sessions; a build in progress finishes first and is kept for the
+next user, and cancellation never deletes cached files.
+
+Every model has one slot that owns its session, status and idle unloading. One build runs at a
+time per model and concurrent users wait for it. A failed build marks the model `failed` and keeps
+any previous session. Idle checks run every 15 seconds; searches and indexing hold their sessions
+while they run, and status polling does not count as use. All models on the selected provider run
+on the provider the first of them loaded with, reported as `loadedExecutionProvider`.
 
 The query loader resolves the ONNX file, all declared external/additional files, and all four
 tokenizer JSON files through `hf_hub::CacheRepo`, then loads those paths directly. It constructs
 no HTTP client and never falls back to the downloading loader. Missing files return HTTP 409
 `models_not_ready` with indexing/setup guidance; corrupt files produce the same actionable API
-code and retain diagnostics in model status. Explicit setup/indexing remains the only download
+code and retain diagnostics in model status. Scans and indexing jobs remain the only download
 path. A search cancelled during synchronous compilation stops after that compilation finishes;
 its completed session remains reusable. Existing advanced weighted image-query request shapes
 are unchanged.
@@ -144,7 +140,8 @@ are part of the desktop read contract. Any table or column shape change requires
 bump; readers should reject versions they do not support.
 
 Writable startup connections apply supported migrations in one transaction. Asset catalog
-versions 2–7 upgrade to 8; OCR version 8 upgrades to 9. Read-only connections require the
+versions 2–10 upgrade to 11; OCR versions 8–10 upgrade to 11; image index versions 1–3 upgrade to
+4; thumbnail versions 3–4 upgrade to 5. Read-only connections require the
 current version and never migrate. Unsupported versions are rejected without changes.
 
 ## Asset catalog schema (version 8)
@@ -267,7 +264,7 @@ with a `scan_error` migrates to `failed` and keeps its text. The backend never s
 scan on its own: a client decides when a library is brought up to date, normally with a
 `pendingOnly` scan when the user creates, edits, or opens it.
 
-## OCR schema (version 9)
+## OCR schema (version 11)
 
 OCR is a derived store for eligible images only. Videos are excluded even during force, rescan,
 and retry. It receives `asset_id` from the catalog and never allocates gallery IDs.
@@ -282,7 +279,6 @@ CREATE TABLE ocr_results(
     source_size INTEGER NOT NULL CHECK(source_size >= 0),
     width INTEGER NOT NULL CHECK(width > 0),
     height INTEGER NOT NULL CHECK(height > 0),
-    mark_delete INTEGER NOT NULL DEFAULT 0 CHECK(mark_delete IN (0, 1)),
     content TEXT NOT NULL
 );
 CREATE INDEX ocr_modified_idx ON ocr_results(source_modified_ns);
@@ -351,8 +347,8 @@ are current — lives in `ocr_embedding_state`, which `db_create.sql` does creat
 it back to `ocr_results` on that fingerprint. Re-running OCR over a changed file therefore retires
 its vector automatically: the row drops out of vector search and reappears in the backlog until it
 is embedded again. Deleting an OCR row cascades the state row away; `vec0` is a virtual table and
-cannot be a foreign key target, so its rows are swept explicitly by `sweep_deletions` and
-`delete_asset`. Writers must open with `PRAGMA foreign_keys = ON`, which `DB::new` does.
+cannot be a foreign key target, so `delete_assets` removes its rows explicitly and orphan pruning
+sweeps any that remain. Writers must open with `PRAGMA foreign_keys = ON`, which `DB::new` does.
 
 Vector search is an **exact** scan (`vec_distance_cosine` over the joined rows), not a `vec0`
 `MATCH ... k = ?` lookup. `k` is applied before any join, so under a root filter an approximate
@@ -419,7 +415,7 @@ FastEmbed/ONNX inference lane. FastEmbed applies the CLIP preprocessor and submi
 ONNX Runtime owns model execution threading. Video samples are decoded by the shared bounded
 FFmpeg service described in [FFMPEG.md](FFMPEG.md); videos never enter OCR.
 
-## Thumbnail schema (version 4)
+## Thumbnail schema (version 5)
 
 Thumbnails are static derived artifacts. Fixed maximum-edge buckets are 128, 256, 512, and 1024
 physical pixels. `generator_version` invalidates generator changes independently from UI size
@@ -451,7 +447,15 @@ CREATE TABLE video_thumbnails(
     data BLOB NOT NULL,
     PRIMARY KEY(asset_id, timestamp_ms, size_bucket)
 ) WITHOUT ROWID;
+CREATE INDEX thumbnail_current_idx
+    ON thumbnails(asset_id, generator_version, source_modified_ns, source_size, size_bucket);
+CREATE INDEX video_thumbnail_current_idx
+    ON video_thumbnails(asset_id, sampling_version, source_modified_ns, source_size);
 ```
+
+Encoded images live in the primary key's rows, so the indexes carry each source fingerprint and
+answer whether a source's thumbnails are current without reading image pages. Version 4 databases
+migrate to version 5 on the server's first writable open, replacing their asset-only indexes.
 
 Production Electron access is direct read-only SQLite access from the main process. Given
 `:asset_id`, `:generator_version`, the current source fingerprint, and `:requested_size`, use:
@@ -503,33 +507,30 @@ Version 1 routes:
   ```json
   {
     "apiVersion": 1,
+    "instanceId": "4f2c-18a7e3b2c41",
     "runtime": {
       "activeExecutionProvider": "directml",
+      "loadedExecutionProvider": "directml",
       "activeRuntimeDistribution": "directml",
       "onnxRuntimeBuildInfo": "ORT Build Info: ...",
       "configuredExecutionProvider": "openvino",
-      "ocrModels": {
-        "detection": { "modelId": "PaddlePaddle/PP-OCRv6_small_det_onnx", "revision": "main", "filename": "inference.onnx", "configFilename": "inference.yml" },
-        "recognition": { "modelId": "PaddlePaddle/PP-OCRv6_small_rec_onnx", "revision": "main", "filename": "inference.onnx", "configFilename": "inference.yml" }
-      },
-      "restartRequired": true
-    },
-    "ocrModelsLoaded": false
+      "restartRequired": true,
+      "imageModel": { "activeModel": "...", "selectedModel": "...", "supportsTextQueries": true, "restartRequired": false, "models": [] },
+      "availableExecutionProviders": ["directml", "openvino", "cpu"]
+    }
   }
   ```
   `activeExecutionProvider` is the provider requested in this process and
   `activeRuntimeDistribution` identifies the ONNX Runtime DLL set actually loaded for it;
   `onnxRuntimeBuildInfo` is ONNX Runtime's own release/commit/build-flags diagnostic string;
   `configuredExecutionProvider` is the persisted choice for the next launch. They differ after a
-  setting changes and while a command-line provider override is in effect. `ocrModels` is the
-  saved default every scan uses unless its request supplies one. `ocrModelsLoaded`
-  avoids a follow-up request when the client only needs to decide whether OCR indexing is available;
-  use `GET /v1/ocr/models` for loaded model identities and their actual session provider.
+  setting changes and while a command-line provider override is in effect.
+  `loadedExecutionProvider` is the provider the first indexing session actually loaded with, which
+  differs from the active one after a fallback, and is `null` until one loads. `instanceId`
+  changes with every server process.
 - `GET /v1/runtime` returns the `runtime` object shown above. `PUT /v1/runtime` accepts
-  `executionProvider`, `imageModel`, and `ocrModels` (the pair shape shown under Jobs). The OCR pair
-  persists in `runtime.json`; explicit scans may also supply it and update the saved choice. The
-  built-in default is the PaddleOCR v6 small detector/recognizer pair. The frontend can omit it on
-  ordinary scans. Video indexing is a library option (`videos`); an `indexVideos: false` left in
+  `executionProvider` and `imageModel`. An `ocrModels` entry left in an older `runtime.json` still
+  parses and is dropped on the next write; OCR always uses the PP-OCRv6 small pair. Video indexing is a library option (`videos`); an `indexVideos: false` left in
   an older `runtime.json` is copied into every library at startup and then removed.
   The execution provider selection persists for the next launch.
   Saved selections absent from the current build migrate to its bundled default at startup;
@@ -692,15 +693,17 @@ Version 1 routes:
 - `GET /v1/text-embeddings?libraryId=<id>` reports what vector search can currently answer for:
   `{embedder: {model, dimensions}, stored: {model, dimensions} | null, indexed, embedded, pending}`.
   `embedder` is what this build produces, `stored` is what the database holds (null before the first
-  backfill), and a difference between them means the next text embed job discards and rebuilds. This is
-  how the UI tells "nothing matched" apart from "nothing has been embedded"
+  backfill), and a difference between them means the next text embed job discards and rebuilds.
+  `pending` counts rows with text but no current vector; an image without text is indexed but never
+  pending, so `embedded + pending` can be less than `indexed`. This is how the UI tells "nothing
+  matched" apart from "nothing has been embedded"
 - `POST /v1/text-embeddings/generate` starts the text embedding backfill job. Its JSON body is
   `{libraryId, force:false, batchSize?}`. `force` re-embeds rows that already have a current vector;
   `batchSize` is 1 to 512 and is additionally clamped to what the backend accepts, so omitting it
   is normally right. The same job can be created through `POST /v1/jobs` with type `textEmbed`
 - `POST /v1/jobs` starts a typed background job and returns `202 Accepted`. Types are
-  `modelPrepare`, `ocrModelLoad`, `libraryScan`, `thumbnailGenerate`, `textEmbed`, `imageEmbed`,
-  `pruneMissing`, and `libraryPurge`. Every type except `modelPrepare` and `ocrModelLoad` takes a
+  `modelPrepare`, `libraryScan`, `thumbnailGenerate`, `textEmbed`, `imageEmbed`,
+  `pruneMissing`, and `libraryPurge`. Every type except `modelPrepare` takes a
   `libraryId`; an unknown library is `404 library_not_found` and no job is created. A job reads its
   library's folders when it runs. `imageEmbed` accepts `{libraryId, force:false, debugLimit?}`
 - `POST /v1/jobs/cancel` takes `{ "requestIds": ["pending-request-id"] }` and returns the same job list as `GET /v1/jobs`. It atomically cancels active and queued work, and retains cancellation tombstones for supplied request IDs that have not been admitted. A late `POST /v1/jobs` using one of these IDs returns `409 job_cancelled`; retrying an already admitted ID returns its retained job snapshot. Request IDs share the existing bounded 24-hour retention.
@@ -1063,61 +1066,15 @@ replayed after a backend crash.
 purge. This option cannot be combined with folder-specific purging. Cancellation or a failed batch
 leaves the definition intact. Finishing this operation never requires an attached browser.
 
-Job creation uses a stable typed envelope so future OCR inference, CLIP, thumbnail, or maintenance
-jobs can share the lifecycle API. Download and compile a PaddleOCR detector and recognizer by
-posting explicit Hugging Face model IDs:
+Job creation uses a stable typed envelope so future CLIP, thumbnail, or maintenance jobs can share
+the lifecycle API.
 
-```json
-{
-  "type": "ocrModelLoad",
-  "params": {
-    "detection": {
-      "modelId": "PaddlePaddle/PP-OCRv6_small_det_onnx",
-      "revision": "main",
-      "filename": "inference.onnx",
-      "configFilename": "inference.yml"
-    },
-    "recognition": {
-      "modelId": "PaddlePaddle/PP-OCRv6_small_rec_onnx",
-      "revision": "main",
-      "filename": "inference.onnx",
-      "configFilename": "inference.yml"
-    }
-  }
-}
-```
-
-`modelId` is required for both models and is never selected inside the binary. `revision` is
-optional and defaults to the repository's `main` branch. `filename` is optional and defaults to
-`inference.onnx`; `configFilename` defaults to `inference.yml`. The configuration supplies the
-detector thresholds and normalization, recognition input shape, and character dictionary, so these
-are kept with the selected model rather than hardcoded for one repository. Files resolve through
-the standard `HF_HOME` cache. A cache hit does not contact the network; a miss reports byte progress
-while `hf-hub` downloads the file. The two sessions are then compiled with level-3 graph
-optimization for the configured ONNX Runtime execution provider and kept in server memory.
-
-`GET /v1/ocr/models` returns `{}` before a successful load and this shape afterward:
-
-```json
-{
-  "loaded": {
-    "detection": {
-      "modelId": "PaddlePaddle/PP-OCRv6_small_det_onnx",
-      "revision": "main",
-      "filename": "inference.onnx"
-    },
-    "recognition": {
-      "modelId": "PaddlePaddle/PP-OCRv6_small_rec_onnx",
-      "revision": "main",
-      "filename": "inference.onnx"
-    },
-    "executionProvider": "cpu"
-  }
-}
-```
-
-`executionProvider` is the provider the sessions were actually compiled for, not the one requested:
-a build that falls back reports `cpu`.
+OCR uses one fixed pair, the PP-OCRv6 small detector (`PaddlePaddle/PP-OCRv6_small_det_onnx`) and
+recognizer (`PaddlePaddle/PP-OCRv6_small_rec_onnx`). Each repository's `inference.yml` supplies
+the detector thresholds and normalization, recognition input shape, and character dictionary. Files
+resolve through the standard `HF_HOME` cache, so a cache hit does not contact the network. Both
+sessions are compiled for the selected execution provider and load and unload together as the
+`ocr` model.
 
 ### Library scans
 
@@ -1164,13 +1121,11 @@ cached entries are never removed. After a complete walk of a folder, catalog ent
 and thumbnails; files are rechecked before each deletion batch. A walk with unreadable entries,
 one that reaches its `debugLimit`, or cancellation is incomplete and removes nothing.
 
-**Models load only for work that needs them.** Image vectors are prepared only when cataloged
-files lack current vectors, OCR runs only for images without current text, and text embeddings
-only for text without current vectors. The OCR pair is downloaded and loaded inside the job, and
-only when some image needs recognition and the loaded pair differs from `ocrModels` (the same shape
-as an `ocrModelLoad` request). When omitted, the saved pair is used, including after restart or
-provider fallback. A scan that finds nothing to do loads no
-model at all.
+**Models load only for work that needs them.** The image model is built only when cataloged files
+lack current vectors, the OCR pair only when some image needs recognition, and the text indexing
+model only when text lacks current vectors; see
+[Search model preparation](#search-model-preparation). A scan that finds nothing to do builds no
+session.
 
 **Options.** Whether video frames are indexed comes from the library's `videos` option. `force` re-runs OCR for images that already have current text. `retryFailed`
 retries sources whose earlier decode failed. `maxDimensions` skips OCR for larger images without
@@ -1200,29 +1155,33 @@ Only `completed` folders clear `scanPending` and record `lastScanCompletedNs`. O
 after the scan finishes.
 
 Phase order is, per folder, `scanning` → `cataloging` → optional `pruning`, then
-`imageEmbedding` (image libraries), optional `downloadingModels` → `loadingModels`, `ocr`, and
-`textEmbedding` (OCR libraries), then `finished`. Each model-preparation step appears only when
-that model is needed. Catalog rows commit in batches during `cataloging`, so the gallery can show
-new files while the scan continues; OCR rows commit every 32 images. Thumbnail generation remains a
-separate job.
+`imageEmbedding` (image libraries), `ocr` and `textEmbedding` (OCR libraries), then `finished`.
+A stage is skipped when the library has nothing it could index (no images for `imageEmbedding`).
+Otherwise each index stage enters its phase before checking for pending work, so that check, query encoder
+downloads and model loading count towards the stage; `total` stays `null` until the stage knows
+its work. A stage that has to build a model session leaves its phase for `loadingModels` with
+`progress.loadingFor` set to the stage's phase, and the job returns to the stage once the session
+is built. Catalog rows commit in
+batches during `cataloging`, so the gallery can show new files while the scan continues; OCR rows
+commit every 32 images. Thumbnail generation remains a separate job.
 
-show these updates.
+A model file download sets `progress.download` (`modelId`, `filename`, `downloadedBytes`,
+`totalBytes`, zero while the size is unknown) in whichever phase needs it.
 
 | Job type | Phase | Fields that move in the phase | `total` in the phase | Honest within-phase UI |
 | --- | --- | --- | --- | --- |
 | Any | `queued` | None | `null` | Queued state, not a progress bar. |
-| `ocrModelLoad` | `downloadingModels` | `downloadedBytes`, `downloadTotalBytes`; `processed` advances after each ONNX inference file resolves; transfer totals accumulate only for network downloads | `null` | Use `downloadedBytes / downloadTotalBytes` only when `downloadTotalBytes > 0`; otherwise show indeterminate download/cache preparation. |
-| `ocrModelLoad` | `loadingModels` | `modelsLoaded`, `phaseCompleted` | `2` (detector and recognizer sessions) | `phaseCompleted / total` or “loading N of 2”. |
-| `ocrModelLoad` | `finished` | None | Last value is retained until the terminal snapshot | Terminal state, no progress bar. |
+| `modelPrepare` | `loadingModels` | `modelsLoaded`, `phaseCompleted`; `loadingModel` (`name`, `modelId`) while a session builds | Sessions the job builds | `phaseCompleted / total`. |
+| `modelPrepare` | `finished` | None | Last value is retained until the terminal snapshot | Terminal state, no progress bar. |
 | `libraryScan` | `scanning` | `discovered` (also on the current folder); when a folder's walk ends, `total` and `phaseCompleted` become its discovered count | `null` while walking; the folder's final count when its walk ends | Show “discovered N” per folder while indeterminate. |
 | `libraryScan` | `cataloging` | `phaseCompleted`; `cataloged` and `failed` (also on the current folder) | Media discovered in the folder | `phaseCompleted / total`. |
 | `libraryScan` | `pruning` | `phaseCompleted`, `pruneCandidates`, `deleted` | Confirmed-missing entries in the folder | `phaseCompleted / total`. Omitted when nothing is missing. |
 | `libraryScan` | `imageEmbedding` | `phaseCompleted`, `processed`, `embedded`, `failed` | Pending current image vectors among the scanned files | `phaseCompleted / total`. |
-| `libraryScan` | `downloadingModels`, `loadingModels` | As for `ocrModelLoad` | As for `ocrModelLoad` | Shown only when the OCR pair must be loaded. |
+| `libraryScan`, `textEmbed`, `imageEmbed` | `loadingModels` | As for `modelPrepare`; `loadingFor` names the stage's phase | The one session being built | Show under the `loadingFor` stage. Only when a session must be built. |
 | `libraryScan` | `ocr` | `phaseCompleted`, `processed`, `skipped`, `failed`; `indexed` advances when committed OCR chunks save | Scanned files, including those skipped as current or not images | `phaseCompleted / total`. |
-| `libraryScan` | `textEmbedding` | `phaseCompleted`, `processed`, `embedded`, `skipped`, `failed` | Pending current `ocrText` vectors in the library | `phaseCompleted / total`. |
+| `libraryScan` | `textEmbedding` | `phaseCompleted`, `processed`, `embedded`, `skipped` | OCR rows with text and no current `ocrText` vector in the library | `phaseCompleted / total`. |
 | `libraryScan` | `finished` | None | Last value is retained until the terminal snapshot | Terminal state; `folders` holds each folder's outcome. |
-| `textEmbed` | `textEmbedding` | `phaseCompleted`, `processed`, `embedded`, `skipped`, `failed` | Pending current `ocrText` vectors in the library after an optional force clear | `phaseCompleted / total`; a zero backlog is immediately complete. |
+| `textEmbed` | `textEmbedding` | `phaseCompleted`, `processed`, `embedded`, `skipped` | OCR rows with text and no current `ocrText` vector in the library, or every row with text when forced | `phaseCompleted / total`; a zero backlog is immediately complete. |
 | `textEmbed` | `finished` | None | Last value is retained until the terminal snapshot | Terminal state, no progress bar. |
 | `imageEmbed` | `imageEmbedding` | `phaseCompleted`, `processed`, `embedded`, `failed` | Pending current CLIP image vectors in the library | `phaseCompleted / total`; a zero backlog is immediately complete. |
 | `imageEmbed` | `finished` | None | Last value is retained until the terminal snapshot | Terminal state, no progress bar. |
@@ -1242,7 +1201,9 @@ files and `imageEmbedding` counts images run through the model, one per still or
 frame, so its rate is images per second while `phaseCompleted` and `total` count files.
 
 Cancellation after OCR but before or during text embedding leaves a `libraryScan` cancelled without
-starting more text embedding batches, and its folders stay pending.
+starting more text embedding batches, and its folders stay pending. An embedding error fails the job
+the same way: the rows already embedded keep their vectors and the rest stay pending for the next
+scan.
 
 Cancellation is cooperative between model files, scan entries, catalog entries, image decodes,
 inference calls, embedding batches, and library-purge assets. `libraryScan` checks it before the
@@ -1446,7 +1407,7 @@ models}`. Top-level `restartRequired` covers both the provider and model. Each c
 placed under `NICEGAL_LOCAL_MODELS_DIR`.
 
 `PUT /v1/runtime` accepts `{"imageModel":"facebook/metaclip-2-worldwide-b32"}`
-and returns runtime status. `executionProvider`, `imageModel`, and `ocrModels`
+and returns runtime status. `executionProvider` and `imageModel`
 are optional, but at least one must be supplied. Unknown or unavailable image models are rejected,
 as are provider or image-model changes while an indexing job is active. The caller restarts the backend to
 activate the selection. Provider and image-model selections persist together in the runtime

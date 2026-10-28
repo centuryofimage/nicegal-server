@@ -7,7 +7,7 @@ use nicegal_core::assets::AssetCatalog;
 use nicegal_core::db::DB;
 use nicegal_core::image_index::ImageIndexDb;
 use nicegal_core::index::{
-    IndexEvent, IndexObserver, IndexOptions, IndexPhase, IndexProgressDelta,
+    CatalogOptions, IndexEvent, IndexObserver, IndexPhase, IndexProgressDelta,
 };
 use nicegal_core::thumbs::ThumbnailService;
 use serde::Deserialize;
@@ -37,7 +37,7 @@ pub(super) enum ReconcileInput<'a> {
 }
 
 impl ReconcileScope {
-    pub(super) fn new(root: PathBuf, options: &IndexOptions) -> Self {
+    pub(super) fn new(root: PathBuf, options: &CatalogOptions) -> Self {
         Self {
             root,
             recursive: options.subdirs,
@@ -69,6 +69,7 @@ impl ReconcileScope {
 
 /// Reconcile only after successful discovery. Confirm absence rather than treating unvisited
 /// paths as deleted; excluded subtrees, unreadable folders, and disconnected roots are preserved.
+#[tracing::instrument(level = "info", skip_all, fields(candidates = tracing::field::Empty))]
 pub(super) fn reconcile(
     mut scope: ReconcileScope,
     databases: &super::Databases,
@@ -91,6 +92,7 @@ pub(super) fn reconcile(
         }
         ReconcileInput::Candidates(candidates) => candidates.to_vec(),
     };
+    tracing::Span::current().record("candidates", candidates.len());
     let mut missing = Vec::new();
     // Complete all filesystem checks before deleting any row. An inaccessible subtree must not
     // turn a partial check into a partial automatic purge.
@@ -559,7 +561,7 @@ mod tests {
 
         fn reconcile(
             &self,
-            options: IndexOptions,
+            options: CatalogOptions,
             observer: &dyn IndexObserver,
         ) -> anyhow::Result<bool> {
             reconcile(
@@ -627,7 +629,7 @@ mod tests {
         );
         fs::remove_file(&removed.path)?;
         let observer = CandidateCounter(AtomicUsize::new(0));
-        assert!(!library.reconcile(IndexOptions::default(), &observer)?);
+        assert!(!library.reconcile(CatalogOptions::default(), &observer)?);
         assert_eq!(observer.0.load(Ordering::Relaxed), 1);
         assert!(library.catalog.get(removed.asset_id)?.is_none());
         assert!(library.catalog.get(retained.asset_id)?.is_some());
@@ -648,7 +650,7 @@ mod tests {
                 .get(removed.asset_id, 128, 1, removed.fingerprint)?
                 .is_none()
         );
-        assert!(!library.reconcile(IndexOptions::default(), &NeverCancelled)?);
+        assert!(!library.reconcile(CatalogOptions::default(), &NeverCancelled)?);
         Ok(())
     }
 
@@ -659,14 +661,14 @@ mod tests {
         let removed = library.asset("removed.png")?;
         fs::remove_file(&removed.path)?;
         assert!(library.reconcile(
-            IndexOptions::default(),
+            CatalogOptions::default(),
             &CancelBeforeSecondAsset(AtomicUsize::new(0))
         )?);
         assert!(library.catalog.get(removed.asset_id)?.is_some());
         fs::remove_dir(&library.root)?;
         assert!(
             library
-                .reconcile(IndexOptions::default(), &NeverCancelled)
+                .reconcile(CatalogOptions::default(), &NeverCancelled)
                 .is_err()
         );
         assert!(library.catalog.get(removed.asset_id)?.is_some());
@@ -684,18 +686,18 @@ mod tests {
             fs::remove_file(&asset.path)?;
         }
         library.reconcile(
-            IndexOptions {
+            CatalogOptions {
                 subdirs: false,
-                ..IndexOptions::default()
+                ..CatalogOptions::default()
             },
             &NeverCancelled,
         )?;
         assert!(library.catalog.get(direct.asset_id)?.is_none());
         assert!(library.catalog.get(nested.asset_id)?.is_some());
         library.reconcile(
-            IndexOptions {
+            CatalogOptions {
                 exclude: vec![glob::Pattern::new("*/.cache")?],
-                ..IndexOptions::default()
+                ..CatalogOptions::default()
             },
             &NeverCancelled,
         )?;
@@ -718,7 +720,7 @@ mod tests {
         fs::write(library.root.join("folder"), [])?;
         assert!(
             library
-                .reconcile(IndexOptions::default(), &NeverCancelled)
+                .reconcile(CatalogOptions::default(), &NeverCancelled)
                 .is_err()
         );
         assert!(library.catalog.get(removed.asset_id)?.is_some());
