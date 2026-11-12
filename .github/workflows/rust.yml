@@ -30,13 +30,13 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends ca-certificates git curl xz-utils unzip build-essential pkg-config libssl-dev libclang-dev cmake nasm libvulkan1
 
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
           submodules: recursive
 
       - name: Setup Rust with cache
-        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        uses: actions-rust-lang/setup-rust-toolchain@v2.0.0
         with:
           cache: true
           build-warnings: warn
@@ -44,7 +44,7 @@ jobs:
           cache-key: debian-12-${{ hashFiles('Cargo.toml', '.cargo/config.toml') }}
 
       - name: Setup uv
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        uses: astral-sh/setup-uv@v10.1.0
         with:
           enable-cache: true
 
