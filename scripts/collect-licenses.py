@@ -143,7 +143,7 @@ def main() -> None:
     # The Windows build wrapper prints the Visual Studio environment banner before
     # forwarding Cargo's JSON output.
     metadata = json.loads(result.stdout[result.stdout.index("{"):])
-    own_packages = {"nicegal-core", "nicegal-cli", "nicegal-server"}
+    own_packages = {"nicegal-core", "nicegal-server"}
     packages = []
     for package in metadata["packages"]:
         if package["name"] in own_packages and package["source"] is None:

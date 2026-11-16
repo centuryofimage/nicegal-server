@@ -13,6 +13,7 @@ const ACCELERATED_ORT_FEATURES: &[&str] = &[
     "CARGO_FEATURE_ORT_OPENVINO",
     "CARGO_FEATURE_ORT_DIRECTML",
     "CARGO_FEATURE_ORT_CUDA",
+    "CARGO_FEATURE_ORT_WEBGPU",
 ];
 
 #[cfg(windows)]
@@ -38,6 +39,8 @@ fn main() {
         "NICEGAL_OPENVINO_LIB_PATH",
         "NICEGAL_CUDA_ORT_LIB_PATH",
         "NICEGAL_CUDA_LIB_PATH",
+        "NICEGAL_WEBGPU_ORT_LIB_PATH",
+        "NICEGAL_WEBGPU_PLUGIN_PATH",
         "NICEGAL_CRT_LIB_PATH",
         "VCToolsRedistDir",
         "ProgramFiles(x86)",
@@ -99,14 +102,24 @@ fn copy_runtime_distributions() -> io::Result<()> {
             profile_dir,
             &[],
         )?;
-        let cuda_destinations = [
-            profile_dir.join("onnxruntime/cuda"),
-            profile_dir.join("deps/onnxruntime/cuda"),
-        ];
+        let cuda_destinations = [profile_dir.join("onnxruntime/cuda")];
         let cuda_libraries = env::var_os("NICEGAL_CUDA_LIB_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|| manifest_dir.join(".venv-cuda/Lib/site-packages/nvidia"));
         copy_dll_tree("NICEGAL_CUDA_LIB_PATH", &cuda_libraries, &cuda_destinations)?;
+    }
+    if env::var_os("CARGO_FEATURE_ORT_WEBGPU").is_some() {
+        // The stock CPU runtime plus the WebGPU plugin EP and its DXC shader compiler.
+        copy_distribution(
+            "webgpu",
+            "NICEGAL_WEBGPU_ORT_LIB_PATH",
+            manifest_dir.join(".venv-webgpu/Lib/site-packages/onnxruntime/capi"),
+            profile_dir,
+            &[(
+                "NICEGAL_WEBGPU_PLUGIN_PATH",
+                manifest_dir.join(".venv-webgpu/Lib/site-packages/onnxruntime_ep_webgpu"),
+            )],
+        )?;
     }
     Ok(())
 }
@@ -183,7 +196,7 @@ fn copy_crt(profile_dir: &Path) -> io::Result<()> {
     copy_dll_directory(
         "NICEGAL_CRT_LIB_PATH",
         library_dir,
-        &[profile_dir.to_owned(), profile_dir.join("deps")],
+        &[profile_dir.to_owned()],
     )
 }
 
@@ -195,10 +208,7 @@ fn copy_distribution(
     profile_dir: &Path,
     extra_dll_directories: &[(&str, PathBuf)],
 ) -> io::Result<()> {
-    let destinations = [
-        profile_dir.join("onnxruntime").join(name),
-        profile_dir.join("deps").join("onnxruntime").join(name),
-    ];
+    let destinations = [profile_dir.join("onnxruntime").join(name)];
     copy_dll_directory(ort_env_var, default_ort_dir, &destinations)?;
     for (env_var, default_dir) in extra_dll_directories {
         copy_dll_directory(env_var, default_dir.clone(), &destinations)?;
@@ -336,21 +346,30 @@ fn is_dll(path: &Path) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case(OsStr::new("dll")))
 }
 
+/// Find the profile directory that holds the final executables. Cargo's build-dir layout v2
+/// (stable since 1.100) places build script output at `<profile>/build/<package>/<hash>/out`;
+/// the legacy layout used `<profile>/build/<package>-<hash>/out`. Test executables run from
+/// inside the build directory, so the runtime lookup searches upward to this directory.
 #[cfg(windows)]
 fn profile_dir(out_dir: &Path) -> io::Result<&Path> {
-    let package_dir = out_dir
+    let hash_dir = out_dir
         .parent()
         .filter(|_| out_dir.file_name() == Some(OsStr::new("out")));
-    let build_dir = package_dir
-        .and_then(Path::parent)
-        .filter(|build_dir| build_dir.file_name() == Some(OsStr::new("build")));
-    let profile_dir = build_dir.and_then(Path::parent);
+    let package_dir = hash_dir.and_then(Path::parent);
+    let profile_dir = match package_dir {
+        Some(directory) if directory.file_name() == Some(OsStr::new("build")) => directory.parent(),
+        Some(directory) => directory
+            .parent()
+            .filter(|build_dir| build_dir.file_name() == Some(OsStr::new("build")))
+            .and_then(Path::parent),
+        None => None,
+    };
 
     profile_dir.ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "OUT_DIR does not match Cargo's target/<profile>/build/<package-hash>/out layout: {}",
+                "OUT_DIR does not match Cargo's <profile>/build/<package>/<hash>/out layout: {}",
                 out_dir.display()
             ),
         )

@@ -202,6 +202,23 @@ pub(crate) fn environment() -> Result<Environment> {
 ///
 /// Every bundled distribution includes CPU. The default Windows build uses DirectML for CPU;
 /// builds with fewer providers use an available distribution. This must run before any model load.
+/// Locate `onnxruntime/<distribution>` beside the executable, or in an ancestor directory.
+/// Cargo's build-dir layout v2 runs test executables from `<profile>/build/<package>/<hash>/out`
+/// while `build.rs` stages the runtime in `<profile>`; shipped builds find it beside the binary.
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+pub fn bundled_runtime_directory(distribution: &str) -> Result<std::path::PathBuf> {
+    let executable = std::env::current_exe().context("resolving the executable path")?;
+    let executable_directory = executable
+        .parent()
+        .context("executable path has no parent directory")?;
+    let relative = std::path::Path::new("onnxruntime").join(distribution);
+    Ok(executable_directory
+        .ancestors()
+        .map(|directory| directory.join(&relative))
+        .find(|candidate| candidate.is_dir())
+        .unwrap_or_else(|| executable_directory.join(relative)))
+}
+
 #[cfg(windows)]
 pub fn initialize_bundled_runtime(execution_provider: ExecutionProvider) -> Result<()> {
     let runtime_distribution = match execution_provider {
@@ -211,21 +228,14 @@ pub fn initialize_bundled_runtime(execution_provider: ExecutionProvider) -> Resu
         ExecutionProvider::Cpu if cfg!(feature = "ort-directml") => "directml",
         ExecutionProvider::Cpu if cfg!(feature = "ort-openvino") => "openvino",
         ExecutionProvider::Cpu if cfg!(feature = "ort-cuda") => "cuda",
+        ExecutionProvider::Cpu if cfg!(feature = "ort-webgpu") => "webgpu",
         ExecutionProvider::Cpu => bail!("no bundled Windows ONNX Runtime distribution is enabled"),
-        ExecutionProvider::Webgpu => {
-            bail!("{execution_provider} is only supported on Linux")
-        }
+        ExecutionProvider::Webgpu => "webgpu",
         ExecutionProvider::CoreML => {
             bail!("{execution_provider} is only supported on macOS")
         }
     };
-    let executable = std::env::current_exe().context("resolving the executable path")?;
-    let executable_directory = executable
-        .parent()
-        .context("executable path has no parent directory")?;
-    let runtime_directory = executable_directory
-        .join("onnxruntime")
-        .join(runtime_distribution);
+    let runtime_directory = bundled_runtime_directory(runtime_distribution)?;
     let dylib_path = runtime_directory.join("onnxruntime.dll");
     if !dylib_path.is_file() {
         bail!(
@@ -242,6 +252,15 @@ pub fn initialize_bundled_runtime(execution_provider: ExecutionProvider) -> Resu
     // Called before models or serving threads exist; no other thread can observe a partial update.
     unsafe { std::env::set_var("PATH", path) };
     initialize_from_dylib(&dylib_path)?;
+    #[cfg(feature = "ort-webgpu")]
+    if execution_provider == ExecutionProvider::Webgpu {
+        environment()?
+            .register_ep_library(
+                "webgpu",
+                runtime_directory.join("onnxruntime_providers_webgpu.dll"),
+            )
+            .context("registering native WebGPU plugin")?;
+    }
     tracing::info!(
         execution_provider = %execution_provider,
         runtime_distribution,
@@ -261,14 +280,8 @@ pub fn initialize_bundled_runtime(execution_provider: ExecutionProvider) -> Resu
         ExecutionProvider::Cuda => bail!("cuda is only supported on Windows"),
         ExecutionProvider::CoreML => bail!("coreml is only supported on macOS"),
     };
-    let executable = std::env::current_exe().context("resolving the executable path")?;
-    let directory = executable
-        .parent()
-        .context("executable path has no parent directory")?;
-    let dylib = directory
-        .join("onnxruntime")
-        .join(distribution)
-        .join("libonnxruntime.so");
+    let runtime_directory = bundled_runtime_directory(distribution)?;
+    let dylib = runtime_directory.join("libonnxruntime.so");
     if !dylib.is_file() {
         bail!(
             "the {distribution} ONNX Runtime distribution is missing: expected {}",
@@ -281,7 +294,7 @@ pub fn initialize_bundled_runtime(execution_provider: ExecutionProvider) -> Resu
         environment()?
             .register_ep_library(
                 "webgpu",
-                directory.join("onnxruntime/webgpu/libonnxruntime_providers_webgpu.so"),
+                runtime_directory.join("libonnxruntime_providers_webgpu.so"),
             )
             .context("registering native WebGPU plugin")?;
     }
@@ -302,11 +315,7 @@ pub fn initialize_bundled_runtime(execution_provider: ExecutionProvider) -> Resu
             bail!("{execution_provider} is not supported on macOS")
         }
     }
-    let executable = std::env::current_exe().context("resolving the executable path")?;
-    let directory = executable
-        .parent()
-        .context("executable path has no parent directory")?;
-    let runtime_directory = directory.join("onnxruntime/coreml");
+    let runtime_directory = bundled_runtime_directory("coreml")?;
     let dylib = runtime_directory.join("libonnxruntime.dylib");
     if !dylib.is_file() {
         bail!(

@@ -32,7 +32,7 @@ if [[ "$(uname -s)" == Linux ]]; then
             exit 1
         }
         for profile in debug release; do
-            for directory in "$target_root/$profile" "$target_root/$profile/deps"; do
+            for directory in "$target_root/$profile"; do
                 destination="$directory/onnxruntime/$provider"
                 mkdir -p "$destination"
                 cp -L "$runtime_directory"/lib*.so* "$destination/"
@@ -62,7 +62,7 @@ elif [[ "$(uname -s)" == Darwin ]]; then
         exit 1
     }
     for profile in debug release; do
-        for directory in "$target_root/$profile" "$target_root/$profile/deps"; do
+        for directory in "$target_root/$profile"; do
             destination="$directory/onnxruntime/coreml"
             mkdir -p "$destination"
             cp -L "$runtime_directory"/*.dylib "$destination/"

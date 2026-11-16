@@ -268,6 +268,8 @@ pub(super) fn runtime_distribution(execution_provider: ExecutionProvider) -> &'s
                     "openvino"
                 } else if cfg!(feature = "ort-cuda") {
                     "cuda"
+                } else if cfg!(feature = "ort-webgpu") {
+                    "webgpu"
                 } else {
                     "cpu"
                 }
@@ -298,6 +300,8 @@ fn available_execution_providers() -> &'static [ExecutionProvider] {
         ExecutionProvider::Directml,
         #[cfg(feature = "ort-cuda")]
         ExecutionProvider::Cuda,
+        #[cfg(feature = "ort-webgpu")]
+        ExecutionProvider::Webgpu,
         #[cfg(feature = "ort-openvino")]
         ExecutionProvider::OpenVino,
         ExecutionProvider::Cpu,

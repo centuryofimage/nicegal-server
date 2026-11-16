@@ -17,6 +17,11 @@ impl IndexObserver for Job {
     }
 
     fn on_event(&self, event: IndexEvent) {
+        if cfg!(debug_assertions)
+            && matches!(event, IndexEvent::Progress(_) | IndexEvent::PhaseChanged(_))
+        {
+            debug_progress_delay(&self.cancel_requested);
+        }
         // Record every failure before the UI's bounded error list, including failures from
         // thumbnail workers that have no separate logger or attached event-stream client.
         if let IndexEvent::Error { path, message } = &event {
@@ -72,6 +77,28 @@ impl IndexObserver for Job {
             }
         }
         self.publish(&mut data);
+    }
+}
+
+/// Debug builds only: `NICEGAL_DEBUG_PROGRESS_DELAY_MS` stalls every progress report and phase
+/// change, so frontend tests can drive job and queue transitions on small or already indexed
+/// libraries. A cancel ends the stall early.
+fn debug_progress_delay(cancelled: &AtomicBool) {
+    static DELAY: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    let delay = DELAY.get_or_init(|| {
+        std::env::var("NICEGAL_DEBUG_PROGRESS_DELAY_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .map(Duration::from_millis)
+    });
+    let Some(delay) = *delay else { return };
+    let deadline = Instant::now() + delay;
+    while !cancelled.load(Ordering::Acquire) {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        std::thread::sleep(left.min(Duration::from_millis(50)));
     }
 }
 

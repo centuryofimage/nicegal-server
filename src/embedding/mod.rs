@@ -239,17 +239,15 @@ mod tests {
             // Tests do not run main(), which selects the bundled runtime in applications.
             #[cfg(windows)]
             {
-                let executable = std::env::current_exe().unwrap();
                 crate::runtime::initialize_from_dylib(
-                    &executable
-                        .parent()
+                    &crate::runtime::bundled_runtime_directory("directml")
                         .unwrap()
-                        .join("onnxruntime/directml/onnxruntime.dll"),
+                        .join("onnxruntime.dll"),
                 )
                 .expect("the bundled CPU runtime initializes");
             }
-            // Elsewhere the bundled loader leaves the environment alone; dev.sh copies the
-            // runtime next to test binaries in target/<profile>/deps.
+            // Elsewhere the bundled loader leaves the environment alone; dev.sh stages the
+            // runtime in target/<profile>, which the loader finds from the test binary.
             #[cfg(not(windows))]
             crate::runtime::initialize_bundled_runtime(crate::runtime::ExecutionProvider::Cpu)
                 .expect("the bundled CPU runtime initializes");

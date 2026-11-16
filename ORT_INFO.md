@@ -34,7 +34,7 @@
   and checks their requirements on every build. Set `NICEGAL_ENABLE_CUDA=1` to also install
   `.venv-cuda` and build with `ort-cuda`; the default and CI builds skip it.
 - `build.rs` copies the distributions to `onnxruntime/directml/`, `onnxruntime/openvino/`, and
-  `onnxruntime/cuda/` when enabled, next to the executable (and the test executable directory). The OpenVINO
+  `onnxruntime/cuda/` when enabled, in the profile directory next to the executable. Test executables run from Cargo's build directory (layout v2, `build/<package>/<hash>/out`), so the loader searches upward from the executable for `onnxruntime/<name>`. The OpenVINO
   and CUDA directories also contain their support DLLs. `NICEGAL_DIRECTML_ORT_LIB_PATH`,
   `NICEGAL_OPENVINO_ORT_LIB_PATH`, `NICEGAL_OPENVINO_LIB_PATH`, `NICEGAL_CUDA_ORT_LIB_PATH`,
   and `NICEGAL_CUDA_LIB_PATH` override their respective
@@ -98,7 +98,13 @@
 
 ## Platform support
 
-Windows packages include DirectML and OpenVINO. Linux x64 defaults to WebGPU
+Windows packages include DirectML and OpenVINO. A Windows `ort-webgpu` build is supported for
+testing but not packaged: create `.venv-webgpu` from `requirements-webgpu.txt`, build with
+`--features ort-webgpu`, and `build.rs` stages `onnxruntime/webgpu/` (stock ORT plus the plugin
+and `dxcompiler.dll`). On an RTX 5070 Ti in November 2026 (ORT 1.32, plugin 0.5.0) it matched
+DirectML's output exactly and ran OCR about 2x faster, but CLIP image inference was 1.4x (B/32)
+to 2x (L/14) slower. Nsight showed more dispatches, many small buffer copies and longer GPU time
+per batch. DirectML stays the Windows default. Linux x64 defaults to WebGPU
 with CPU fallback and requires a working Vulkan driver/loader. An OpenVINO build
 can be selected with `NICEGAL_LINUX_PROVIDERS=openvino`. The later September 14
 user direction removes the untested CUDA/MIGraphX paths, superseding their

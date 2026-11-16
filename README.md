@@ -13,7 +13,7 @@ git clone --recurse-submodules https://github.com/centuryofimage/nicegal-server.
 cd nicegal-server
 ```
 
-Build a deployable server with `build-server.cmd` on Windows or `./build-server.sh` on Linux and macOS. For local Rust builds, use `./dev.sh build` on Linux or macOS. The wrapper builds pinned static FFmpeg into `.deps/ffmpeg` on first use, using the parent repository's `.github/ffmpeg/posix.args` recipe when available or the bundled copy for a standalone checkout. It also installs and stages the platform's ONNX Runtime wheel for debug and release executables. Install `git`, `make`, a C compiler, `nasm`, `pkg-config`, libclang, and `uv` first. Set `NICEGAL_FFMPEG_DIR` to use another FFmpeg package. Run `nicegal-server --help` or `nicegal-cli --help` for standalone usage. The desktop app configures and starts its bundled server automatically. The [HTTP API reference](INTERNAL_API.md) covers integration.
+Build a deployable server with `build-server.cmd` on Windows or `./build-server.sh` on Linux and macOS. For local Rust builds, use `./dev.sh build` on Linux or macOS. The wrapper builds pinned static FFmpeg into `.deps/ffmpeg` on first use, using the parent repository's `.github/ffmpeg/posix.args` recipe when available or the bundled copy for a standalone checkout. It also installs and stages the platform's ONNX Runtime wheel for debug and release executables. Install `git`, `make`, a C compiler, `nasm`, `pkg-config`, libclang, and `uv` first. Set `NICEGAL_FFMPEG_DIR` to use another FFmpeg package. Run `nicegal-server --help` for standalone usage. The desktop app configures and starts its bundled server automatically. The [HTTP API reference](INTERNAL_API.md) covers integration.
 
 ## Image search models
 

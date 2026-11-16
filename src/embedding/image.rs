@@ -2077,11 +2077,9 @@ mod tests {
         RUNTIME.call_once(|| {
             #[cfg(windows)]
             crate::runtime::initialize_from_dylib(
-                &std::env::current_exe()
+                &crate::runtime::bundled_runtime_directory("directml")
                     .unwrap()
-                    .parent()
-                    .unwrap()
-                    .join("onnxruntime/directml/onnxruntime.dll"),
+                    .join("onnxruntime.dll"),
             )
             .unwrap();
             #[cfg(not(windows))]

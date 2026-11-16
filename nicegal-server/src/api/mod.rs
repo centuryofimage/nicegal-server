@@ -346,12 +346,10 @@ mod tests {
             RUNTIME.call_once(|| {
                 // Select the test binary's bundled CPU runtime without changing PATH in
                 // the multithreaded harness. main() normally initializes this for us.
-                let executable = std::env::current_exe().unwrap();
                 nicegal_core::runtime::initialize_from_dylib(
-                    &executable
-                        .parent()
+                    &nicegal_core::runtime::bundled_runtime_directory("directml")
                         .unwrap()
-                        .join("onnxruntime/directml/onnxruntime.dll"),
+                        .join("onnxruntime.dll"),
                 )
                 .expect("the bundled CPU runtime initializes");
             });
