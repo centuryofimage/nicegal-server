@@ -447,6 +447,10 @@ impl CatalogPipeline<'_> {
             }
             let entry = match result {
                 Ok(entry) => entry,
+                Err(error) if is_access_denied(&error) => {
+                    tracing::debug!(path = ?error.path(), "skipping folder without access");
+                    continue;
+                }
                 Err(error) => {
                     complete = false;
                     let path = error
@@ -763,6 +767,15 @@ fn is_excluded_dir(exclude_dirs: &[PathBuf], entry: &walkdir::DirEntry) -> bool 
     entry.path_is_symlink()
         && entry.file_type().is_dir()
         && canonicalize_path(path).is_ok_and(|target| is_or_inside(&target))
+}
+
+/// Whether a walk error is a folder the user may not open, such as `WindowsApps` or a junction
+/// into another account's profile. Walks treat those folders as outside the library: they are
+/// skipped without an error and do not leave the walk incomplete, so cleanup still runs.
+pub fn is_access_denied(error: &walkdir::Error) -> bool {
+    error
+        .io_error()
+        .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
 }
 
 fn duration_micros(duration: Duration) -> u64 {

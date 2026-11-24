@@ -28,8 +28,14 @@ use super::prune_jobs::{self, ReconcileInput, ReconcileScope};
 use super::text_embeddings::job::TextEmbedOptions;
 
 const OCR_COMMIT_CHUNK_SIZE: usize = 32;
-/// Cache folders that never hold library media.
-const DEFAULT_EXCLUDES: [&str; 2] = ["*/.cache", "*/.thumb*"];
+/// Cache folders that never hold library media, and the system folders at the root of every
+/// Windows volume. The system folder names are matched in any letter case.
+const DEFAULT_EXCLUDES: [&str; 4] = [
+    "*/.cache",
+    "*/.thumb*",
+    "*/$[Rr][Ee][Cc][Yy][Cc][Ll][Ee].[Bb][Ii][Nn]",
+    "*/[Ss][Yy][Ss][Tt][Ee][Mm] [Vv][Oo][Ll][Uu][Mm][Ee] [Ii][Nn][Ff][Oo][Rr][Mm][Aa][Tt][Ii][Oo][Nn]",
+];
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -568,6 +574,9 @@ fn snapshot_directories(
 ) -> anyhow::Result<Vec<DirectorySnapshot>> {
     let mut directories = Vec::<DirectorySnapshot>::new();
     let mut unreadable = Vec::<PathBuf>::new();
+    // The last directory yielded at each depth. The one at `depth - 1` is the directory being
+    // read when an error at `depth` arrives.
+    let mut open = Vec::<PathBuf>::new();
     for entry in WalkDir::new(root)
         .follow_links(true)
         .into_iter()
@@ -587,17 +596,34 @@ fn snapshot_directories(
             Ok(entry) => entry,
             // A link back to an ancestor; that directory is already recorded.
             Err(error) if error.loop_ancestor().is_some() => continue,
+            // A folder the user may not open is treated as outside the library.
+            Err(error) if index::is_access_denied(&error) => continue,
             Err(error) => {
-                let path = error
-                    .path()
-                    .context("unreadable entry without a path")?
-                    .to_owned();
-                unreadable.push(PathBuf::try_from(path)?);
+                let path = match error.path() {
+                    Some(path) => PathBuf::try_from(path.to_owned())?,
+                    // Some failures carry no path, such as a child directory that could not be
+                    // opened for loop detection. That child is never yielded, so its parent is
+                    // marked instead.
+                    None => match error.depth().checked_sub(1) {
+                        Some(depth) => open
+                            .get(depth)
+                            .cloned()
+                            .with_context(|| format!("unreadable entry without a path: {error}"))?,
+                        // At depth 0 the root itself could not be opened.
+                        None => {
+                            return Err(anyhow::Error::new(error))
+                                .with_context(|| format!("cannot open {root}"));
+                        }
+                    },
+                };
+                unreadable.push(path);
                 continue;
             }
         };
         if entry.file_type().is_dir() {
             let path = PathBuf::try_from(entry.path().to_owned())?;
+            open.truncate(entry.depth());
+            open.push(path.clone());
             directories.push(DirectorySnapshot {
                 modified_ns: directory_mtime(&path)?,
                 path,
@@ -758,7 +784,31 @@ fn quick_catalog(
         {
             continue;
         }
-        let snapshot = snapshot_directories(&path, options, job)?;
+        let snapshot = match snapshot_directories(&path, options, job) {
+            Ok(snapshot) => snapshot,
+            Err(error) if super::jobs::is_cancelled(&error) => return Err(error),
+            // A folder the user may not open is treated as outside the library.
+            Err(error)
+                if error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<walkdir::Error>()
+                        .is_some_and(index::is_access_denied)
+                }) =>
+            {
+                tracing::debug!(directory = %path, "skipping new directory without access");
+                continue;
+            }
+            // Any other new subdirectory that cannot be read is reported like an unreadable
+            // directory, and its parent is looked at again.
+            Err(error) => {
+                report_unreadable(job, &path, &error);
+                complete = false;
+                if let Some(parent) = path.parent() {
+                    set_mtime(&mut next, parent, UNKNOWN_MTIME);
+                }
+                continue;
+            }
+        };
         let (found, summary) = index::catalog_snapshot(catalog, &path, options, job)?;
         tracing::trace!(directory = %path, directories = snapshot.len(), assets = found.len(), scan_complete = summary.scan_complete, "cataloged new directory subtree");
         complete &= summary.scan_complete;
@@ -869,6 +919,33 @@ mod tests {
     use nicegal_core::libraries::LibraryOptions;
 
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn default_exclusions_cover_volume_system_folders_in_any_case() {
+        let options = CatalogOptions {
+            exclude: DEFAULT_EXCLUDES
+                .iter()
+                .map(|pattern| Pattern::new(pattern).unwrap())
+                .collect(),
+            ..CatalogOptions::default()
+        };
+        for (path, excluded) in [
+            (r"C:\$Recycle.Bin", true),
+            (r"D:\$RECYCLE.BIN\S-1-5-21\$RABC123.jpg", true),
+            (r"D:\System Volume Information", true),
+            ("D:/system volume information/x.jpg", true),
+            (r"D:\photos\$Recycle.Bin.jpg", false),
+            (r"D:\System Volume", false),
+            (r"D:\photos", false),
+        ] {
+            assert_eq!(
+                excluded_directory(camino::Utf8Path::new(path), &options),
+                excluded,
+                "{path}"
+            );
+        }
+    }
 
     fn folder(path: &str, scan_pending: bool) -> IncludedFolder {
         IncludedFolder {
